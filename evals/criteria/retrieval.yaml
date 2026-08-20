@@ -1,0 +1,34 @@
+api_version: valkeyrie.io/retrieval-criteria/1
+kind: RetrievalQualificationCriteria
+status: approved_by_p0_03
+configuration_policy:
+  compare_bounded_candidates_without_persistent_comparison_infrastructure: true
+  freeze_one_embedding_chunking_and_hybrid_configuration_through_beta: true
+hard_gates:
+  route_selection_rate: 1.0
+  exact_identifier_lookup_rate: 1.0
+  generation_filter_presence_rate: 1.0
+  cross_generation_leaks: 0
+  excluded_path_leaks: 0
+  prompt_or_evaluation_leaks: 0
+  malformed_or_unverifiable_metadata: 0
+quality_gates:
+  canonical_expected_evidence_recall_at_5:
+    minimum: 0.95
+  normalized_discounted_cumulative_gain_at_10:
+    minimum: 0.85
+  each_repository_family_recall_at_5:
+    minimum: 0.80
+operational_gates:
+  fixture_p95_latency_seconds:
+    maximum: 2
+  missing_or_unavailable_generation:
+    required_behavior: fail_closed
+required_metadata:
+  - repository
+  - path
+  - full_commit
+  - authority
+  - version_scope
+  - content_checksum
+  - generation_id

@@ -1,0 +1,39 @@
+api_version: valkeyrie.io/usage-safeguards/1
+kind: UsageSafeguardCriteria
+status: approved_by_p0_03
+applies_to: future_non_public_development_environment
+default_state:
+  ingress_enabled: false
+  model_processing_enabled: false
+  live_github_enabled: false
+request_envelope:
+  accepted_requests_per_day: 100
+  maximum_concurrency: 5
+  maximum_model_calls_per_request_across_retries: 2
+  maximum_input_tokens_per_request_across_retries: 20000
+  maximum_output_tokens_per_request_across_retries: 2000
+  maximum_external_api_calls_per_request: 20
+spend_envelope:
+  proposed_monthly_budget_usd: 500
+  alert_percentage: 80
+  stop_new_model_work_percentage: 100
+telemetry:
+  - accepted_rejected_and_failed_requests
+  - model_calls_and_input_output_tokens
+  - dependency_calls_throttles_timeouts_and_latency
+  - invalid_citations_and_abstentions
+  - queue_age_retries_and_dead_letters
+  - corpus_age_storage_and_index_growth
+circuit_breakers:
+  - request_token_and_api_limits
+  - concurrency_limit
+  - dependency_failure_rate
+  - invalid_citation
+  - anomalous_spend
+  - emergency_operator_stop
+required_behavior:
+  limit_exhaustion: explicit_partial_or_limit_result
+  dependency_failure: never_imply_absence_or_readiness
+  prompt_or_retrieved_text: cannot_change_limits_or_breakers
+  promotion_brakes: default_disabled_and_fail_closed
+  alert_owner: must_be_named_before_deployment

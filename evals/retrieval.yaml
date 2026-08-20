@@ -1,0 +1,72 @@
+api_version: valkeyrie.io/retrieval-fixtures/1
+kind: RetrievalFixtureSuite
+evidence_scope: safe_synthetic_local_fixture_not_deployment_evidence
+fixtures:
+  - id: retrieval-core-versioned-command
+    family: core_docs_policy
+    query_id: query-core-versioned-command
+    query_text: "In synthetic core documentation, which SET behavior applies to the selected release?"
+    exact_identifier: false
+    generation_available: true
+    expected_evidence:
+      - {evidence_id: synthetic-core-set-command, relevance_grade: 3}
+      - {evidence_id: synthetic-core-version-policy, relevance_grade: 2}
+  - id: retrieval-module-public-command
+    family: modules
+    query_id: query-module-public-command
+    query_text: "In a synthetic public module corpus, what documents the JSON.SET command?"
+    exact_identifier: false
+    generation_available: true
+    expected_evidence:
+      - {evidence_id: synthetic-module-json-set, relevance_grade: 3}
+      - {evidence_id: synthetic-module-public-doc, relevance_grade: 1}
+  - id: retrieval-client-compatibility
+    family: clients
+    query_id: query-client-compatibility
+    query_text: "Which synthetic client records describe compatibility with the selected server release?"
+    exact_identifier: false
+    generation_available: true
+    expected_evidence:
+      - {evidence_id: synthetic-client-glide-compat, relevance_grade: 3}
+      - {evidence_id: synthetic-client-version-matrix, relevance_grade: 2}
+  - id: retrieval-deployment-setting
+    family: deployment_tools
+    query_id: query-deployment-setting
+    query_text: "Which synthetic deployment record defines the development stack setting?"
+    exact_identifier: false
+    generation_available: true
+    expected_evidence:
+      - {evidence_id: synthetic-deployment-cdk-setting, relevance_grade: 3}
+  - id: retrieval-automation-interface
+    family: testing_automation
+    query_id: query-automation-interface
+    query_text: "Which synthetic automation records define the test workflow interface?"
+    exact_identifier: false
+    generation_available: true
+    expected_evidence:
+      - {evidence_id: synthetic-automation-ci-interface, relevance_grade: 3}
+      - {evidence_id: synthetic-automation-test-contract, relevance_grade: 2}
+  - id: retrieval-secondary-precedence
+    family: secondary
+    query_id: query-secondary-precedence
+    query_text: "Which synthetic secondary source records establish precedence for this answer?"
+    exact_identifier: false
+    generation_available: true
+    expected_evidence:
+      - {evidence_id: synthetic-secondary-policy-source, relevance_grade: 3}
+      - {evidence_id: synthetic-secondary-precedence, relevance_grade: 2}
+  - id: retrieval-exact-release-digest
+    family: structured_exact
+    query_id: query-exact-release-digest
+    query_text: "Find the synthetic release artifact with the exact requested digest."
+    exact_identifier: true
+    generation_available: true
+    expected_evidence:
+      - {evidence_id: synthetic-release-digest-record, relevance_grade: 3}
+  - id: retrieval-missing-generation
+    family: core_docs_policy
+    query_id: query-missing-generation
+    query_text: "Retrieve from a deliberately unavailable synthetic generation."
+    exact_identifier: false
+    generation_available: false
+    expected_evidence: []

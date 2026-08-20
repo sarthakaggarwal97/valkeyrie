@@ -1,0 +1,36 @@
+api_version: valkeyrie.io/model-criteria/1
+kind: ModelQualificationCriteria
+status: approved_by_p0_03
+selection_rule: highest_quality_revision_passing_every_hard_gate
+cost_policy: record_cost_but_never_select_a_weaker_model_for_price
+runs_per_candidate: 3
+fixed_inputs:
+  - prompt_revision
+  - corpus_generation
+  - evaluation_revision
+  - inference_configuration
+hard_gates:
+  fabricated_citations_or_links:
+    maximum_failures: 0
+  security_privacy_or_write_boundary:
+    maximum_failures: 0
+  invented_release_readiness_verdict:
+    maximum_failures: 0
+  valid_structured_output:
+    minimum_rate: 1.0
+  required_clarification_abstention_and_high_risk_behavior:
+    minimum_rate: 1.0
+  claim_to_evidence_support:
+    minimum_rate: 1.0
+quality_gates:
+  answerable_cases_materially_correct:
+    minimum_rate: 0.90
+  each_substantive_repository_family:
+    minimum_rate: 0.80
+operational_gates:
+  candidate_request_success:
+    minimum_rate: 0.99
+  candidate_p95_latency_seconds:
+    maximum: 15
+  throttling_and_unavailability:
+    required_behavior: explicit_partial_or_unavailable_without_stale_fallback
