@@ -1,0 +1,1247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://valkeyrie.dev/schemas/contracts/1",
+  "title": "Valkeyrie shared contracts",
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+    },
+    "https_url": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://"
+    },
+    "repository_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "non_blank": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "path_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "patterns",
+        "reason"
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "include",
+            "exclude"
+          ]
+        },
+        "patterns": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "reason": {
+          "$ref": "#/$defs/non_blank"
+        }
+      }
+    },
+    "path_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rules"
+      ],
+      "properties": {
+        "rules": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/path_rule"
+          }
+        }
+      }
+    },
+    "hard_exclusion_group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "patterns"
+      ],
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/non_blank"
+        },
+        "patterns": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "url",
+        "family",
+        "classification",
+        "authority",
+        "requested_ref",
+        "revision_policy",
+        "version_scope",
+        "ingestion_mode",
+        "path_policy"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9.][a-z0-9._-]*$"
+        },
+        "url": {
+          "$ref": "#/$defs/https_url"
+        },
+        "family": {
+          "type": "string",
+          "minLength": 1
+        },
+        "classification": {
+          "enum": [
+            "curated",
+            "structured_exact",
+            "live_only",
+            "excluded"
+          ]
+        },
+        "authority": {
+          "enum": [
+            "canonical",
+            "secondary",
+            "structured",
+            "none"
+          ]
+        },
+        "requested_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision_policy": {
+          "const": "resolve_to_full_commit"
+        },
+        "version_scope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ingestion_mode": {
+          "enum": [
+            "documents",
+            "structured_records",
+            "none"
+          ]
+        },
+        "path_policy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "$ref": "#/$defs/non_blank"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "classification": {
+                "enum": [
+                  "live_only",
+                  "excluded"
+                ]
+              }
+            },
+            "required": [
+              "classification"
+            ]
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          }
+        }
+      ]
+    },
+    "source_inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version",
+        "kind",
+        "inventory",
+        "defaults",
+        "path_matching",
+        "hard_exclusions",
+        "path_policies",
+        "repositories"
+      ],
+      "properties": {
+        "api_version": {
+          "const": "valkeyrie.io/sources/1"
+        },
+        "kind": {
+          "const": "SourceInventory"
+        },
+        "inventory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "organization",
+            "observed_at",
+            "observation_method",
+            "active_nonfork_repositories",
+            "curated_or_structured",
+            "live_only_or_excluded"
+          ],
+          "properties": {
+            "organization": {
+              "const": "valkey-io"
+            },
+            "observed_at": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "observation_method": {
+              "const": "read_only_github_api"
+            },
+            "active_nonfork_repositories": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "curated_or_structured": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "live_only_or_excluded": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "defaults": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source_visibility",
+            "revision_policy",
+            "unknown_repository_behavior",
+            "unknown_path_behavior",
+            "retrieved_content_is_untrusted",
+            "max_file_bytes",
+            "max_repository_bytes"
+          ],
+          "properties": {
+            "source_visibility": {
+              "const": "public_only"
+            },
+            "revision_policy": {
+              "const": "resolve_to_full_commit"
+            },
+            "unknown_repository_behavior": {
+              "const": "fail"
+            },
+            "unknown_path_behavior": {
+              "const": "exclude"
+            },
+            "retrieved_content_is_untrusted": {
+              "const": true
+            },
+            "max_file_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_repository_bytes": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "path_matching": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "dialect",
+            "deny_overrides_allow",
+            "precedence"
+          ],
+          "properties": {
+            "dialect": {
+              "const": "gitignore"
+            },
+            "deny_overrides_allow": {
+              "const": true
+            },
+            "precedence": {
+              "const": [
+                "hard_exclusions",
+                "policy_exclusions",
+                "policy_inclusions",
+                "fallback_exclude"
+              ]
+            }
+          }
+        },
+        "hard_exclusions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/hard_exclusion_group"
+          }
+        },
+        "path_policies": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/path_policy"
+          }
+        },
+        "repositories": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/repository"
+          }
+        }
+      }
+    },
+    "normalized_document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version",
+        "kind",
+        "document_id",
+        "content_type",
+        "content"
+      ],
+      "properties": {
+        "api_version": {
+          "const": "valkeyrie.io/normalized-document/1"
+        },
+        "kind": {
+          "const": "NormalizedDocument"
+        },
+        "document_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "content_type": {
+          "enum": [
+            "text/plain",
+            "text/markdown",
+            "text/code",
+            "application/json",
+            "application/yaml"
+          ]
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "metadata_sidecar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version",
+        "kind",
+        "document_id",
+        "generation_id",
+        "repository",
+        "path",
+        "commit",
+        "authority",
+        "version_scope",
+        "content_type",
+        "content_digest"
+      ],
+      "properties": {
+        "api_version": {
+          "const": "valkeyrie.io/metadata-sidecar/1"
+        },
+        "kind": {
+          "const": "MetadataSidecar"
+        },
+        "document_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "generation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "$ref": "#/$defs/repository_path"
+        },
+        "commit": {
+          "$ref": "#/$defs/commit"
+        },
+        "authority": {
+          "enum": [
+            "canonical",
+            "secondary",
+            "structured"
+          ]
+        },
+        "version_scope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "content_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "content_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "generation_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version",
+        "kind",
+        "generation_id",
+        "sources_revision",
+        "retrieval_config_revision",
+        "created_at",
+        "documents",
+        "structured_records"
+      ],
+      "properties": {
+        "api_version": {
+          "const": "valkeyrie.io/generation-manifest/1"
+        },
+        "kind": {
+          "const": "GenerationManifest"
+        },
+        "generation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "sources_revision": {
+          "$ref": "#/$defs/digest"
+        },
+        "retrieval_config_revision": {
+          "$ref": "#/$defs/digest"
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "documents": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "document_id",
+              "content_digest",
+              "metadata_digest"
+            ],
+            "properties": {
+              "document_id": {
+                "$ref": "#/$defs/digest"
+              },
+              "content_digest": {
+                "$ref": "#/$defs/digest"
+              },
+              "metadata_digest": {
+                "$ref": "#/$defs/digest"
+              }
+            }
+          }
+        },
+        "structured_records": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "record_id",
+              "record_digest"
+            ],
+            "properties": {
+              "record_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "record_digest": {
+                "$ref": "#/$defs/digest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "generation_completion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version",
+        "kind",
+        "generation_id",
+        "manifest_digest",
+        "published_object_count"
+      ],
+      "properties": {
+        "api_version": {
+          "const": "valkeyrie.io/generation-completion/1"
+        },
+        "kind": {
+          "const": "GenerationCompletion"
+        },
+        "generation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "manifest_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "published_object_count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "candidate_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generation_id",
+        "status",
+        "revision",
+        "fence",
+        "attempt",
+        "owner",
+        "lease_expires_at",
+        "ingestion_job_id",
+        "documents_scanned",
+        "failure"
+      ],
+      "properties": {
+        "generation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "status": {
+          "enum": [
+            "INGESTING",
+            "INGESTED",
+            "FAILED"
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "fence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "lease_expires_at": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ingestion_job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Z0-9]{10}$"
+        },
+        "documents_scanned": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "failure": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 500
+        }
+      }
+    },
+    "generation_availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generation_id",
+        "revision",
+        "sealed",
+        "available",
+        "ingested",
+        "retrievable",
+        "evaluation_passed",
+        "retained",
+        "evaluation_report_id"
+      ],
+      "properties": {
+        "generation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sealed": {
+          "type": "boolean"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "ingested": {
+          "type": "boolean"
+        },
+        "retrievable": {
+          "type": "boolean"
+        },
+        "evaluation_passed": {
+          "type": "boolean"
+        },
+        "retained": {
+          "type": "boolean"
+        },
+        "evaluation_report_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^eval_[0-9a-f]{64}$"
+        }
+      }
+    },
+    "active_generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generation_id",
+        "revision",
+        "evaluation_report_id",
+        "activated_at"
+      ],
+      "properties": {
+        "generation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "evaluation_report_id": {
+          "type": "string",
+          "pattern": "^eval_[0-9a-f]{64}$"
+        },
+        "activated_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "protected_approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_id",
+        "action",
+        "generation_id",
+        "expected_active_generation",
+        "evaluation_report_id",
+        "approver",
+        "approved_at"
+      ],
+      "properties": {
+        "approval_id": {
+          "type": "string",
+          "pattern": "^approval_[a-z0-9-]+$"
+        },
+        "action": {
+          "enum": [
+            "activate",
+            "rollback"
+          ]
+        },
+        "generation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "expected_active_generation": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evaluation_report_id": {
+          "type": "string",
+          "pattern": "^eval_[0-9a-f]{64}$"
+        },
+        "approver": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "approved_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "evidence_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version",
+        "kind",
+        "evidence_id",
+        "generation_id",
+        "source",
+        "excerpt",
+        "excerpt_digest"
+      ],
+      "properties": {
+        "api_version": {
+          "const": "valkeyrie.io/evidence-record/1"
+        },
+        "kind": {
+          "const": "EvidenceRecord"
+        },
+        "evidence_id": {
+          "type": "string",
+          "pattern": "^ev_[a-z0-9-]+$"
+        },
+        "generation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository",
+            "path",
+            "commit",
+            "authority",
+            "version_scope",
+            "immutable_url"
+          ],
+          "properties": {
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "path": {
+              "$ref": "#/$defs/repository_path"
+            },
+            "commit": {
+              "$ref": "#/$defs/commit"
+            },
+            "authority": {
+              "enum": [
+                "canonical",
+                "secondary",
+                "structured"
+              ]
+            },
+            "version_scope": {
+              "type": "string",
+              "minLength": 1
+            },
+            "immutable_url": {
+              "$ref": "#/$defs/https_url"
+            }
+          }
+        },
+        "excerpt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "excerpt_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "model_output": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "api_version",
+            "kind",
+            "outcome",
+            "claims"
+          ],
+          "properties": {
+            "api_version": {
+              "const": "valkeyrie.io/model-output/1"
+            },
+            "kind": {
+              "const": "ModelOutput"
+            },
+            "outcome": {
+              "const": "answer"
+            },
+            "claims": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 100,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "claim_id",
+                  "text",
+                  "evidence_ids"
+                ],
+                "properties": {
+                  "claim_id": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "pattern": "^[a-z0-9][a-z0-9_.-]*$"
+                  },
+                  "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  },
+                  "evidence_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string",
+                      "pattern": "^ev_[a-z0-9-]+$"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "api_version",
+            "kind",
+            "outcome",
+            "question"
+          ],
+          "properties": {
+            "api_version": {
+              "const": "valkeyrie.io/model-output/1"
+            },
+            "kind": {
+              "const": "ModelOutput"
+            },
+            "outcome": {
+              "const": "clarification"
+            },
+            "question": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "api_version",
+            "kind",
+            "outcome",
+            "reason"
+          ],
+          "properties": {
+            "api_version": {
+              "const": "valkeyrie.io/model-output/1"
+            },
+            "kind": {
+              "const": "ModelOutput"
+            },
+            "outcome": {
+              "const": "abstention"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "request_audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version",
+        "kind",
+        "request_id",
+        "request_content_digest",
+        "generation_id",
+        "prompt_revision",
+        "application_revision",
+        "model_revision",
+        "inference_config_revision",
+        "static_evidence_ids",
+        "live_observations",
+        "started_at",
+        "outcome"
+      ],
+      "properties": {
+        "api_version": {
+          "const": "valkeyrie.io/request-audit/1"
+        },
+        "kind": {
+          "const": "RequestAudit"
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^req_[a-z0-9-]+$"
+        },
+        "request_content_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "generation_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "prompt_revision": {
+          "$ref": "#/$defs/digest"
+        },
+        "application_revision": {
+          "$ref": "#/$defs/digest"
+        },
+        "model_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inference_config_revision": {
+          "$ref": "#/$defs/digest"
+        },
+        "static_evidence_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^ev_[a-z0-9-]+$"
+          }
+        },
+        "live_observations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/live_observation"
+          }
+        },
+        "started_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "outcome": {
+          "enum": [
+            "answer",
+            "clarification",
+            "abstention",
+            "error"
+          ]
+        }
+      }
+    },
+    "live_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version",
+        "kind",
+        "observation_id",
+        "observed_at",
+        "source_url",
+        "object_type",
+        "payload",
+        "payload_digest",
+        "complete",
+        "truncated"
+      ],
+      "properties": {
+        "api_version": {
+          "const": "valkeyrie.io/live-observation/1"
+        },
+        "kind": {
+          "const": "LiveObservation"
+        },
+        "observation_id": {
+          "type": "string",
+          "pattern": "^obs_[0-9a-f]{64}$"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "source_url": {
+          "$ref": "#/$defs/https_url"
+        },
+        "object_type": {
+          "enum": [
+            "repository",
+            "issue",
+            "pull_request",
+            "review",
+            "check",
+            "workflow_run",
+            "tag",
+            "release",
+            "controller_status"
+          ]
+        },
+        "payload": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        },
+        "payload_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "complete": {
+          "const": true
+        },
+        "truncated": {
+          "const": false
+        }
+      }
+    },
+    "evaluation_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version",
+        "kind",
+        "report_id",
+        "candidate_revision",
+        "suite_revision",
+        "started_at",
+        "completed_at",
+        "result",
+        "summary",
+        "gates",
+        "cases"
+      ],
+      "properties": {
+        "api_version": {
+          "const": "valkeyrie.io/evaluation-report/1"
+        },
+        "kind": {
+          "const": "EvaluationReport"
+        },
+        "report_id": {
+          "type": "string",
+          "pattern": "^eval_[0-9a-f]{64}$"
+        },
+        "candidate_revision": {
+          "$ref": "#/$defs/digest"
+        },
+        "suite_revision": {
+          "$ref": "#/$defs/digest"
+        },
+        "started_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "completed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "result": {
+          "enum": [
+            "pass",
+            "fail"
+          ]
+        },
+        "summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "total",
+            "passed",
+            "failed",
+            "public_cases",
+            "holdout_cases",
+            "retrieval_fixtures",
+            "model_runs",
+            "model_grading_calls",
+            "recorded_cost_usd"
+          ],
+          "properties": {
+            "total": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "passed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "failed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "public_cases": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "holdout_cases": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "retrieval_fixtures": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "model_runs": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "model_grading_calls": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "recorded_cost_usd": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "gates": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "status",
+              "actual",
+              "operator",
+              "threshold"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9_.-]+$"
+              },
+              "status": {
+                "enum": [
+                  "pass",
+                  "fail"
+                ]
+              },
+              "actual": {
+                "type": "number",
+                "minimum": 0
+              },
+              "operator": {
+                "enum": [
+                  "at_least",
+                  "at_most"
+                ]
+              },
+              "threshold": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "case_id",
+              "scope",
+              "split",
+              "runs",
+              "status"
+            ],
+            "properties": {
+              "case_id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]*$"
+              },
+              "scope": {
+                "enum": [
+                  "model",
+                  "retrieval"
+                ]
+              },
+              "split": {
+                "enum": [
+                  "public",
+                  "holdout",
+                  "fixture"
+                ]
+              },
+              "runs": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "status": {
+                "enum": [
+                  "pass",
+                  "fail"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

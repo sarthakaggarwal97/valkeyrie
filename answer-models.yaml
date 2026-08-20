@@ -1,0 +1,23 @@
+# Approved answer-model candidate inventory. This file is the only source of
+# qualification candidates: prepare_model_invocation loads it fail-closed and
+# requires exactly one live evaluation report per listed candidate. Listing a
+# candidate here is NOT a qualification claim; qualification requires complete
+# suite-bound live reports.
+#
+# - us.anthropic.claude-fable-5: candidate requested by the project owner.
+# - amazon.nova-pro-v1:0: comparison candidate.
+api_version: valkeyrie.io/answer-models/1
+kind: AnswerModelInventory
+candidates:
+- model_id: us.anthropic.claude-fable-5
+  inference:
+    maximum_output_tokens: 2048
+    temperature: null
+    top_p: null
+    reasoning_effort: low
+- model_id: amazon.nova-pro-v1:0
+  inference:
+    maximum_output_tokens: 1200
+    temperature: 0.0
+    top_p: 1.0
+    reasoning_effort: null

@@ -1,0 +1,426 @@
+api_version: valkeyrie.io/retrieval-config/1
+kind: FrozenRetrievalConfiguration
+status: reviewed_frozen_beta
+qualification:
+  label: bounded_local_synthetic_qualification
+  claim_scope: local_synthetic_measurements_not_deployed_production_claims
+  candidate_limit: 3
+  fixture_suite: evals/retrieval.yaml
+  criteria: evals/criteria/retrieval.yaml
+  fixture_revision: sha256:94713f4d1c98d2049d04c93a514c1db6f13e282e48ecf61e9dba55117e70d805
+selection:
+  eligibility: passes_all_approved_retrieval_gates
+  quality_order:
+  - overall_recall_at_5_desc
+  - overall_ndcg_at_10_desc
+  - p95_latency_seconds_asc
+  tie_break: candidate_id_lexical_asc
+  selected_candidate: titan-v2-1024-fixed-300-20
+freeze:
+  lifecycle: through_public_beta
+  routine_change: prohibited
+  migration_requirement: separately_approved_full_index_migration
+revision:
+  algorithm: sha256_canonical_semantics
+  derived_field: config_revision
+  config_revision_is_not_part_of_preimage: true
+  config_revision: sha256:b0db86c993c9147ff0078a78c55163b8a6ba462e400ce4fad9ab4b3263d48223
+candidates:
+- id: titan-v2-512-fixed-256-15
+  configuration:
+    embedding:
+      model_id: amazon.titan-embed-text-v2:0
+      dimensions: 512
+      output_normalization: model_defined
+    chunking:
+      strategy: FIXED_SIZE
+      max_tokens: 256
+      overlap_percentage: 15
+    index:
+      dimensions: 512
+      engine: faiss
+      algorithm: hnsw
+      distance_metric: l2
+      vector_field: bedrock-knowledge-base-default-vector
+      text_field: AMAZON_BEDROCK_TEXT_CHUNK
+      metadata_field: AMAZON_BEDROCK_METADATA
+    retrieval:
+      search_type: HYBRID
+      number_of_results: 10
+      generation_filter_field: generation_id
+      exact_identifier_route: deterministic_exact_lookup
+      unavailable_generation_behavior: fail_closed
+      reranking: false
+  measurements:
+  - fixture_id: retrieval-core-versioned-command
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-core-set-command
+    - synthetic-core-version-policy
+    measured_latency_seconds: 0.34
+  - fixture_id: retrieval-module-public-command
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-module-json-set
+    - synthetic-distractor-module
+    measured_latency_seconds: 0.36
+  - fixture_id: retrieval-client-compatibility
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-client-glide-compat
+    - synthetic-client-version-matrix
+    measured_latency_seconds: 0.37
+  - fixture_id: retrieval-deployment-setting
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-deployment-cdk-setting
+    measured_latency_seconds: 0.3
+  - fixture_id: retrieval-automation-interface
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-automation-ci-interface
+    - synthetic-automation-test-contract
+    measured_latency_seconds: 0.4
+  - fixture_id: retrieval-secondary-precedence
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-secondary-policy-source
+    - synthetic-secondary-precedence
+    measured_latency_seconds: 0.31
+  - fixture_id: retrieval-exact-release-digest
+    route_selected: true
+    exact_identifier_found: true
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-release-digest-record
+    measured_latency_seconds: 0.12
+  - fixture_id: retrieval-missing-generation
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: true
+    ranked_evidence_ids: []
+    measured_latency_seconds: 0.05
+- id: titan-v2-1024-fixed-300-20
+  configuration:
+    embedding:
+      model_id: amazon.titan-embed-text-v2:0
+      dimensions: 1024
+      output_normalization: model_defined
+    chunking:
+      strategy: FIXED_SIZE
+      max_tokens: 300
+      overlap_percentage: 20
+    index:
+      dimensions: 1024
+      engine: faiss
+      algorithm: hnsw
+      distance_metric: l2
+      vector_field: bedrock-knowledge-base-default-vector
+      text_field: AMAZON_BEDROCK_TEXT_CHUNK
+      metadata_field: AMAZON_BEDROCK_METADATA
+    retrieval:
+      search_type: HYBRID
+      number_of_results: 10
+      generation_filter_field: generation_id
+      exact_identifier_route: deterministic_exact_lookup
+      unavailable_generation_behavior: fail_closed
+      reranking: false
+  measurements:
+  - fixture_id: retrieval-core-versioned-command
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-core-set-command
+    - synthetic-core-version-policy
+    - synthetic-distractor-core
+    measured_latency_seconds: 0.44
+  - fixture_id: retrieval-module-public-command
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-module-json-set
+    - synthetic-module-public-doc
+    - synthetic-distractor-module
+    measured_latency_seconds: 0.51
+  - fixture_id: retrieval-client-compatibility
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-client-glide-compat
+    - synthetic-client-version-matrix
+    - synthetic-distractor-client
+    measured_latency_seconds: 0.47
+  - fixture_id: retrieval-deployment-setting
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-deployment-cdk-setting
+    - synthetic-distractor-deployment
+    measured_latency_seconds: 0.39
+  - fixture_id: retrieval-automation-interface
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-automation-ci-interface
+    - synthetic-automation-test-contract
+    - synthetic-distractor-automation
+    measured_latency_seconds: 0.56
+  - fixture_id: retrieval-secondary-precedence
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-secondary-policy-source
+    - synthetic-secondary-precedence
+    - synthetic-distractor-secondary
+    measured_latency_seconds: 0.42
+  - fixture_id: retrieval-exact-release-digest
+    route_selected: true
+    exact_identifier_found: true
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-release-digest-record
+    measured_latency_seconds: 0.31
+  - fixture_id: retrieval-missing-generation
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: true
+    ranked_evidence_ids: []
+    measured_latency_seconds: 0.08
+- id: titan-v2-1024-fixed-512-20
+  configuration:
+    embedding:
+      model_id: amazon.titan-embed-text-v2:0
+      dimensions: 1024
+      output_normalization: model_defined
+    chunking:
+      strategy: FIXED_SIZE
+      max_tokens: 512
+      overlap_percentage: 20
+    index:
+      dimensions: 1024
+      engine: faiss
+      algorithm: hnsw
+      distance_metric: l2
+      vector_field: bedrock-knowledge-base-default-vector
+      text_field: AMAZON_BEDROCK_TEXT_CHUNK
+      metadata_field: AMAZON_BEDROCK_METADATA
+    retrieval:
+      search_type: HYBRID
+      number_of_results: 10
+      generation_filter_field: generation_id
+      exact_identifier_route: deterministic_exact_lookup
+      unavailable_generation_behavior: fail_closed
+      reranking: false
+  measurements:
+  - fixture_id: retrieval-core-versioned-command
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-distractor-a
+    - synthetic-distractor-b
+    - synthetic-core-set-command
+    - synthetic-core-version-policy
+    measured_latency_seconds: 0.66
+  - fixture_id: retrieval-module-public-command
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-distractor-a
+    - synthetic-distractor-b
+    - synthetic-module-json-set
+    - synthetic-module-public-doc
+    measured_latency_seconds: 0.75
+  - fixture_id: retrieval-client-compatibility
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-distractor-a
+    - synthetic-distractor-b
+    - synthetic-client-glide-compat
+    - synthetic-client-version-matrix
+    measured_latency_seconds: 0.72
+  - fixture_id: retrieval-deployment-setting
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-distractor-a
+    - synthetic-distractor-b
+    - synthetic-deployment-cdk-setting
+    measured_latency_seconds: 0.61
+  - fixture_id: retrieval-automation-interface
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-distractor-a
+    - synthetic-distractor-b
+    - synthetic-automation-ci-interface
+    - synthetic-automation-test-contract
+    measured_latency_seconds: 0.79
+  - fixture_id: retrieval-secondary-precedence
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-distractor-a
+    - synthetic-distractor-b
+    - synthetic-secondary-policy-source
+    - synthetic-secondary-precedence
+    measured_latency_seconds: 0.63
+  - fixture_id: retrieval-exact-release-digest
+    route_selected: true
+    exact_identifier_found: true
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: null
+    ranked_evidence_ids:
+    - synthetic-distractor-a
+    - synthetic-distractor-b
+    - synthetic-release-digest-record
+    measured_latency_seconds: 0.48
+  - fixture_id: retrieval-missing-generation
+    route_selected: true
+    exact_identifier_found: null
+    generation_filter_present: true
+    cross_generation_leaks: 0
+    excluded_path_leaks: 0
+    prompt_or_evaluation_leaks: 0
+    malformed_or_unverifiable_metadata: 0
+    failed_closed: true
+    ranked_evidence_ids: []
+    measured_latency_seconds: 0.1

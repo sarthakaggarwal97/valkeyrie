@@ -1,0 +1,21 @@
+api_version: valkeyrie.io/prompts/1
+kind: PromptPackage
+revision:
+  algorithm: sha256_canonical_roles_paths_and_bytes
+  canonical_order: lexical_path
+  newline_normalization: lf
+  derived_field: prompt_revision
+  prompt_revision: sha256:d06c1262c98feda8661e494b92fb5dd92985e23ec896dbd596947b5635107768
+  prompt_revision_is_not_part_of_preimage: true
+output_contract: evidence_ids_only_for_citations
+prompts:
+  - name: system
+    file: prompts/system.md
+  - name: evidence-use
+    file: prompts/evidence-use.md
+  - name: citations
+    file: prompts/citations.md
+  - name: clarification
+    file: prompts/clarification.md
+  - name: answer
+    file: prompts/answer.md

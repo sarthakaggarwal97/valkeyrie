@@ -1,0 +1,863 @@
+api_version: valkeyrie.io/sources/1
+kind: SourceInventory
+inventory:
+  organization: valkey-io
+  observed_at: "2026-08-18T17:34:09Z"
+  observation_method: read_only_github_api
+  active_nonfork_repositories: 46
+  curated_or_structured: 43
+  live_only_or_excluded: 3
+
+defaults:
+  source_visibility: public_only
+  revision_policy: resolve_to_full_commit
+  unknown_repository_behavior: fail
+  unknown_path_behavior: exclude
+  retrieved_content_is_untrusted: true
+  max_file_bytes: 1048576
+  max_repository_bytes: 104857600
+
+path_matching:
+  dialect: gitignore
+  deny_overrides_allow: true
+  precedence:
+    - hard_exclusions
+    - policy_exclusions
+    - policy_inclusions
+    - fallback_exclude
+
+hard_exclusions:
+  - reason: repository_metadata_dependencies_build_and_generated_output_are_not_source_material
+    patterns:
+      - .git/**
+      - "**/.git/**"
+      - node_modules/**
+      - "**/node_modules/**"
+      - deps/**
+      - "**/deps/**"
+      - vendor/**
+      - "**/vendor/**"
+      - third_party/**
+      - "**/third_party/**"
+      - submodules/**
+      - "**/submodules/**"
+      - target/**
+      - "**/target/**"
+      - build/**
+      - "**/build/**"
+      - dist/**
+      - "**/dist/**"
+      - "**/generated/**"
+      - "**/generated_commands/**"
+      - out/**
+      - "**/out/**"
+      - .venv/**
+      - "**/__pycache__/**"
+  - reason: agent_control_templates_fixtures_prompts_and_evaluations_are_not_evidence
+    patterns:
+      - templates/**
+      - "**/templates/**"
+      - AGENTS.md
+      - "**/AGENTS.md"
+      - .agents/**
+      - "**/.agents/**"
+      - .kiro/**
+      - "**/.kiro/**"
+      - .test/**
+      - "**/.test/**"
+      - .github/ISSUE_TEMPLATE/**
+      - .github/PULL_REQUEST_TEMPLATE*
+      - "**/.github/copilot-instructions.md"
+      - prompts/**
+      - evals/**
+      - "**/expected-answers/**"
+      - "**/grader/**"
+  - reason: binary_archive_minified_and_credential_shaped_content_is_not_text_corpus
+    patterns:
+      - "**/*.min.js"
+      - "**/*.min.css"
+      - "**/*.zip"
+      - "**/*.tar"
+      - "**/*.gz"
+      - "**/*.bz2"
+      - "**/*.7z"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+      - "**/*.gif"
+      - "**/*.pdf"
+      - "**/*.so"
+      - "**/*.dylib"
+      - "**/*.dll"
+      - "**/*.jar"
+      - "**/*.jceks"
+      - "**/*.pem"
+      - "**/*.bat"
+      - "**/*.exe"
+      - "**/.env*"
+      - "**/*secret*"
+      - "**/*credential*"
+
+path_policies:
+  project_policy:
+    rules:
+      - action: include
+        patterns:
+          - /README*
+          - /CONTRIBUTING*
+          - /GOVERNANCE*
+          - /SECURITY*
+          - /CODE_OF_CONDUCT*
+          - /LICENSE*
+          - "/*.md"
+          - docs/**/*.md
+          - policies/**/*.md
+          - profile/**/*.md
+        reason: reviewed_project_policy_and_guidance
+      - action: exclude
+        patterns: ["**"]
+        reason: not_selected
+
+  core_source:
+    rules:
+      - action: include
+        patterns:
+          - /README*
+          - /CONTRIBUTING*
+          - /SECURITY*
+          - /LICENSE*
+          - "/*.md"
+          - design-docs/**/*.md
+          - src/**/*.c
+          - src/**/*.h
+          - src/commands/**/*.json
+          - tests/**/*.tcl
+          - utils/**/*.py
+          - runtest*
+        reason: canonical_core_behavior_policy_source_and_tests
+      - action: exclude
+        patterns: ["**"]
+        reason: not_selected
+
+  valkey_documentation:
+    rules:
+      - action: include
+        patterns:
+          - /README*
+          - /CONTRIBUTING*
+          - /LICENSE*
+          - "/*.md"
+          - commands/**/*.md
+          - topics/**/*.md
+          - project-docs/**/*.md
+          - modules/**/*.md
+          - clients/**/*.md
+          - libraries/**/*.md
+          - resources/**/*.md
+          - tools/**/*.md
+          - /groups.json
+          - /languages.json
+        reason: canonical_user_and_contributor_documentation
+      - action: exclude
+        patterns: ["**"]
+        reason: not_selected
+
+  documentation:
+    rules:
+      - action: include
+        patterns:
+          - /README*
+          - /CONTRIBUTING*
+          - /LICENSE*
+          - "/*.md"
+          - commands/**/*.md
+          - topics/**/*.md
+          - src/content/docs/**/*.md
+          - src/content/docs/**/*.mdx
+          - project-docs/**/*.md
+          - modules/**/*.md
+          - clients/**/*.md
+          - libraries/**/*.md
+          - resources/**/*.md
+          - tools/**/*.md
+          - /groups.json
+          - /languages.json
+        reason: canonical_user_and_contributor_documentation
+      - action: exclude
+        patterns: ["**"]
+        reason: not_selected
+
+  website:
+    rules:
+      - action: include
+        patterns:
+          - /README*
+          - /CONTRIBUTING*
+          - /LICENSE*
+          - content/**/*.md
+          - content/**/*.html
+          - config/**/*.yaml
+          - config/**/*.toml
+        reason: canonical_non_generated_website_content
+      - action: exclude
+        patterns: ["**"]
+        reason: generated_or_non_content_website_material
+
+  planet_policy:
+    rules:
+      - action: exclude
+        patterns:
+          - content/**
+          - data/**
+          - templates/**
+          - public/**
+        reason: aggregated_output_or_template
+      - action: include
+        patterns:
+          - /README*
+          - /CONTRIBUTING*
+          - /LICENSE*
+          - docs/**/*.md
+          - policies/**/*.md
+          - "/*.md"
+        reason: planet_contribution_aggregation_filtering_credit_and_history_policy
+      - action: exclude
+        patterns: ["**"]
+        reason: not_selected
+
+  module:
+    rules:
+      - action: exclude
+        patterns:
+          - tests/__init__.py
+        reason: empty_python_package_marker_is_not_evidence
+      - action: include
+        patterns:
+          - /README*
+          - /CONTRIBUTING*
+          - /SECURITY*
+          - /LICENSE*
+          - /CHANGELOG*
+          - /RELEASE*
+          - /00-RELEASENOTES
+          - /versions.json
+          - "/*.md"
+          - docs/**/*.md
+          - rfc/**/*.md
+          - examples/**
+          - packaging/**
+          - src/**/*.c
+          - src/**/*.h
+          - src/**/*.rs
+          - tests/**/*.tcl
+          - tests/**/*.py
+          - tests/**/*.rs
+        reason: module_behavior_security_compatibility_examples_and_tests
+      - action: exclude
+        patterns: ["**"]
+        reason: not_selected
+
+  client:
+    rules:
+      - action: exclude
+        patterns:
+          - tests/**/__init__.py
+          - "**/generated/**"
+          - "**/generated_commands/**"
+          - "**/benchmark/**"
+          - "**/benchmarks/**"
+        reason: generated_or_benchmark_material
+      - action: include
+        patterns:
+          - /README*
+          - /CONTRIBUTING*
+          - /SECURITY*
+          - /LICENSE*
+          - /CHANGELOG*
+          - /RELEASE*
+          - /MIGRAT*
+          - "/*.md"
+          - docs/**/*.md
+          - examples/**
+          - src/**
+          - include/**
+          - tests/**
+        reason: public_client_api_compatibility_examples_and_behavior_tests
+      - action: exclude
+        patterns: ["**"]
+        reason: not_selected
+
+  deployment:
+    rules:
+      - action: exclude
+        patterns:
+          - "**/rendered/**"
+          - "**/screenshots/**"
+          - "**/images/**"
+        reason: rendered_or_bulk_visual_output
+      - action: include
+        patterns:
+          - /README*
+          - /CONTRIBUTING*
+          - /SECURITY*
+          - /LICENSE*
+          - /CHANGELOG*
+          - /versions.json
+          - "/*.md"
+          - docs/**/*.md
+          - examples/**
+          - "*/README.md"
+          - "*/Chart.yaml"
+          - "*/values.yaml"
+          - "*/values.schema.json"
+          - charts/**/README.md
+          - charts/**/values.yaml
+          - charts/**/values.schema.json
+          - config/**
+          - api/**
+          - deploy/**
+          - docs-site/src/content/docs/**/*.md
+          - docs-site/src/content/docs/**/*.mdx
+          - apps/metrics/config.yml
+        reason: installation_configuration_operations_and_public_api_guidance
+      - action: exclude
+        patterns: ["**"]
+        reason: not_selected
+
+  testing_automation:
+    rules:
+      - action: include
+        patterns:
+          - /README*
+          - /CONTRIBUTING*
+          - /SECURITY*
+          - /LICENSE*
+          - /CHANGELOG*
+          - "/*.md"
+          - docs/**/*.md
+          - examples/**
+          - config/**
+          - configs/**
+          - schemas/**
+          - /action.yml
+          - /repos.yml
+          - /.github/workflows/build-release.yml
+        reason: public_test_provenance_automation_interfaces_and_runbooks
+      - action: exclude
+        patterns: ["**"]
+        reason: implementation_or_output_not_selected
+
+  secondary:
+    rules:
+      - action: include
+        patterns:
+          - /README*
+          - /LICENSE*
+          - skills/**/*.md
+        reason: reviewed_secondary_guidance
+      - action: exclude
+        patterns: ["**"]
+        reason: not_selected
+
+  structured_hashes:
+    rules:
+      - action: include
+        patterns:
+          - /README*
+          - /LICENSE*
+          - "*.json"
+          - "*.txt"
+          - "*.sha256"
+          - "**/*.json"
+          - "**/*.txt"
+          - "**/*.sha256"
+        reason: deterministic_release_artifact_digest_records
+      - action: exclude
+        patterns: ["**"]
+        reason: not_a_supported_digest_record
+
+  none:
+    rules:
+      - action: exclude
+        patterns: ["**"]
+        reason: no_static_corpus_material
+
+repositories:
+  # Core, documentation, and project policy (6)
+  - name: valkey
+    url: https://github.com/valkey-io/valkey
+    family: core_docs_policy
+    classification: curated
+    authority: canonical
+    requested_ref: unstable
+    revision_policy: resolve_to_full_commit
+    version_scope: branches_tags_and_releases
+    ingestion_mode: documents
+    path_policy: core_source
+  - name: valkey-doc
+    url: https://github.com/valkey-io/valkey-doc
+    family: core_docs_policy
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: released_and_current_documentation
+    ingestion_mode: documents
+    path_policy: valkey_documentation
+  - name: valkey-io.github.io
+    url: https://github.com/valkey-io/valkey-io.github.io
+    family: core_docs_policy
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: current_project_website
+    ingestion_mode: documents
+    path_policy: website
+  - name: community
+    url: https://github.com/valkey-io/community
+    family: core_docs_policy
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: current_project_policy
+    ingestion_mode: documents
+    path_policy: project_policy
+  - name: .github
+    url: https://github.com/valkey-io/.github
+    family: core_docs_policy
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: current_organization_policy
+    ingestion_mode: documents
+    path_policy: project_policy
+  - name: planet
+    url: https://github.com/valkey-io/planet
+    family: core_docs_policy
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: current_planet_policy
+    ingestion_mode: documents
+    path_policy: planet_policy
+
+  # Official modules and module development (8)
+  - name: valkey-bloom
+    url: https://github.com/valkey-io/valkey-bloom
+    family: modules
+    classification: curated
+    authority: canonical
+    requested_ref: unstable
+    revision_policy: resolve_to_full_commit
+    version_scope: module_versions
+    ingestion_mode: documents
+    path_policy: module
+  - name: valkey-json
+    url: https://github.com/valkey-io/valkey-json
+    family: modules
+    classification: curated
+    authority: canonical
+    requested_ref: unstable
+    revision_policy: resolve_to_full_commit
+    version_scope: module_versions
+    ingestion_mode: documents
+    path_policy: module
+  - name: valkey-search
+    url: https://github.com/valkey-io/valkey-search
+    family: modules
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: module_versions
+    ingestion_mode: documents
+    path_policy: module
+  - name: valkey-ldap
+    url: https://github.com/valkey-io/valkey-ldap
+    family: modules
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: module_versions
+    ingestion_mode: documents
+    path_policy: module
+  - name: valkey-lua5.5
+    url: https://github.com/valkey-io/valkey-lua5.5
+    family: modules
+    classification: curated
+    authority: canonical
+    requested_ref: master
+    revision_policy: resolve_to_full_commit
+    version_scope: scripting_engine_versions
+    ingestion_mode: documents
+    path_policy: module
+  - name: valkey-luajit
+    url: https://github.com/valkey-io/valkey-luajit
+    family: modules
+    classification: curated
+    authority: canonical
+    requested_ref: master
+    revision_policy: resolve_to_full_commit
+    version_scope: scripting_engine_versions
+    ingestion_mode: documents
+    path_policy: module
+  - name: valkey-bundle
+    url: https://github.com/valkey-io/valkey-bundle
+    family: modules
+    classification: curated
+    authority: canonical
+    requested_ref: mainline
+    revision_policy: resolve_to_full_commit
+    version_scope: bundle_versions
+    ingestion_mode: documents
+    path_policy: module
+  - name: valkeymodule-rs
+    url: https://github.com/valkey-io/valkeymodule-rs
+    family: modules
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: sdk_versions
+    ingestion_mode: documents
+    path_policy: module
+
+  # Official clients (16)
+  - name: valkey-glide
+    url: https://github.com/valkey-io/valkey-glide
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: valkey-glide-docs
+    url: https://github.com/valkey-io/valkey-glide-docs
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_documentation_versions
+    ingestion_mode: documents
+    path_policy: documentation
+  - name: valkey-glide-cpp
+    url: https://github.com/valkey-io/valkey-glide-cpp
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: valkey-glide-csharp
+    url: https://github.com/valkey-io/valkey-glide-csharp
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: valkey-glide-php
+    url: https://github.com/valkey-io/valkey-glide-php
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: valkey-glide-ruby
+    url: https://github.com/valkey-io/valkey-glide-ruby
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: valkey-go
+    url: https://github.com/valkey-io/valkey-go
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: valkey-py
+    url: https://github.com/valkey-io/valkey-py
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: valkey-java
+    url: https://github.com/valkey-io/valkey-java
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: master
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: valkey-swift
+    url: https://github.com/valkey-io/valkey-swift
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: libvalkey
+    url: https://github.com/valkey-io/libvalkey
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: libvalkey-py
+    url: https://github.com/valkey-io/libvalkey-py
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: iovalkey
+    url: https://github.com/valkey-io/iovalkey
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: iovalkey-commands
+    url: https://github.com/valkey-io/iovalkey-commands
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: public_command_api_versions
+    ingestion_mode: documents
+    path_policy: documentation
+  - name: spring-data-valkey
+    url: https://github.com/valkey-io/spring-data-valkey
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+  - name: valkey-namespace
+    url: https://github.com/valkey-io/valkey-namespace
+    family: clients
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: client_versions
+    ingestion_mode: documents
+    path_policy: client
+
+  # Deployment and user tools (5)
+  - name: valkey-container
+    url: https://github.com/valkey-io/valkey-container
+    family: deployment_tools
+    classification: curated
+    authority: canonical
+    requested_ref: mainline
+    revision_policy: resolve_to_full_commit
+    version_scope: container_versions
+    ingestion_mode: documents
+    path_policy: deployment
+  - name: valkey-helm
+    url: https://github.com/valkey-io/valkey-helm
+    family: deployment_tools
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: chart_versions
+    ingestion_mode: documents
+    path_policy: deployment
+  - name: valkey-operator
+    url: https://github.com/valkey-io/valkey-operator
+    family: deployment_tools
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: operator_versions
+    ingestion_mode: documents
+    path_policy: deployment
+  - name: valkey-admin
+    url: https://github.com/valkey-io/valkey-admin
+    family: deployment_tools
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: tool_versions
+    ingestion_mode: documents
+    path_policy: deployment
+  - name: valkey-try-me
+    url: https://github.com/valkey-io/valkey-try-me
+    family: deployment_tools
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: experimental_tool_versions
+    ingestion_mode: documents
+    path_policy: deployment
+
+  # Testing, benchmarking, provenance, and automation (6)
+  - name: valkey-fuzzer
+    url: https://github.com/valkey-io/valkey-fuzzer
+    family: testing_automation
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: tool_versions
+    ingestion_mode: documents
+    path_policy: testing_automation
+  - name: valkey-test-framework
+    url: https://github.com/valkey-io/valkey-test-framework
+    family: testing_automation
+    classification: curated
+    authority: canonical
+    requested_ref: unstable
+    revision_policy: resolve_to_full_commit
+    version_scope: framework_versions
+    ingestion_mode: documents
+    path_policy: testing_automation
+  - name: valkey-perf-benchmark
+    url: https://github.com/valkey-io/valkey-perf-benchmark
+    family: testing_automation
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: benchmark_versions
+    ingestion_mode: documents
+    path_policy: testing_automation
+  - name: verify-provenance
+    url: https://github.com/valkey-io/verify-provenance
+    family: testing_automation
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: current_verification_contract
+    ingestion_mode: documents
+    path_policy: testing_automation
+  - name: valkey-ci-agent
+    url: https://github.com/valkey-io/valkey-ci-agent
+    family: testing_automation
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: public_controller_interfaces
+    ingestion_mode: documents
+    path_policy: testing_automation
+  - name: valkey-release-automation
+    url: https://github.com/valkey-io/valkey-release-automation
+    family: testing_automation
+    classification: curated
+    authority: canonical
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: public_build_and_publication_contracts
+    ingestion_mode: documents
+    path_policy: testing_automation
+
+  # Reviewed secondary synthesis (1)
+  - name: valkey-skills
+    url: https://github.com/valkey-io/valkey-skills
+    family: secondary
+    classification: curated
+    authority: secondary
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: declared_skill_scope
+    ingestion_mode: documents
+    path_policy: secondary
+
+  # Structured exact source (1)
+  - name: valkey-hashes
+    url: https://github.com/valkey-io/valkey-hashes
+    family: structured_exact
+    classification: structured_exact
+    authority: structured
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: release_artifacts
+    ingestion_mode: structured_records
+    path_policy: structured_hashes
+
+  # Live-only or excluded (3)
+  - name: assets
+    url: https://github.com/valkey-io/assets
+    family: excluded
+    classification: excluded
+    authority: none
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: none
+    ingestion_mode: none
+    path_policy: none
+    reason: bulk_binary_and_visual_assets
+  - name: one-time-for-planet
+    url: https://github.com/valkey-io/one-time-for-planet
+    family: excluded
+    classification: excluded
+    authority: none
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: none
+    ingestion_mode: none
+    path_policy: none
+    reason: unfinished_one_time_aggregation
+  - name: iovalkey-interface-generator
+    url: https://github.com/valkey-io/iovalkey-interface-generator
+    family: excluded
+    classification: live_only
+    authority: none
+    requested_ref: main
+    revision_policy: resolve_to_full_commit
+    version_scope: live_repository_metadata_only
+    ingestion_mode: none
+    path_policy: none
+    reason: generated_interface_support_code

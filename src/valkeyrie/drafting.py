@@ -1,0 +1,381 @@
+"""Fail-closed model-invocation boundary and strict per-claim output acceptance.
+
+The model-visible payload is exactly three inputs: exact reviewed prompts
+loaded fail-closed from the prompt package, one bounded user question, and one
+fully verified evidence package. The model target and inference metadata stay
+outside that payload. The qualification candidate set is the approved
+answer-model inventory, never a caller argument: the selection is recomputed
+here from the complete exact evaluation suite, the inventory-constructed
+candidate profiles, and exactly one live report per candidate, so a caller
+cannot forge a selection or narrow the candidate set.
+
+Accepted model output is a strict per-claim structure; every claim must pass
+``validate_claim_support`` and every model-authored text must pass bounded
+lexical prohibition screens. Those screens are lexical only: semantic
+entailment between a claim and its cited evidence remains evaluation-owned and
+is never established deterministically here. Citations are rendered by the
+application alone from evidence IDs.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from importlib.resources import files
+from pathlib import Path
+from typing import Any, Final, cast
+
+from jsonschema import Draft202012Validator, FormatChecker
+
+from valkeyrie.answer_models import (
+    AnswerModelError,
+    AnswerModelProfile,
+    AnswerModelSelection,
+    create_candidate_profiles,
+    load_answer_model_inventory,
+    select_answer_model,
+)
+from valkeyrie.bedrock_response import (
+    BedrockResponseError,
+    BedrockTextResponse,
+    normalize_bedrock_response,
+)
+from valkeyrie.evaluations import EvaluationSuite
+from valkeyrie.evidence import (
+    ClaimSupport,
+    EvidenceError,
+    EvidenceLimits,
+    EvidencePackage,
+    render_citations,
+    validate_claim_support,
+    verify_evidence_package,
+)
+from valkeyrie.generation import GenerationBundle
+from valkeyrie.prompts import PromptPackageError, PromptTemplate, load_prompt_package
+from valkeyrie.sources import load_yaml_mapping
+
+
+class DraftingError(ValueError):
+    """A drafting input, selection binding, or model output is invalid."""
+
+
+@dataclass(frozen=True)
+class ModelInput:
+    """The complete model-visible payload: exactly reviewed prompts, one bounded
+    question, and one verified evidence package. Model target and inference
+    metadata must never enter this payload."""
+
+    prompts: tuple[PromptTemplate, ...]
+    question: str
+    evidence: EvidencePackage
+
+
+@dataclass(frozen=True)
+class ModelInvocation:
+    """The model-visible input plus non-visible target and provenance metadata."""
+
+    input: ModelInput
+    profile: AnswerModelProfile
+    prompt_revision: str
+
+
+@dataclass(frozen=True)
+class DraftClaim:
+    """One accepted claim with its canonical supporting evidence IDs."""
+
+    claim_id: str
+    text: str
+    evidence_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DraftedAnswer:
+    """An accepted per-claim answer plus application-rendered citations."""
+
+    claims: tuple[DraftClaim, ...]
+    citations: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DraftedClarification:
+    """An accepted strict clarification containing one bounded question."""
+
+    question: str
+
+
+@dataclass(frozen=True)
+class DraftedAbstention:
+    """An accepted strict abstention containing one bounded reason."""
+
+    reason: str
+
+
+DraftedOutput = DraftedAnswer | DraftedClarification | DraftedAbstention
+
+_DEFAULT_LIMITS = EvidenceLimits()
+_INVENTORY_FILE: Final = "answer-models.yaml"
+_MAX_QUESTION_BYTES: Final = 8 * 1024
+_MAX_OUTPUT_BYTES: Final = 256 * 1024
+_MAX_CLAIM_TEXT_BYTES: Final = 4 * 1024
+_MAX_CLARIFICATION_BYTES: Final = 1024
+_MAX_ABSTENTION_BYTES: Final = 2048
+
+_PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    ("an evidence ID", re.compile(r"\bev_[a-z0-9-]+")),
+    (
+        "a link",
+        re.compile(
+            r"\b(?:https?|ftp)://|\bwww\.|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}/",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "a citation label",
+        re.compile(
+            r"\[[^\]\n]*\]\s*\(|\[[0-9]+\]|\b[a-z0-9.][a-z0-9._-]*/[^\s@]+@[0-9a-f]{7,40}\b"
+        ),
+    ),
+    (
+        "a source-authority declaration",
+        re.compile(
+            r"\b(?:canonical|authoritative|official)\s+"
+            r"(?:source|reference|documentation|authority)\b|\bsource\s+of\s+truth\b"
+            r"|\b(?:is|are|was|were|remains?)\s+(?:the\s+)?"
+            r"(?:canonical|authoritative|official)\b"
+            r"|\baccording\s+to\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "a release-readiness decision",
+        re.compile(
+            r"\b(?:release|version|build|candidate)\s+is\s+(?:ready|approved)\b"
+            r"|\bready\s+(?:for|to)\s+(?:release|ship|tag)\b"
+            r"|\bapprove(?:s|d)?\s+the\s+release\b"
+            r"|\bgo\s*/?\s*no[- ]?go\b"
+            r"|\bship\s+it\b"
+            r"|\b(?:can|could|may)\s+(?:now\s+)?ship\b"
+            r"|\bsafe\s+to\s+(?:release|ship|tag|deploy|merge)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "a completed project-state write",
+        re.compile(
+            r"\b(?:i|we)\s+(?:have\s+|just\s+)?"
+            r"(?:merged|pushed|committed|deployed|released|tagged|published|closed|created)\b"
+            r"|\b(?:was|were|has\s+been|have\s+been|got)\s+"
+            r"(?:merged|pushed|committed|deployed|released|tagged|published|closed|created)\b"
+            r"|\b(?:deployment|merge|release|rollout|commit|push|publication|tag)\s+"
+            r"(?:completed|finished|succeeded)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+_SCHEMA = cast(
+    dict[str, Any],
+    load_yaml_mapping(Path(str(files("valkeyrie").joinpath("schemas", "contracts.schema.json")))),
+)
+_OUTPUT_SCHEMA = {
+    "$schema": _SCHEMA["$schema"],
+    "$defs": _SCHEMA["$defs"],
+    "$ref": "#/$defs/model_output",
+}
+Draft202012Validator.check_schema(_OUTPUT_SCHEMA)
+_OUTPUT_VALIDATOR = Draft202012Validator(_OUTPUT_SCHEMA, format_checker=FormatChecker())
+
+
+def prepare_model_invocation(
+    root: Path,
+    question: str,
+    suite: EvaluationSuite,
+    reports: tuple[Mapping[str, object], ...],
+    selection: AnswerModelSelection,
+    bundle: GenerationBundle,
+    evidence: EvidencePackage,
+    *,
+    limits: EvidenceLimits = _DEFAULT_LIMITS,
+) -> ModelInvocation:
+    """Assemble the only model-visible payload plus target metadata, or fail closed.
+
+    The candidate set is the approved answer-model inventory, never a caller
+    argument. Candidate profiles are constructed from the inventory using the
+    exact reviewed prompt revision, verified corpus generation, and evaluation
+    suite revision; exactly one live evaluation report is required per
+    inventory candidate, and omitted or extra candidates or reports fail. A
+    caller-supplied selection that differs from the recomputed one is rejected.
+    """
+    _bounded_text(question, "user question", _MAX_QUESTION_BYTES)
+    try:
+        package = load_prompt_package(root)
+    except PromptPackageError as error:
+        raise DraftingError(f"reviewed prompt package is invalid: {error}") from error
+    try:
+        candidates = load_answer_model_inventory(root / _INVENTORY_FILE)
+    except AnswerModelError as error:
+        raise DraftingError(f"approved answer-model inventory is invalid: {error}") from error
+    try:
+        verified = verify_evidence_package(bundle, evidence, limits=limits)
+    except EvidenceError as error:
+        raise DraftingError(f"evidence package is not verified: {error}") from error
+    try:
+        profiles = create_candidate_profiles(
+            candidates,
+            prompt_revision=package.prompt_revision,
+            corpus_generation=verified.generation_id,
+            evaluation_suite_revision=suite.revision,
+        )
+        recomputed = select_answer_model(suite, profiles, reports)
+    except AnswerModelError as error:
+        raise DraftingError(f"answer-model qualification is invalid: {error}") from error
+    if not isinstance(selection, AnswerModelSelection) or selection != recomputed:
+        raise DraftingError("selection does not match the recomputed qualification")
+    return ModelInvocation(
+        input=ModelInput(prompts=package.templates, question=question, evidence=verified),
+        profile=recomputed.profile,
+        prompt_revision=package.prompt_revision,
+    )
+
+
+def accept_model_output(
+    value: object,
+    bundle: GenerationBundle,
+    evidence: EvidencePackage,
+    *,
+    limits: EvidenceLimits = _DEFAULT_LIMITS,
+) -> DraftedOutput:
+    """Accept one strict model output or fail closed.
+
+    An answer must use the per-claim structure ``[{claim_id, text,
+    evidence_ids}]``; every claim must pass ``validate_claim_support`` and
+    every model-authored text must pass the bounded lexical prohibition
+    screens. The screens are lexical only and do not establish semantic
+    entailment, which remains evaluation-owned. Citations are rendered by the
+    application alone from validated evidence IDs.
+    """
+    document = _bounded_document(value)
+    errors = sorted(
+        _OUTPUT_VALIDATOR.iter_errors(document),
+        key=lambda error: "/".join(str(part) for part in error.absolute_path),
+    )
+    if errors:
+        error = errors[0]
+        where = "/".join(str(part) for part in error.absolute_path) or "$"
+        raise DraftingError(f"model output schema validation failed at {where}: {error.message}")
+
+    outcome = document["outcome"]
+    if outcome == "clarification":
+        question = cast(str, document["question"])
+        _screened_model_text(question, "clarification question", _MAX_CLARIFICATION_BYTES)
+        return DraftedClarification(question)
+    if outcome == "abstention":
+        reason = cast(str, document["reason"])
+        _screened_model_text(reason, "abstention reason", _MAX_ABSTENTION_BYTES)
+        return DraftedAbstention(reason)
+
+    claims = cast(list[Mapping[str, object]], document["claims"])
+    texts: dict[str, str] = {}
+    order: list[str] = []
+    supports: list[ClaimSupport] = []
+    for claim in claims:
+        claim_id = cast(str, claim["claim_id"])
+        text = cast(str, claim["text"])
+        if claim_id in texts:
+            raise DraftingError(f"duplicate claim ID: {claim_id}")
+        _screened_model_text(text, f"claim {claim_id!r} text", _MAX_CLAIM_TEXT_BYTES)
+        evidence_ids = cast(list[str], claim["evidence_ids"])
+        texts[claim_id] = text
+        order.append(claim_id)
+        supports.append(ClaimSupport(claim_id, tuple(evidence_ids)))
+    try:
+        canonical = validate_claim_support(bundle, evidence, tuple(supports), limits=limits)
+        cited = tuple(
+            sorted({evidence_id for support in canonical for evidence_id in support.evidence_ids})
+        )
+        citations = render_citations(bundle, evidence, cited, limits=limits)
+    except EvidenceError as error:
+        raise DraftingError(f"claim support is invalid: {error}") from error
+    by_claim = {support.claim_id: support.evidence_ids for support in canonical}
+    return DraftedAnswer(
+        claims=tuple(
+            DraftClaim(claim_id, texts[claim_id], by_claim[claim_id]) for claim_id in order
+        ),
+        citations=citations,
+    )
+
+
+def _bounded_document(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
+        raise DraftingError("model output must be a mapping with string keys")
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise DraftingError("model output is not canonically encodable JSON") from error
+    if len(encoded) > _MAX_OUTPUT_BYTES:
+        raise DraftingError(f"model output exceeds its {_MAX_OUTPUT_BYTES}-byte bound")
+    return cast(Mapping[str, object], value)
+
+
+def accept_bedrock_response(
+    value: object,
+    bundle: GenerationBundle,
+    evidence: EvidencePackage,
+    *,
+    limits: EvidenceLimits = _DEFAULT_LIMITS,
+) -> DraftedOutput:
+    """Normalize a typed Bedrock final-text response before parsing any model text."""
+    if not isinstance(value, BedrockTextResponse):
+        raise DraftingError("Bedrock response has an unknown or missing field")
+    try:
+        normalized = normalize_bedrock_response(value.response_text, value.stop_reason)
+    except BedrockResponseError as error:
+        raise DraftingError(f"Bedrock response failed closed: {error.code}") from error
+    try:
+        document = json.loads(
+            normalized.response_text,
+            object_pairs_hook=_reject_json_duplicates,
+        )
+    except (UnicodeError, json.JSONDecodeError, DraftingError) as error:
+        raise DraftingError("normalized Bedrock response is invalid JSON") from error
+    return accept_model_output(document, bundle, evidence, limits=limits)
+
+
+def _reject_json_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise DraftingError(f"normalized Bedrock response contains duplicate key: {key}")
+        value[key] = item
+    return value
+
+
+def _screened_model_text(value: str, field: str, maximum: int) -> None:
+    _bounded_text(value, field, maximum)
+    for label, pattern in _PROHIBITED_MODEL_TEXT:
+        if pattern.search(value) is not None:
+            raise DraftingError(f"{field} contains {label}")
+
+
+def _bounded_text(value: object, field: str, maximum: int) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise DraftingError(f"{field} must be non-blank text")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise DraftingError(f"{field} must be valid UTF-8") from error
+    if len(encoded) > maximum:
+        raise DraftingError(f"{field} exceeds its {maximum}-byte bound")
+    if any(
+        (ord(character) < 32 and character not in "\t\n") or 127 <= ord(character) <= 159
+        for character in value
+    ):
+        raise DraftingError(f"{field} contains a control character")
