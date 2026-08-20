@@ -1,0 +1,4 @@
+{
+  "app": "uv run python infra/app.py",
+  "output": "cdk.out"
+}

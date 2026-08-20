@@ -1,0 +1,5 @@
+{
+  "app": "uv run python infra/application.py",
+  "output": "cdk.application.out",
+  "stacks": ["ApplicationBootstrap", "ApplicationPlane"]
+}
