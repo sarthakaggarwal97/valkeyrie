@@ -1,0 +1,115 @@
+api_version: valkeyrie.io/revision-action-policy/1
+kind: RevisionAndExternalActionPolicy
+status: approved_boundary_design_not_deployed
+
+scope:
+  current_authorization: local_non_public_phase_1
+  external_actions_default: deny_unless_named_gate_or_authorized_protected_path
+  routine_change_default: normal_review_plus_automated_validation
+  project_state_writes: prohibited
+
+design_references:
+  - docs/rfcs/valkeyrie-maintainer-rfc.md#prompt-and-request-versioning
+  - docs/rfcs/valkeyrie-maintainer-rfc.md#separate-deployment-paths
+  - docs/rfcs/valkeyrie-maintainer-rfc.md#slack-behavior
+  - docs/rfcs/valkeyrie-maintainer-rfc.md#corpus-updates
+  - docs/security/threat-model.yaml
+  - task:F-06
+  - task:A-05
+  - task:P2-05
+  - task:P2-08
+
+request_revision_contract:
+  pin_on: first_idempotent_claim
+  required_fields:
+    - generation_id
+    - prompt_revision
+    - application_revision
+    - model_revision
+    - inference_config_revision
+  rules:
+    - Every retry, redrive, expired-claim recovery, and reconciliation attempt uses the revisions pinned by the first successful claim.
+    - A retry executes the pinned application revision and configuration; merely recording old identifiers while running current code or configuration is prohibited.
+    - No attempt substitutes the current active generation, prompt, application, model, or inference configuration.
+    - Static evidence and live-observation references remain bound to the request audit record.
+
+artifact_retention:
+  retention_floor: maximum_retry_redrive_recovery_and_reconciliation_lifetime
+  lifetime_components:
+    - queue_retry_lifetime
+    - dead_letter_redrive_lifetime
+    - expired_claim_recovery_lifetime
+    - terminal_unconfirmed_reconciliation_lifetime
+  artifacts:
+    - id: corpus_generation
+      revision_fields: [generation_id]
+      retained_object: sealed_generation_and_retrievable_index_state
+      execution_requirement: Retrieval must use the pinned generation filter and fail if that generation is unavailable.
+    - id: prompt_package
+      revision_fields: [prompt_revision]
+      retained_object: immutable_prompt_package
+      execution_requirement: The pinned prompt package, not the current prompt, is supplied to every attempt.
+    - id: application_package
+      revision_fields: [application_revision]
+      retained_object: immutable_routable_worker_artifact
+      execution_requirement: Retry and recovery dispatch execute the pinned worker artifact.
+    - id: answer_model_profile
+      revision_fields: [model_revision, inference_config_revision]
+      retained_object: immutable_model_profile_and_inference_configuration
+      execution_requirement: The exact model revision and inference configuration are requested without fallback substitution.
+  deletion_requires:
+    - No nonterminal request, queue, redrive, expired claim, send intent, or reconciliation record references the artifact.
+    - The maximum configured lifetime has elapsed since the last possible reference was created.
+    - The artifact is not a retained rollback target.
+  unavailable_provider_model_behavior: explicit_unavailable_outcome_no_model_or_configuration_substitution
+
+external_action_policy:
+  confirmation_rule: Only the six gates below require bespoke human confirmation inside the approved phase plan.
+  approval_binding: Each approval binds the exact reviewed revision, target, scope, evidence, owner, and time window named by its task.
+  non_transference: A gate authorizes only its named action and does not authorize a later gate or expand the security boundary.
+  gates:
+    - id: D-01
+      action: deploy_development_knowledge_plane
+      authorizes: The reviewed isolated knowledge-plane change set in the named development account and region.
+      does_not_authorize: [application_deployment, slack_deployment_or_traffic, live_github_credentials, public_beta]
+    - id: D-02
+      action: deploy_development_application_and_prompt_revision
+      authorizes: The reviewed application and prompt revision in the already approved development boundary.
+      does_not_authorize: [corpus_activation, slack_deployment_or_traffic, live_github_credentials, public_beta]
+    - id: P2-D1
+      action: deploy_disabled_slack_stack_and_run_bounded_synthetic_window
+      authorizes: The reviewed disabled stack, credentials, and named synthetic test window only.
+      does_not_authorize: [real_slack_pilot, live_github_credentials, public_beta]
+    - id: P2-D5
+      action: enable_timeboxed_real_slack_pilot
+      authorizes: The exact reviewed workspace, channels, participants, configuration, and pilot timebox.
+      does_not_authorize: [unlisted_slack_scope, live_github_credentials, public_beta]
+    - id: P3-D1
+      action: provision_live_github_credential_and_deploy_disabled_live_state
+      authorizes: The reviewed read-only identity and disabled live-state deployment in the named account and region.
+      does_not_authorize: [live_capability_enablement, project_state_writes, public_beta]
+    - id: P3-11
+      action: enable_read_only_public_beta
+      authorizes: The reviewed channels, read capabilities, owners, support boundary, and public-beta safeguards.
+      does_not_authorize: [private_sources, expanded_slack_scope, project_state_writes]
+
+routine_change_policy:
+  confirmation: no_new_bespoke_gate_when_the_approved_boundary_is_unchanged
+  review: normal_codeowners_review
+  classes:
+    - id: source_or_authority_policy
+      automated_validation: [source_schema, inventory_partition, path_and_authority_tests, affected_evaluations]
+    - id: prompt_or_routing
+      automated_validation: [prompt_contract, complete_visible_and_holdout_suite, safety_and_injection_cases, answer_diff]
+    - id: evaluation_contract
+      automated_validation: [manifest_and_schema, exact_suite_semantics, holdout_custody, threshold_regressions]
+    - id: answer_model_or_inference_configuration
+      automated_validation: [complete_model_qualification, safety_and_reliability_gates, immutable_profile]
+    - id: embedding_chunking_or_index_configuration
+      automated_validation: [retrieval_qualification, compatibility_preflight, deliberate_full_index_migration]
+    - id: corpus_generation
+      automated_validation: [exact_revision_resolution, reproducible_build, complete_manifest, evaluation_and_smoke_tests]
+  rules:
+    - Passing review and automated validation never grants a credential or executes an external action before its named gate.
+    - Routine changes use existing protected application-deployment or corpus-promotion paths only within an already authorized target and boundary.
+    - A private source, broader Slack scope, longer retention, proactive message, project-state write, or other boundary expansion stops and requires a separately reviewed future policy; it is not an implicit seventh gate or authorized beta action.

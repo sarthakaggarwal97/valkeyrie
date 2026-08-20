@@ -1,0 +1,433 @@
+api_version: valkeyrie.io/threat-model/1
+kind: ThreatModel
+status: approved_boundary_design_not_deployed
+
+scope:
+  current_authorization: local_non_public_phase_1
+  target_boundary: read_only_public_beta
+  public_inputs_only: true
+  real_slack_traffic: prohibited_until_P2-D5
+  project_state_writes: prohibited
+  external_action_gates: [D-01, D-02, P2-D1, P2-D5, P3-D1, P3-11]
+  excluded_inputs:
+    - private_repositories
+    - embargoed_security_advisories
+    - organization_internal_information
+    - direct_messages
+    - private_slack_channels
+    - broad_slack_history
+  prohibited_capabilities:
+    - github_or_project_state_writes
+    - release_readiness_decisions
+    - unrestricted_web_browsing
+    - arbitrary_code_execution
+    - existing_automation_credential_import
+    - proactive_or_cross_thread_slack_posts
+
+design_references:
+  - docs/rfcs/valkeyrie-maintainer-rfc.md#non-goals-for-the-first-public-beta
+  - docs/rfcs/valkeyrie-maintainer-rfc.md#slack-behavior
+  - docs/rfcs/valkeyrie-maintainer-rfc.md#security-and-privacy
+  - task:F-05
+  - task:P2-03
+  - task:P2-04
+  - task:P2-06
+  - task:P2-07
+  - task:I-10A
+
+data_flows:
+  - id: DF-GITHUB-CORPUS
+    source_zone: public_github
+    destination_zone: reviewed_corpus_builder
+    data: allowlisted_public_files_at_exact_commits
+    classification: public_untrusted
+    boundary_ids: [TB-PUBLIC-SOURCE]
+    enabled_phase: phase_1_local
+    rule: Selection comes only from reviewed sources.yaml; content cannot change policy.
+  - id: DF-CORPUS-AWS
+    source_zone: protected_corpus_workflow
+    destination_zone: immutable_s3_and_derived_index
+    data: normalized_documents_metadata_and_generation_control
+    classification: reviewed_project_data
+    boundary_ids: [TB-ACTIONS-AWS]
+    enabled_phase: after_D-01
+    rule: OIDC role is corpus-only; generations are write-once and prompts stay outside ingestion.
+  - id: DF-APPLICATION-AWS
+    source_zone: protected_application_workflow
+    destination_zone: immutable_application_and_prompt_runtime
+    data: reviewed_code_infrastructure_and_prompt_revision
+    classification: reviewed_project_data
+    boundary_ids: [TB-ACTIONS-AWS]
+    enabled_phase: after_D-02
+    rule: The application role deploys one immutable revision and cannot publish or activate corpus generations.
+  - id: DF-SLACK-INGRESS
+    source_zone: allowlisted_public_slack_channel
+    destination_zone: ingress_lambda_and_sqs
+    data: signed_mention_or_feedback_payload
+    classification: transient_user_data
+    boundary_ids: [TB-SLACK-INGRESS]
+    enabled_phase: bounded_synthetic_after_P2-D1_real_pilot_after_P2-D5
+    rule: Verify signature and scope, enqueue first, then return HTTP 2xx within three seconds only after SQS accepts; failed enqueue returns no acknowledgement so Slack can retry.
+  - id: DF-QUEUE-WORKER
+    source_zone: sqs_at_least_once_delivery
+    destination_zone: worker_and_request_state
+    data: verified_event_and_pinned_revision_identity
+    classification: transient_user_data
+    boundary_ids: [TB-QUEUE-WORKER]
+    enabled_phase: bounded_synthetic_after_P2-D1_real_pilot_after_P2-D5
+    rule: Claim idempotently before external work; retries reuse pinned revisions.
+  - id: DF-WORKER-EVIDENCE
+    source_zone: worker_runtime
+    destination_zone: static_retrieval_typed_github_and_bedrock
+    data: approved_question_validated_evidence_and_typed_read_requests
+    classification: public_evidence_plus_transient_question
+    boundary_ids: [TB-RUNTIME-DEPENDENCIES]
+    enabled_phase: phase_1_local_then_gated_runtime
+    rule: Deterministic code selects routes, sources, credentials, limits, and citations.
+  - id: DF-WORKER-SLACK
+    source_zone: worker_runtime
+    destination_zone: originating_allowlisted_slack_thread
+    data: acknowledgement_clarification_answer_or_approved_error
+    classification: transient_user_data
+    boundary_ids: [TB-RUNTIME-SLACK]
+    enabled_phase: bounded_synthetic_after_P2-D1_real_pilot_after_P2-D5
+    rule: Persist fenced intent before posting; pre-intent failures and definitive rejections retry, while ambiguous post-intent outcomes become terminal-unconfirmed without automatic repost.
+  - id: DF-OBSERVABILITY
+    source_zone: application_and_aws_dependencies
+    destination_zone: cloudwatch_metrics_logs_alarms_and_operator_exports
+    data: redacted_events_metrics_and_diagnostic_metadata
+    classification: operational_metadata
+    boundary_ids: [TB-RUNTIME-TELEMETRY]
+    enabled_phase: after_D-01
+    rule: Raw Slack content and credential-shaped values are excluded from normal telemetry.
+
+trust_boundaries:
+  - id: TB-PUBLIC-SOURCE
+    source: public_github_and_retrieved_text
+    destination: reviewed_builder_and_application
+    untrusted_inputs: [repository_content, metadata, retrieved_instructions]
+    required_control_ids: [C-PUBLIC-SOURCE, C-CONTENT-NONAUTHORITY]
+  - id: TB-ACTIONS-AWS
+    source: protected_github_actions_environment
+    destination: aws_account
+    untrusted_inputs: [workflow_inputs, changed_manifests, pull_request_content]
+    required_control_ids: [C-CLOUD-IDENTITY, C-NO-PROJECT-WRITE]
+  - id: TB-SLACK-INGRESS
+    source: public_internet_and_slack
+    destination: ingress_lambda
+    untrusted_inputs: [request_body, headers, timestamp, workspace_app_and_channel_ids]
+    required_control_ids: [C-SIGNED-INGRESS, C-ALLOWLISTED-SLACK, C-ENQUEUE-BEFORE-ACK]
+  - id: TB-QUEUE-WORKER
+    source: sqs_redelivery_and_request_state
+    destination: worker_lambda
+    untrusted_inputs: [duplicate_event, stale_lease, delayed_message, approved_question]
+    required_control_ids: [C-IDEMPOTENT-CLAIM, C-CONTENT-NONAUTHORITY, C-SECRET-HYGIENE, C-RETENTION]
+  - id: TB-RUNTIME-DEPENDENCIES
+    source: worker_lambda
+    destination: bedrock_knowledge_base_github_and_controller_projection
+    untrusted_inputs: [approved_question, credential_shaped_value, retrieved_text, malformed_response, throttling, outage, stale_state]
+    required_control_ids: [C-CONTENT-NONAUTHORITY, C-SECRET-HYGIENE, C-RETENTION, C-GENERATION-FILTER, C-CLOUD-IDENTITY, C-LIVE-GITHUB-IDENTITY, C-DEPENDENCY-FAIL-CLOSED, C-USAGE-LIMITS]
+  - id: TB-RUNTIME-SLACK
+    source: worker_lambda
+    destination: slack_web_api
+    untrusted_inputs: [timeout, definitive_rejection, ambiguous_remote_outcome]
+    required_control_ids: [C-SEND-FENCE, C-SAME-THREAD]
+  - id: TB-RUNTIME-TELEMETRY
+    source: runtime_data_and_failures
+    destination: operators_and_retained_telemetry
+    untrusted_inputs: [raw_question, secret_shaped_value, diagnostic_payload]
+    required_control_ids: [C-SECRET-HYGIENE, C-RETENTION, C-TELEMETRY-REDACTION]
+
+controls:
+  - id: C-PUBLIC-SOURCE
+    implementation_state: implemented
+    owner_tasks: [C-01, C-08]
+    requirement: Only reviewed public repositories and allowlisted paths are eligible for corpus or static evidence.
+  - id: C-ALLOWLISTED-SLACK
+    implementation_state: planned
+    owner_tasks: [P2-01, P2-03]
+    requirement: Only signed events from the approved workspace, app, and allowlisted public channels are eligible.
+  - id: C-CONTENT-NONAUTHORITY
+    implementation_state: planned
+    owner_tasks: [A-03, Q-02]
+    requirement: User, retrieved, and model text cannot select policy, authority, tools, endpoints, credentials, or limits.
+  - id: C-GENERATION-FILTER
+    implementation_state: planned
+    owner_tasks: [I-07, Q-03]
+    requirement: Every static retrieval uses the request-pinned generation and fails closed when unavailable.
+  - id: C-CLOUD-IDENTITY
+    implementation_state: planned
+    owner_tasks: [I-02]
+    requirement: Separate least-privilege GitHub OIDC deployment and corpus roles; no existing automation credential or project-write permission is imported.
+  - id: C-LIVE-GITHUB-IDENTITY
+    implementation_state: planned
+    owner_tasks: [P3-01, P3-02]
+    requirement: The live GitHub identity exposes only reviewed typed reads and remains isolated from existing automation credentials.
+  - id: C-NO-PROJECT-WRITE
+    implementation_state: planned
+    owner_tasks: [I-02]
+    requirement: No Phase 1 runtime or workflow identity can mutate GitHub, automation, releases, permissions, or project state.
+  - id: C-SECRET-HYGIENE
+    implementation_state: planned
+    owner_tasks: [P2-01, P2-07]
+    requirement: Secrets stay in Secrets Manager and secret-shaped values never enter prompts, logs, corpus, or evaluations.
+  - id: C-RETENTION
+    implementation_state: planned
+    owner_tasks: [P2-04, P2-07]
+    requirement: Expired context is rejected immediately; TTL deletion is eventual; all stores and exports follow the approved shortest-useful retention.
+  - id: C-DEPENDENCY-FAIL-CLOSED
+    implementation_state: planned
+    owner_tasks: [A-03, P2-08, P3-02]
+    requirement: Outages, throttling, malformed data, and unavailable generations produce explicit partial, unavailable, or abstention outcomes without stale fallback.
+  - id: C-SIGNED-INGRESS
+    implementation_state: planned
+    owner_tasks: [P2-03]
+    requirement: Signature, five-minute replay window, workspace, app, channel, size, and schema pass before enqueue and acknowledgement.
+  - id: C-ENQUEUE-BEFORE-ACK
+    implementation_state: planned
+    owner_tasks: [P2-03]
+    requirement: HTTP 2xx is returned within three seconds only after SQS accepts the verified event; failed enqueue remains retryable by Slack.
+  - id: C-IDEMPOTENT-CLAIM
+    implementation_state: planned
+    owner_tasks: [P2-04]
+    requirement: Conditional claims suppress duplicate model work and fence recovery after an expired lease.
+  - id: C-SEND-FENCE
+    implementation_state: planned
+    owner_tasks: [P2-06]
+    requirement: Durable per-post intent and fence token precede Slack calls; pre-intent failures and definitive rejections retry, while ambiguous post-intent outcomes become terminal-unconfirmed without automatic repost.
+  - id: C-SAME-THREAD
+    implementation_state: planned
+    owner_tasks: [P2-06]
+    requirement: The application writes only approved responses in the originating allowlisted thread.
+  - id: C-USAGE-LIMITS
+    implementation_state: planned
+    owner_tasks: [I-10A, I-10B]
+    requirement: Per-request API/token/model-call bounds, concurrency limits, budgets, anomaly alerts, and dependency breakers stop loops and abuse.
+  - id: C-TELEMETRY-REDACTION
+    implementation_state: planned
+    owner_tasks: [P2-07, P2-08]
+    requirement: Normal telemetry contains operational metadata, never raw Slack content, secrets, or credential-shaped values.
+  - id: C-KILL-SWITCH
+    implementation_state: planned
+    owner_tasks: [I-10A, I-10B, P2-08]
+    requirement: Named operators can disable ingress and model processing; promotion brakes default disabled and fail closed.
+
+verifications:
+  - id: V-SOURCE-SCOPE
+    implementation_state: implemented
+    type: automated_test
+    reference: tests/test_phase0_inputs.py::test_path_matching_covers_real_sources_and_deny_overrides
+    assertion: Private-shaped, control, generated, and excluded paths cannot enter the reviewed corpus.
+  - id: V-INJECTION
+    implementation_state: implemented
+    type: automated_test
+    reference: tests/test_threat_model.py::test_injection_and_private_scope_evaluations_are_distinct
+    assertion: User and retrieved-content injection cases independently require denial.
+  - id: V-ZERO-BOUNDARY
+    implementation_state: implemented
+    type: automated_test
+    reference: tests/test_evaluations.py::test_zero_tolerance_model_failures_block_candidate
+    assertion: Citation, security, privacy, write-boundary, and readiness failures block qualification.
+  - id: V-DEPENDENCY
+    implementation_state: implemented
+    type: automated_test
+    reference: tests/test_evaluations.py::test_failed_high_risk_request_remains_in_behavior_denominator
+    assertion: Dependency failure cannot remove a high-risk case from the fail-closed denominator.
+  - id: V-IAM
+    implementation_state: planned
+    type: task_acceptance
+    reference: I-02
+    assertion: Negative IAM tests prove role separation, read-only runtime identity, and absent project-write credentials.
+  - id: V-LIVE-GITHUB-IDENTITY
+    implementation_state: planned
+    type: task_acceptance
+    reference: P3-01
+    assertion: The proposed live GitHub app permissions are exact, read-only, isolated, and approved before provisioning.
+  - id: V-SECRETS
+    implementation_state: planned
+    type: task_acceptance
+    reference: P2-07
+    assertion: Prompt/log/corpus fixtures reject secrets and credential-shaped values.
+  - id: V-RETENTION
+    implementation_state: planned
+    type: task_acceptance
+    reference: P2-07
+    assertion: Tests cover logical expiry, retention/deletion policy, and every table, queue, DLQ, log, evaluation, and export store.
+  - id: V-RETENTION-DEPLOYED
+    implementation_state: planned
+    type: deployed_fault_test
+    reference: P2-09
+    assertion: Deployed tests prove immediate logical expiry and eventual TTL/deletion behavior.
+  - id: V-REPLAY
+    implementation_state: planned
+    type: task_acceptance
+    reference: P2-03
+    assertion: Unit tests reject invalid signatures, stale timestamps, and wrong workspace, app, or channel before enqueue.
+  - id: V-REPLAY-DEPLOYED
+    implementation_state: planned
+    type: deployed_fault_test
+    reference: P2-09
+    assertion: Deployed ingress fault tests prove signature and five-minute replay-window enforcement.
+  - id: V-DUPLICATE
+    implementation_state: planned
+    type: deployed_fault_test
+    reference: P2-09
+    assertion: Duplicate events, SQS redelivery, stale workers, and DLQ redrive do not repeat model work.
+  - id: V-UNCERTAIN-SEND
+    implementation_state: planned
+    type: deployed_fault_test
+    reference: P2-09
+    assertion: Every pre/post-intent failure point proves retry, definitive rejection, or terminal-unconfirmed behavior without blind repost.
+  - id: V-SAME-THREAD
+    implementation_state: planned
+    type: deployed_fault_test
+    reference: P2-09
+    assertion: Wrong-channel and wrong-thread post attempts fail closed.
+  - id: V-RUNAWAY
+    implementation_state: planned
+    type: deployed_fault_test
+    reference: I-10B
+    assertion: API, token, model-call, concurrency, dependency, budget, anomaly, promotion, and emergency-stop controls trigger before quotas are exhausted.
+  - id: V-KILL-SWITCH
+    implementation_state: planned
+    type: deployed_fault_test
+    reference: I-10B
+    assertion: Deployed safeguard tests prove ingress and model processing emergency stops reach named owners and fail closed.
+  - id: V-DISABLED-STACK
+    implementation_state: planned
+    type: task_acceptance
+    reference: P2-D4
+    assertion: Post-synthetic checks prove ingress and model processing are disabled and no channel remains enabled.
+  - id: V-PRIVATE-INPUT
+    implementation_state: implemented
+    type: automated_test
+    reference: tests/test_threat_model.py::test_injection_and_private_scope_evaluations_are_distinct
+    assertion: Distinct source, direct-message, private-channel, and broad-history cases require denial or abstention.
+
+threats:
+  - id: TH-PROMPT-INJECTION
+    category: prompt_injection
+    boundary_ids: [TB-PUBLIC-SOURCE, TB-SLACK-INGRESS, TB-QUEUE-WORKER, TB-RUNTIME-DEPENDENCIES]
+    scenario: User or retrieved content attempts to change source authority, tools, credentials, limits, or qualification behavior.
+    impact: Unauthorized capability selection, evidence poisoning, fabricated claims, or policy bypass.
+    control_ids: [C-PUBLIC-SOURCE, C-CONTENT-NONAUTHORITY, C-GENERATION-FILTER]
+    verification_ids: [V-INJECTION, V-ZERO-BOUNDARY]
+    residual_risk: Novel instructions may reduce answer quality; deterministic validation must still block authority and capability changes.
+    required_before: [Q-02]
+  - id: TH-CLOUD-CREDENTIAL
+    category: credential_exposure
+    boundary_ids: [TB-ACTIONS-AWS]
+    scenario: A workflow or application identity gains broad AWS access, imports an automation credential, or receives project-write permission.
+    impact: AWS compromise or project-state mutation outside the read-only boundary.
+    control_ids: [C-CLOUD-IDENTITY, C-NO-PROJECT-WRITE]
+    verification_ids: [V-IAM]
+    residual_risk: Compromise of an approved narrow deployment credential remains possible and requires revocation and incident response.
+    required_before: [D-01, D-02]
+  - id: TH-SLACK-SECRET
+    category: secret_exposure
+    boundary_ids: [TB-SLACK-INGRESS, TB-QUEUE-WORKER, TB-RUNTIME-DEPENDENCIES, TB-RUNTIME-TELEMETRY]
+    scenario: A Slack secret or credential-shaped user value enters a prompt, corpus, log, evaluation, or operator export.
+    impact: Slack application compromise or disclosure of user-supplied credentials.
+    control_ids: [C-SECRET-HYGIENE, C-RETENTION, C-TELEMETRY-REDACTION]
+    verification_ids: [V-SECRETS, V-RETENTION]
+    residual_risk: Secret-pattern detection can reject benign text and still requires rotation after suspected exposure.
+    required_before: [P2-D1]
+  - id: TH-LIVE-CREDENTIAL
+    category: live_credential_exposure
+    boundary_ids: [TB-RUNTIME-DEPENDENCIES]
+    scenario: A live GitHub credential exposes unreviewed operations or can be selected or redirected by user, retrieved, or model text.
+    impact: Unauthorized GitHub access or expansion from typed reads to project-state mutation.
+    control_ids: [C-LIVE-GITHUB-IDENTITY, C-CONTENT-NONAUTHORITY]
+    verification_ids: [V-LIVE-GITHUB-IDENTITY]
+    residual_risk: A narrow read credential can still expose public metadata incorrectly if typed response validation fails.
+    required_before: [P3-D1]
+  - id: TH-RETENTION-DESIGN
+    category: retention_privacy
+    boundary_ids: [TB-QUEUE-WORKER, TB-RUNTIME-DEPENDENCIES, TB-RUNTIME-TELEMETRY]
+    scenario: Raw questions, context, secrets, or diagnosed-failure exports are assigned an overbroad or incomplete retention/deletion policy.
+    impact: Privacy breach, unintended model/log disclosure, or expanded data scope.
+    control_ids: [C-SECRET-HYGIENE, C-RETENTION, C-TELEMETRY-REDACTION]
+    verification_ids: [V-SECRETS, V-RETENTION]
+    residual_risk: Physical TTL deletion is eventual, so application-level expiry must remain authoritative.
+    required_before: [P2-D1]
+  - id: TH-RETENTION-RUNTIME
+    category: retention_runtime
+    boundary_ids: [TB-QUEUE-WORKER, TB-RUNTIME-TELEMETRY]
+    scenario: Deployed context or exports remain logically accessible after expiry or evade approved deletion behavior.
+    impact: Pilot data remains available beyond the approved window.
+    control_ids: [C-RETENTION, C-TELEMETRY-REDACTION]
+    verification_ids: [V-RETENTION-DEPLOYED]
+    residual_risk: Eventual physical deletion leaves inaccessible expired records until AWS cleanup completes.
+    required_before: [P2-D5]
+  - id: TH-DEPENDENCY
+    category: dependency_failure
+    boundary_ids: [TB-RUNTIME-DEPENDENCIES]
+    scenario: GitHub, Bedrock, retrieval, controller projection, or pinned generation is unavailable, throttled, stale, or malformed.
+    impact: False absence/readiness claims, stale fallback, mixed generations, or unbounded retries.
+    control_ids: [C-GENERATION-FILTER, C-DEPENDENCY-FAIL-CLOSED, C-USAGE-LIMITS]
+    verification_ids: [V-DEPENDENCY, V-RUNAWAY]
+    residual_risk: A safe partial or unavailable answer can reduce usefulness but preserves evidence integrity.
+    required_before: [Q-04, P2-D5, P3-11]
+  - id: TH-REPLAY
+    category: replay
+    boundary_ids: [TB-SLACK-INGRESS]
+    scenario: A captured, stale, forged, or cross-workspace Slack request is delivered as a new event.
+    impact: Unauthorized processing, repeated cost, or response in an unapproved channel.
+    control_ids: [C-SIGNED-INGRESS, C-ALLOWLISTED-SLACK, C-ENQUEUE-BEFORE-ACK]
+    verification_ids: [V-REPLAY]
+    residual_risk: Valid in-window Slack retries remain and are handled by idempotency.
+    required_before: [P2-D1]
+  - id: TH-REPLAY-DEPLOYED
+    category: replay_deployed
+    boundary_ids: [TB-SLACK-INGRESS, TB-QUEUE-WORKER]
+    scenario: Deployed ingress replay or delayed retry bypasses the approved timestamp, idempotency, or same-thread behavior.
+    impact: Repeated model cost or a duplicate or misplaced reply during the real pilot.
+    control_ids: [C-SIGNED-INGRESS, C-IDEMPOTENT-CLAIM, C-SAME-THREAD]
+    verification_ids: [V-REPLAY-DEPLOYED, V-SAME-THREAD]
+    residual_risk: Fault testing cannot exhaust every provider retry schedule; bounded monitoring remains necessary.
+    required_before: [P2-D5]
+  - id: TH-DUPLICATE
+    category: duplicate_delivery
+    boundary_ids: [TB-QUEUE-WORKER]
+    scenario: Slack retries, SQS redelivery, concurrent workers, stale leases, or DLQ redrive repeat one logical request.
+    impact: Duplicate model work, inconsistent revisions, repeated cost, or duplicate visible replies.
+    control_ids: [C-IDEMPOTENT-CLAIM, C-RETENTION, C-SEND-FENCE]
+    verification_ids: [V-DUPLICATE, V-UNCERTAIN-SEND]
+    residual_risk: Exactly-once external delivery is not promised; omission is preferred to an unsafe duplicate.
+    required_before: [P2-D5]
+  - id: TH-UNCERTAIN-SEND
+    category: uncertain_send
+    boundary_ids: [TB-RUNTIME-SLACK]
+    scenario: A timeout or crash occurs after durable send intent when Slack may have accepted the post.
+    impact: Blind retry can duplicate a visible acknowledgement, clarification, answer, or error.
+    control_ids: [C-SEND-FENCE, C-SAME-THREAD]
+    verification_ids: [V-UNCERTAIN-SEND, V-SAME-THREAD]
+    residual_risk: Terminal-unconfirmed may omit a post and requires reconciliation or manual recovery.
+    required_before: [P2-D5]
+  - id: TH-RUNAWAY
+    category: runaway_usage
+    boundary_ids: [TB-QUEUE-WORKER, TB-RUNTIME-DEPENDENCIES]
+    scenario: Retry loops, abuse, configuration errors, dependency storms, or concurrency consume unbounded calls, tokens, spend, or storage.
+    impact: Cost overrun, throttling, service instability, or blocked owner operations.
+    control_ids: [C-IDEMPOTENT-CLAIM, C-USAGE-LIMITS, C-KILL-SWITCH]
+    verification_ids: [V-RUNAWAY, V-KILL-SWITCH]
+    residual_risk: Circuit breakers may reject legitimate traffic and require named-owner recovery.
+    required_before: [P2-D1, P2-D5, P3-11]
+  - id: TH-DISABLED-STACK
+    category: disabled_stack
+    boundary_ids: [TB-SLACK-INGRESS, TB-QUEUE-WORKER, TB-RUNTIME-DEPENDENCIES]
+    scenario: Synthetic enablement remains active after its bounded run or can resume processing without the next human gate.
+    impact: Unapproved Slack or model traffic occurs between the synthetic and real-pilot decisions.
+    control_ids: [C-USAGE-LIMITS, C-KILL-SWITCH]
+    verification_ids: [V-DISABLED-STACK]
+    residual_risk: Operators must preserve disablement while investigating any failed closeout check.
+    required_before: [P2-D5]
+  - id: TH-PRIVATE-INTERNAL
+    category: private_internal_input
+    boundary_ids: [TB-PUBLIC-SOURCE, TB-SLACK-INGRESS, TB-QUEUE-WORKER, TB-RUNTIME-DEPENDENCIES, TB-RUNTIME-TELEMETRY]
+    scenario: A connector, credential, channel rule, history fetch, or telemetry path admits private repositories, advisories, internal code, DMs, private channels, broad history, or credentials.
+    impact: Confidentiality breach and an unauthorized expansion of the approved public-source and allowlisted-channel boundary.
+    control_ids: [C-PUBLIC-SOURCE, C-ALLOWLISTED-SLACK, C-SECRET-HYGIENE, C-RETENTION, C-TELEMETRY-REDACTION]
+    verification_ids: [V-SOURCE-SCOPE, V-PRIVATE-INPUT, V-SECRETS]
+    residual_risk: Non-credential sensitive text pasted into an allowed public channel may enter the approved prompt and transient queue under the retention policy; scope controls prevent private connector, DM, private-channel, and broad-history access rather than classifying all sensitive prose.
+    required_before: [P2-D1, P2-D5, P3-D1, P3-11]
