@@ -1,0 +1,19 @@
+{
+    "Item": {
+        "fence": {
+            "N": "1"
+        },
+        "lease_expires_at": {
+            "S": "2026-08-20T15:31:08Z"
+        },
+        "owner": {
+            "S": "deployed-evaluation-6f19efd2cf2f"
+        },
+        "pk": {
+            "S": "request#req_deployed-eval-3a14b616d5d13a8c0f1341dc6ad336d853d8b7eaeb039396a6d8a4925a1934b7"
+        },
+        "revision": {
+            "N": "1"
+        }
+    }
+}

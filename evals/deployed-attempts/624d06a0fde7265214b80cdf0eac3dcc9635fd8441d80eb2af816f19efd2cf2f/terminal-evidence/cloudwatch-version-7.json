@@ -1,0 +1,41 @@
+{
+    "events": [
+        {
+            "timestamp": 1787239548665,
+            "message": "{\"timestamp\": \"2026-08-20T15:25:48Z\", \"level\": \"INFO\", \"message\": \"Found credentials in environment variables.\", \"logger\": \"botocore.credentials\", \"requestId\": \"7eb40436-0dd8-4ba2-87fc-06cafc38013b\"}\n",
+            "ingestionTime": 1787239552986
+        },
+        {
+            "timestamp": 1787239598802,
+            "message": "{\"time\":\"2026-08-20T15:26:38.802Z\",\"type\":\"platform.runtimeDone\",\"record\":{\"requestId\":\"f2d4f832-ea3f-411f-a0d6-70114192d856\",\"status\":\"timeout\",\"metrics\":{\"durationMs\":30000.809,\"producedBytes\":0}}}",
+            "ingestionTime": 1787239598822
+        },
+        {
+            "timestamp": 1787239598811,
+            "message": "{\"time\":\"2026-08-20T15:26:38.811Z\",\"type\":\"platform.report\",\"record\":{\"requestId\":\"f2d4f832-ea3f-411f-a0d6-70114192d856\",\"metrics\":{\"durationMs\":30000.0,\"billedDurationMs\":30000,\"memorySizeMB\":512,\"maxMemoryUsedMB\":111},\"status\":\"timeout\"}}",
+            "ingestionTime": 1787239598839
+        },
+        {
+            "timestamp": 1787239775426,
+            "message": "{\"timestamp\": \"2026-08-20T15:29:35Z\", \"level\": \"INFO\", \"message\": \"Found credentials in environment variables.\", \"logger\": \"botocore.credentials\", \"requestId\": \"f738a796-71ab-477c-bcba-d346b0c34c8c\"}\n",
+            "ingestionTime": 1787239782824
+        },
+        {
+            "timestamp": 1787239846749,
+            "message": "{\"time\":\"2026-08-20T15:30:46.749Z\",\"type\":\"platform.runtimeDone\",\"record\":{\"requestId\":\"c164d276-28f2-41d4-af27-44dc279506e0\",\"status\":\"timeout\",\"metrics\":{\"durationMs\":30000.463,\"producedBytes\":0}}}",
+            "ingestionTime": 1787239846774
+        },
+        {
+            "timestamp": 1787239846759,
+            "message": "{\"time\":\"2026-08-20T15:30:46.759Z\",\"type\":\"platform.report\",\"record\":{\"requestId\":\"c164d276-28f2-41d4-af27-44dc279506e0\",\"metrics\":{\"durationMs\":30000.0,\"billedDurationMs\":30000,\"memorySizeMB\":512,\"maxMemoryUsedMB\":112},\"status\":\"timeout\"}}",
+            "ingestionTime": 1787239846791
+        },
+        {
+            "timestamp": 1787239849348,
+            "message": "{\"timestamp\": \"2026-08-20T15:30:49Z\", \"level\": \"INFO\", \"message\": \"Found credentials in environment variables.\", \"logger\": \"botocore.credentials\", \"requestId\": \"d526534e-3ac9-4483-8b34-625842c9f47a\"}\n",
+            "ingestionTime": 1787239856737
+        }
+    ],
+    "nextForwardToken": "f/39856780488970005256603500015623178220447275044942643200/s",
+    "nextBackwardToken": "b/39856773783515036726820141582026425211373542768428843008/s"
+}
