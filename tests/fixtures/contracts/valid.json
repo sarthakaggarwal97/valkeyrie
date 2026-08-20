@@ -1,0 +1,217 @@
+{
+  "normalized_document": {
+    "api_version": "valkeyrie.io/normalized-document/1",
+    "kind": "NormalizedDocument",
+    "document_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "content_type": "text/markdown",
+    "content": "GET returns the value stored at a key."
+  },
+  "metadata_sidecar": {
+    "api_version": "valkeyrie.io/metadata-sidecar/1",
+    "kind": "MetadataSidecar",
+    "document_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "generation_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "repository": "valkey-doc",
+    "path": "commands/get.md",
+    "commit": "3333333333333333333333333333333333333333",
+    "authority": "canonical",
+    "version_scope": "released_and_current_documentation",
+    "content_type": "text/markdown",
+    "content_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "generation_manifest": {
+    "api_version": "valkeyrie.io/generation-manifest/1",
+    "kind": "GenerationManifest",
+    "generation_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "sources_revision": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "retrieval_config_revision": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+    "created_at": "2026-08-18T19:00:00Z",
+    "documents": [
+      {
+        "document_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "content_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "metadata_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+      }
+    ],
+    "structured_records": [
+      {
+        "record_id": "command:get",
+        "record_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+      }
+    ]
+  },
+  "generation_completion": {
+    "api_version": "valkeyrie.io/generation-completion/1",
+    "kind": "GenerationCompletion",
+    "generation_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "manifest_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "published_object_count": 4
+  },
+  "candidate_state": {
+    "generation_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "status": "INGESTING",
+    "revision": 1,
+    "fence": 1,
+    "attempt": 1,
+    "owner": "worker-1",
+    "lease_expires_at": 1800000300,
+    "ingestion_job_id": null,
+    "documents_scanned": null,
+    "failure": null
+  },
+  "generation_availability": {
+    "generation_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "revision": 1,
+    "sealed": true,
+    "available": true,
+    "ingested": true,
+    "retrievable": true,
+    "evaluation_passed": true,
+    "retained": true,
+    "evaluation_report_id": "eval_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "active_generation": {
+    "generation_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "revision": 1,
+    "evaluation_report_id": "eval_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "activated_at": "2026-08-19T03:00:00Z"
+  },
+  "protected_approval": {
+    "approval_id": "approval_example",
+    "action": "activate",
+    "generation_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "expected_active_generation": null,
+    "evaluation_report_id": "eval_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "approver": "sarthagg",
+    "approved_at": "2026-08-19T03:00:00Z"
+  },
+  "evidence_record": {
+    "api_version": "valkeyrie.io/evidence-record/1",
+    "kind": "EvidenceRecord",
+    "evidence_id": "ev_get-command",
+    "generation_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "source": {
+      "repository": "valkey-doc",
+      "path": "commands/get.md",
+      "commit": "3333333333333333333333333333333333333333",
+      "authority": "canonical",
+      "version_scope": "released_and_current_documentation",
+      "immutable_url": "https://github.com/valkey-io/valkey-doc/blob/3333333333333333333333333333333333333333/commands/get.md"
+    },
+    "excerpt": "GET returns the value stored at a key.",
+    "excerpt_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+  },
+  "model_output": {
+    "api_version": "valkeyrie.io/model-output/1",
+    "kind": "ModelOutput",
+    "outcome": "answer",
+    "claims": [
+      {
+        "claim_id": "get-returns-stored-value",
+        "text": "GET returns the value stored at a key.",
+        "evidence_ids": [
+          "ev_get-command"
+        ]
+      }
+    ]
+  },
+  "request_audit": {
+    "api_version": "valkeyrie.io/request-audit/1",
+    "kind": "RequestAudit",
+    "request_id": "req_example",
+    "request_content_digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+    "generation_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "prompt_revision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "application_revision": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "model_revision": "amazon.nova-pro-v1:0",
+    "inference_config_revision": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "static_evidence_ids": [
+      "ev_get-command"
+    ],
+    "live_observations": [
+      {
+        "api_version": "valkeyrie.io/live-observation/1",
+        "kind": "LiveObservation",
+        "observation_id": "obs_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "observed_at": "2026-08-18T19:00:00Z",
+        "source_url": "https://api.github.com/repos/valkey-io/valkey/releases/latest",
+        "object_type": "release",
+        "payload": {
+          "tag_name": "9.0.0"
+        },
+        "payload_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "complete": true,
+        "truncated": false
+      }
+    ],
+    "started_at": "2026-08-18T19:00:00Z",
+    "outcome": "answer"
+  },
+  "live_observation": {
+    "api_version": "valkeyrie.io/live-observation/1",
+    "kind": "LiveObservation",
+    "observation_id": "obs_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "observed_at": "2026-08-18T19:00:00Z",
+    "source_url": "https://api.github.com/repos/valkey-io/valkey/releases/latest",
+    "object_type": "release",
+    "payload": {
+      "tag_name": "9.0.0"
+    },
+    "payload_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "complete": true,
+    "truncated": false
+  },
+  "evaluation_report": {
+    "api_version": "valkeyrie.io/evaluation-report/1",
+    "kind": "EvaluationReport",
+    "report_id": "eval_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "candidate_revision": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "suite_revision": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "started_at": "2026-08-18T19:00:00Z",
+    "completed_at": "2026-08-18T19:01:00Z",
+    "result": "pass",
+    "summary": {
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "public_cases": 1,
+      "holdout_cases": 1,
+      "retrieval_fixtures": 1,
+      "model_runs": 6,
+      "model_grading_calls": 0,
+      "recorded_cost_usd": 0
+    },
+    "gates": [
+      {
+        "name": "model.valid_structured_output",
+        "status": "pass",
+        "actual": 1,
+        "operator": "at_least",
+        "threshold": 1
+      }
+    ],
+    "cases": [
+      {
+        "case_id": "core-get",
+        "scope": "model",
+        "split": "public",
+        "runs": 3,
+        "status": "pass"
+      },
+      {
+        "case_id": "holdout-core-get",
+        "scope": "model",
+        "split": "holdout",
+        "runs": 3,
+        "status": "pass"
+      },
+      {
+        "case_id": "retrieval-core-get",
+        "scope": "retrieval",
+        "split": "fixture",
+        "runs": 1,
+        "status": "pass"
+      }
+    ]
+  }
+}
