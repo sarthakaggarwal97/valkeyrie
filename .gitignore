@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+dist/
+*.egg-info/
+
+# AWS CDK local synthesis
+cdk.out/
+cdk.application.out/
+cdk.context.json
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
