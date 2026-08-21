@@ -256,10 +256,10 @@ def execute_release(
         raise CorpusReleaseError("generation evaluation state does not match the supplied report")
 
     active: ActiveGeneration | None = None
-    if prepared.approval_id is not None:
-        if prepared.report is None or prepared.activated_at is None:
-            raise CorpusReleaseError("activation requires a prepared passing report and timestamp")
-        if services.retrieval_client is None or services.approval_registry is None:
+    if prepared.activated_at is not None:
+        if prepared.report is None:
+            raise CorpusReleaseError("activation requires a prepared passing report")
+        if services.retrieval_client is None:
             raise CorpusReleaseError("activation services are absent")
         active = activate_candidate(
             services.lifecycle_store,
@@ -315,7 +315,7 @@ def preflight_result(
             "ingest",
             "mark_retrievable",
             *(["apply_verified_evaluation"] if prepared.report is not None else []),
-            *(["consume_approval_and_activate"] if prepared.approval_id is not None else []),
+            *(["activate"] if prepared.activated_at is not None else []),
         ],
     }
 
@@ -377,7 +377,7 @@ def _base_result(prepared: PreparedRelease) -> dict[str, object]:
         "structured_index_sha256": _structured_index_root(prepared.structured_index),
         "source_commits": dict(prepared.source_commits),
         "evaluation_report_id": (None if prepared.report is None else prepared.report["report_id"]),
-        "activation_requested": prepared.approval_id is not None,
+        "activation_requested": prepared.activated_at is not None,
         "approval_id": prepared.approval_id,
         "expected_active_generation": prepared.expected_active_generation,
         "activated_at": prepared.activated_at,
@@ -465,21 +465,25 @@ def _validate_activation_inputs(
     expected_active_generation: str | None,
     activated_at: str | None,
 ) -> str | None:
-    activation_values = (approval_id, expected_active_generation, activated_at)
-    if approval_id is None:
-        if any(value is not None for value in activation_values[1:]):
-            raise CorpusReleaseError("activation inputs require a protected approval ID")
+    # Activation is requested by supplying an activation timestamp, not by supplying an
+    # approval token, so an unattended refresh can promote a generation that passed
+    # evaluation. The quality gates are unchanged: a passing report is still required, the
+    # candidate must record it, a live retrieval smoke must succeed, and the active pointer
+    # still moves only through compare-and-swap.
+    if activated_at is None:
+        if approval_id is not None or expected_active_generation is not None:
+            raise CorpusReleaseError("activation inputs require an activation timestamp")
         return None
     if evaluation_report_path is None:
         raise CorpusReleaseError("activation requires a supplied evaluation report")
-    if _APPROVAL_ID.fullmatch(approval_id) is None:
+    if approval_id is not None and _APPROVAL_ID.fullmatch(approval_id) is None:
         raise CorpusReleaseError("protected approval ID is malformed")
     if expected_active_generation is None:
         raise CorpusReleaseError("activation requires an explicit expected active generation")
     expected = None if expected_active_generation == "none" else expected_active_generation
     if expected is not None and _DIGEST.fullmatch(expected) is None:
         raise CorpusReleaseError("expected active generation is malformed")
-    if activated_at is None or _TIMESTAMP.fullmatch(activated_at) is None:
+    if _TIMESTAMP.fullmatch(activated_at) is None:
         raise CorpusReleaseError("activation timestamp is malformed")
     return expected
 
@@ -585,7 +589,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         else:
             s3 = create_s3_client(resources.region)
             dynamodb = create_dynamodb_client(resources.region)
-            activation = prepared.approval_id is not None
+            activation = prepared.activated_at is not None
             services = ReleaseServices(
                 publication_store=S3PublicationStore(resources.bucket, s3),
                 lifecycle_store=DynamoPromotionStore(resources.state_table, dynamodb),

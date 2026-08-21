@@ -190,6 +190,70 @@ def activate_candidate(
     )
 
 
+def activate_without_approval(
+    store: MemoryPromotionStore,
+    suite: EvaluationSuite,
+    report: dict[str, object],
+    *,
+    expected_active_generation: str | None,
+    activated_at: str,
+) -> ActiveGeneration:
+    """Activate the way an unattended weekly refresh does, with no human token."""
+    return activate_candidate_impl(
+        store,
+        suite,
+        report,
+        None,
+        approval_id=None,
+        retrieval_client=SmokeClient(),
+        retrieval_config=CONFIG,
+        knowledge_base_id="ABCDEFGHIJ",
+        expected_active_generation=expected_active_generation,
+        activated_at=activated_at,
+    )
+
+
+def test_unattended_activation_needs_no_approval_but_still_requires_the_cas(
+    suite: EvaluationSuite,
+) -> None:
+    report = _report(suite, GEN_A)
+    report_id = cast(str, report["report_id"])
+    store = MemoryPromotionStore([_record(GEN_A, report_id)])
+
+    active = activate_without_approval(
+        store, suite, report, expected_active_generation=None, activated_at=NOW
+    )
+
+    assert active == ActiveGeneration(GEN_A, 1, report_id, NOW)
+    assert store.active == active
+    assert store.writes == [active]
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"retrievable": False}, "not safely retrievable"),
+        ({"evaluation_passed": False}, "has not passed evaluation"),
+    ],
+)
+def test_unattended_activation_still_refuses_an_unqualified_generation(
+    suite: EvaluationSuite, changes: dict[str, object], message: str
+) -> None:
+    # Removing the human token must not remove the quality gates: without an approval the
+    # evaluation result is the only thing standing between a bad corpus and live traffic.
+    report = _report(suite, GEN_A)
+    report_id = cast(str, report["report_id"])
+    store = MemoryPromotionStore([_record(GEN_A, report_id, **changes)])
+
+    with pytest.raises(PromotionError, match=message):
+        activate_without_approval(
+            store, suite, report, expected_active_generation=None, activated_at=NOW
+        )
+
+    assert store.active is None
+    assert store.writes == []
+
+
 def test_passing_candidate_activates_only_through_expected_cas_and_approval(
     suite: EvaluationSuite,
 ) -> None:

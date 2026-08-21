@@ -94,16 +94,24 @@ def activate_candidate(
     store: PromotionStore,
     suite: EvaluationSuite,
     report: Mapping[str, object],
-    approval_registry: ApprovalRegistry,
+    approval_registry: ApprovalRegistry | None,
     *,
-    approval_id: str,
+    approval_id: str | None,
     retrieval_client: BedrockRetrievalClient,
     retrieval_config: FrozenRetrievalConfiguration,
     knowledge_base_id: str,
     expected_active_generation: str | None,
     activated_at: str,
 ) -> ActiveGeneration:
-    """Smoke, approve, and CAS-activate one exact qualified generation state."""
+    """Smoke and CAS-activate one exact qualified generation state.
+
+    ``approval_id`` is optional so an unattended corpus refresh can promote a
+    generation without a human token. The quality gates are unchanged and all still
+    apply: the evaluation report must pass, the stored candidate must record that
+    exact passing report, a live generation-filtered retrieval smoke must succeed,
+    and the active pointer still moves only through compare-and-swap. Supplying an
+    approval adds the one-time human token on top of those.
+    """
     _validate_store(store)
     generation_id, report_id = _passing_report(suite, report)
     record = _generation(store, generation_id)
@@ -121,14 +129,15 @@ def activate_candidate(
         )
     except RetrievalError as error:
         raise PromotionError(f"candidate generation-filtered smoke failed: {error}") from error
-    _consume_approval(
-        approval_registry,
-        approval_id,
-        "activate",
-        generation_id,
-        expected_active_generation,
-        report_id,
-    )
+    if approval_id is not None or approval_registry is not None:
+        _consume_approval(
+            approval_registry,
+            approval_id,
+            "activate",
+            generation_id,
+            expected_active_generation,
+            report_id,
+        )
     replacement = ActiveGeneration(
         generation_id,
         1 if current is None else current.revision + 1,
@@ -219,7 +228,7 @@ def _validate_active(active: object) -> None:
 
 
 def _consume_approval(
-    registry: ApprovalRegistry,
+    registry: ApprovalRegistry | None,
     approval_id: object,
     action: Literal["activate", "rollback"],
     generation_id: str,
