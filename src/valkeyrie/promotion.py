@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final, Literal, Protocol
 
@@ -142,95 +142,6 @@ def activate_candidate(
     return replacement
 
 
-def rollback_generation(
-    store: PromotionStore,
-    approval_registry: ApprovalRegistry,
-    *,
-    approval_id: str,
-    target_generation_id: str,
-    expected_active_generation: str,
-    switched_at: str,
-    health_check: Callable[[PinnedGeneration], bool],
-) -> ActiveGeneration:
-    """CAS-switch to an eligible retained generation and safely restore on failed health."""
-    _validate_store(store)
-    if not callable(health_check):
-        raise PromotionError("rollback health check must be callable")
-    _validate_timestamp(switched_at, "rollback timestamp")
-    target = _generation(store, target_generation_id)
-    _require_rollback_target(target)
-    if target.evaluation_report_id is None:  # pragma: no cover - eligibility owns this branch
-        raise PromotionError("rollback target has no passing evaluation report")
-    current = _expected_active(store, expected_active_generation)
-    if current is None:
-        raise PromotionError("rollback requires an existing active generation")
-    if current.generation_id == target_generation_id:
-        raise PromotionError("rollback target is already active")
-    prior_record = _generation(store, current.generation_id)
-    _consume_approval(
-        approval_registry,
-        approval_id,
-        "rollback",
-        target_generation_id,
-        expected_active_generation,
-        target.evaluation_report_id,
-    )
-
-    replacement = ActiveGeneration(
-        target_generation_id,
-        current.revision + 1,
-        target.evaluation_report_id,
-        switched_at,
-    )
-    if not store.compare_and_swap_active(current.revision, target, replacement):
-        raise PromotionError("active or rollback-target state changed during rollback")
-
-    try:
-        pin = pin_generation(store, target_generation_id)
-        result = health_check(pin)
-        if not isinstance(result, bool):
-            raise PromotionError("rollback health check returned a non-boolean result")
-        if not result:
-            raise PromotionError("rollback health check failed")
-    except Exception as error:
-        _restore_after_failed_health(store, current, prior_record, replacement, switched_at)
-        raise PromotionError(
-            "rollback health check failed; safe prior active generation restored"
-        ) from error
-    _require_active_ownership(store, replacement, "rollback")
-    return replacement
-
-
-def _restore_after_failed_health(
-    store: PromotionStore,
-    prior: ActiveGeneration,
-    prior_record: GenerationAvailability,
-    failed_switch: ActiveGeneration,
-    restored_at: str,
-) -> None:
-    try:
-        current_prior = _generation(store, prior.generation_id)
-    except PromotionError as error:
-        raise PromotionError(
-            "rollback health failed and prior generation is no longer safely restorable"
-        ) from error
-    if current_prior != prior_record:
-        raise PromotionError("rollback health failed and prior generation lifecycle state changed")
-    restored = ActiveGeneration(
-        prior.generation_id,
-        failed_switch.revision + 1,
-        prior.evaluation_report_id,
-        restored_at,
-    )
-    if not store.compare_and_swap_active(
-        failed_switch.revision,
-        current_prior,
-        restored,
-    ):
-        raise PromotionError("rollback health failed and safe prior restoration raced")
-    _require_active_ownership(store, restored, "rollback restoration")
-
-
 def _passing_report(
     suite: EvaluationSuite,
     report: Mapping[str, object],
@@ -272,13 +183,6 @@ def _require_activation_candidate(record: GenerationAvailability, report_id: str
         raise PromotionError("candidate generation has not passed evaluation")
     if record.evaluation_report_id != report_id:
         raise PromotionError("candidate state and evaluation report do not match")
-
-
-def _require_rollback_target(record: GenerationAvailability) -> None:
-    if not record.retained:
-        raise PromotionError("rollback target is not retained")
-    if not record.evaluation_passed or record.evaluation_report_id is None:
-        raise PromotionError("rollback target has no passing evaluation")
 
 
 def _expected_active(

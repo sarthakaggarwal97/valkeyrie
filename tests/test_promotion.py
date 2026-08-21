@@ -19,10 +19,7 @@ from valkeyrie.promotion import (
 from valkeyrie.promotion import (
     activate_candidate as activate_candidate_impl,
 )
-from valkeyrie.promotion import (
-    rollback_generation as rollback_generation_impl,
-)
-from valkeyrie.retrieval import GenerationAvailability, PinnedGeneration
+from valkeyrie.retrieval import GenerationAvailability
 from valkeyrie.retrieval_config import FrozenRetrievalConfiguration, load_retrieval_config
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -193,27 +190,6 @@ def activate_candidate(
     )
 
 
-def rollback_generation(
-    store: MemoryPromotionStore,
-    approval: ProtectedApproval,
-    *,
-    target_generation_id: str,
-    expected_active_generation: str,
-    switched_at: str,
-    health_check: Any,
-) -> ActiveGeneration:
-    bound = replace(approval, expected_active_generation=expected_active_generation)
-    return rollback_generation_impl(
-        store,
-        MemoryApprovalRegistry((bound,)),
-        approval_id=bound.approval_id,
-        target_generation_id=target_generation_id,
-        expected_active_generation=expected_active_generation,
-        switched_at=switched_at,
-        health_check=health_check,
-    )
-
-
 def test_passing_candidate_activates_only_through_expected_cas_and_approval(
     suite: EvaluationSuite,
 ) -> None:
@@ -322,92 +298,6 @@ def test_stale_or_racing_activation_fails_without_substitution(suite: Evaluation
         )
     assert store.active == current
     assert store.writes == []
-
-
-def test_retained_passing_retrievable_generation_rolls_back_and_runs_health() -> None:
-    current = ActiveGeneration(GEN_B, 5, "eval_" + "b" * 64, NOW)
-    target_report = "eval_" + "a" * 64
-    store = MemoryPromotionStore(
-        [_record(GEN_A, target_report), _record(GEN_B, current.evaluation_report_id)],
-        current,
-    )
-    checked: list[str] = []
-
-    def healthy(pin: PinnedGeneration) -> bool:
-        checked.append(pin.generation_id)
-        return True
-
-    switched = rollback_generation(
-        store,
-        _approval("rollback", GEN_A, target_report),
-        target_generation_id=GEN_A,
-        expected_active_generation=GEN_B,
-        switched_at=LATER,
-        health_check=healthy,
-    )
-
-    assert switched == ActiveGeneration(GEN_A, 6, target_report, LATER)
-    assert store.active == switched
-    assert checked == [GEN_A]
-
-
-@pytest.mark.parametrize(
-    ("changes", "message"),
-    [
-        ({"retained": False}, "not retained"),
-        ({"evaluation_passed": False}, "no passing evaluation"),
-        ({"retrievable": False}, "not safely retrievable"),
-    ],
-)
-def test_ineligible_rollback_target_fails_before_cas(
-    changes: dict[str, object],
-    message: str,
-) -> None:
-    current = ActiveGeneration(GEN_B, 5, "eval_" + "b" * 64, NOW)
-    target_report = "eval_" + "a" * 64
-    store = MemoryPromotionStore(
-        [
-            _record(GEN_A, target_report, **changes),
-            _record(GEN_B, current.evaluation_report_id),
-        ],
-        current,
-    )
-
-    with pytest.raises(PromotionError, match=message):
-        rollback_generation(
-            store,
-            _approval("rollback", GEN_A, target_report),
-            target_generation_id=GEN_A,
-            expected_active_generation=GEN_B,
-            switched_at=LATER,
-            health_check=lambda _: True,
-        )
-    assert store.active == current
-    assert store.writes == []
-
-
-def test_failed_post_switch_health_restores_prior_active_generation() -> None:
-    current = ActiveGeneration(GEN_B, 5, "eval_" + "b" * 64, NOW)
-    target_report = "eval_" + "a" * 64
-    store = MemoryPromotionStore(
-        [_record(GEN_A, target_report), _record(GEN_B, current.evaluation_report_id)],
-        current,
-    )
-
-    with pytest.raises(PromotionError, match="prior active generation restored"):
-        rollback_generation(
-            store,
-            _approval("rollback", GEN_A, target_report),
-            target_generation_id=GEN_A,
-            expected_active_generation=GEN_B,
-            switched_at=LATER,
-            health_check=lambda _: False,
-        )
-
-    assert [item.generation_id for item in store.writes] == [GEN_A, GEN_B]
-    assert store.active is not None
-    assert store.active.generation_id == GEN_B
-    assert store.active.revision == 7
 
 
 def test_inflight_pin_remains_original_after_activation(suite: EvaluationSuite) -> None:
@@ -567,79 +457,3 @@ def test_generation_lifecycle_change_before_cas_blocks_activation(
             activated_at=NOW,
         )
     assert store.active is None
-
-
-def test_failed_health_does_not_restore_prior_generation_that_became_unavailable() -> None:
-    current = ActiveGeneration(GEN_B, 5, "eval_" + "b" * 64, NOW)
-    target_report = "eval_" + "a" * 64
-    prior = _record(GEN_B, current.evaluation_report_id)
-    store = MemoryPromotionStore([_record(GEN_A, target_report), prior], current)
-
-    def unhealthy(_: PinnedGeneration) -> bool:
-        store.generations[GEN_B] = replace(prior, revision=2, retrievable=False)
-        return False
-
-    with pytest.raises(PromotionError, match="no longer safely restorable"):
-        rollback_generation(
-            store,
-            _approval("rollback", GEN_A, target_report),
-            target_generation_id=GEN_A,
-            expected_active_generation=GEN_B,
-            switched_at=LATER,
-            health_check=unhealthy,
-        )
-    assert store.active is not None
-    assert store.active.generation_id == GEN_A
-
-
-def test_successful_health_cannot_return_after_active_pointer_race() -> None:
-    current = ActiveGeneration(GEN_B, 5, "eval_" + "b" * 64, NOW)
-    target_report = "eval_" + "a" * 64
-    store = MemoryPromotionStore(
-        [_record(GEN_A, target_report), _record(GEN_B, current.evaluation_report_id)],
-        current,
-    )
-
-    def race_after_switch() -> None:
-        store.active = ActiveGeneration(GEN_C, 7, "eval_" + "c" * 64, LATER)
-
-    store.after_cas = race_after_switch
-    with pytest.raises(PromotionError, match="changed after successful rollback"):
-        rollback_generation(
-            store,
-            _approval("rollback", GEN_A, target_report),
-            target_generation_id=GEN_A,
-            expected_active_generation=GEN_B,
-            switched_at=LATER,
-            health_check=lambda _: True,
-        )
-
-
-def test_rollback_target_lifecycle_change_before_cas_blocks_switch() -> None:
-    current = ActiveGeneration(GEN_B, 5, "eval_" + "b" * 64, NOW)
-    target_report = "eval_" + "a" * 64
-    target = _record(GEN_A, target_report)
-    store = MemoryPromotionStore(
-        [target, _record(GEN_B, current.evaluation_report_id)],
-        current,
-    )
-
-    def make_target_unqualified() -> None:
-        store.generations[GEN_A] = replace(
-            target,
-            revision=2,
-            retained=False,
-            retrievable=False,
-        )
-
-    store.before_cas = make_target_unqualified
-    with pytest.raises(PromotionError, match="rollback-target state changed"):
-        rollback_generation(
-            store,
-            _approval("rollback", GEN_A, target_report),
-            target_generation_id=GEN_A,
-            expected_active_generation=GEN_B,
-            switched_at=LATER,
-            health_check=lambda _: True,
-        )
-    assert store.active == current
