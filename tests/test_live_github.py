@@ -18,23 +18,17 @@ from valkeyrie.live_github import (
     MAX_SEARCH_BODY_BYTES,
     MAX_SEARCH_PER_PAGE,
     MAX_SEARCH_TERMS,
-    MAX_TAG_BYTES,
     OWNER,
     PROJECTS_GRAPHQL_QUERY,
     REQUEST_TIMEOUT_SECONDS,
     CheckRunQuery,
-    CommitChecksQuery,
-    CommitStatusQuery,
     IssueQuery,
     IssueSearchQuery,
     LatestReleaseQuery,
     LiveGitHubError,
     LiveGitHubQuery,
-    MilestoneQuery,
     ProjectQuery,
     PullRequestQuery,
-    ReleaseByIdQuery,
-    ReleaseByTagQuery,
     WorkflowRunQuery,
     infer_live_query,
     normalize_project_response,
@@ -166,25 +160,6 @@ def _release(repository: str = "valkey", release_id: int = 9) -> dict[str, objec
     }
 
 
-def _milestone(repository: str = "valkey", number: int = 10) -> dict[str, object]:
-    return {
-        "id": 1010,
-        "number": number,
-        "state": "open",
-        "title": "Valkey 9.1",
-        "description": "Tracked work",
-        "open_issues": 3,
-        "closed_issues": 4,
-        "creator": _user(),
-        "created_at": TIMESTAMP,
-        "updated_at": TIMESTAMP,
-        "due_on": None,
-        "closed_at": None,
-        "url": f"https://api.github.com/repos/{OWNER}/{repository}/milestones/{number}",
-        "html_url": f"https://github.com/{OWNER}/{repository}/milestone/{number}",
-    }
-
-
 def _workflow_run(repository: str = "valkey", run_id: int = 11) -> dict[str, object]:
     return {
         "id": run_id,
@@ -219,31 +194,6 @@ def _check_run(
         "url": f"https://api.github.com/repos/{OWNER}/{repository}/check-runs/{check_run_id}",
         "html_url": f"https://github.com/{OWNER}/{repository}/runs/{check_run_id}",
         "output": {"annotations_count": 1000000},
-    }
-
-
-def _commit_checks(repository: str = "valkey", commit: str = SHA) -> dict[str, object]:
-    return {"total_count": 1, "check_runs": [_check_run(repository, 12, commit)]}
-
-
-def _commit_status(repository: str = "valkey", commit: str = SHA) -> dict[str, object]:
-    return {
-        "sha": commit,
-        "state": "success",
-        "total_count": 1,
-        "url": f"https://api.github.com/repos/{OWNER}/{repository}/commits/{commit}/status",
-        "statuses": [
-            {
-                "id": 13,
-                "state": "success",
-                "context": "continuous-integration/test",
-                "description": "Tests passed",
-                "created_at": TIMESTAMP,
-                "updated_at": TIMESTAMP,
-                "url": f"https://api.github.com/repos/{OWNER}/{repository}/statuses/{commit}",
-                "target_url": "https://ignored.example/build",
-            }
-        ],
     }
 
 
@@ -310,25 +260,12 @@ def _valid_payload(query: LiveGitHubQuery) -> dict[str, object]:
         return _pull_request(query.repository, query.number)
     if isinstance(query, IssueQuery):
         return _issue(query.repository, query.number)
-    if isinstance(query, (LatestReleaseQuery, ReleaseByTagQuery, ReleaseByIdQuery)):
-        release_id = query.release_id if isinstance(query, ReleaseByIdQuery) else 9
-        value = _release(query.repository, release_id)
-        if isinstance(query, ReleaseByTagQuery):
-            value["tag_name"] = query.tag
-            value["html_url"] = (
-                f"https://github.com/{OWNER}/{query.repository}/releases/tag/{query.tag}"
-            )
-        return value
-    if isinstance(query, MilestoneQuery):
-        return _milestone(query.repository, query.number)
+    if isinstance(query, LatestReleaseQuery):
+        return _release(query.repository, 9)
     if isinstance(query, WorkflowRunQuery):
         return _workflow_run(query.repository, query.run_id)
     if isinstance(query, CheckRunQuery):
         return _check_run(query.repository, query.check_run_id)
-    if isinstance(query, CommitChecksQuery):
-        return _commit_checks(query.repository, query.commit)
-    if isinstance(query, CommitStatusQuery):
-        return _commit_status(query.repository, query.commit)
     raise AssertionError("REST payload requested for non-REST query")
 
 
@@ -360,24 +297,6 @@ def _decoded(observation: LiveObservation) -> dict[str, object]:
             "release",
         ),
         (
-            ReleaseByTagQuery("valkey", "v9.0.0"),
-            "https://api.github.com/repos/valkey-io/valkey/releases/tags/v9.0.0",
-            "release",
-            "release",
-        ),
-        (
-            ReleaseByIdQuery("valkey", 9),
-            "https://api.github.com/repos/valkey-io/valkey/releases/9",
-            "release",
-            "release",
-        ),
-        (
-            MilestoneQuery("valkey", 10),
-            "https://api.github.com/repos/valkey-io/valkey/milestones/10",
-            "issue",
-            "milestone",
-        ),
-        (
             WorkflowRunQuery("valkey", 11),
             "https://api.github.com/repos/valkey-io/valkey/actions/runs/11",
             "workflow_run",
@@ -388,18 +307,6 @@ def _decoded(observation: LiveObservation) -> dict[str, object]:
             "https://api.github.com/repos/valkey-io/valkey/check-runs/12",
             "check",
             "check_run",
-        ),
-        (
-            CommitChecksQuery("valkey", SHA),
-            f"https://api.github.com/repos/valkey-io/valkey/commits/{SHA}/check-runs?per_page=100",
-            "check",
-            "commit_checks",
-        ),
-        (
-            CommitStatusQuery("valkey", SHA),
-            f"https://api.github.com/repos/valkey-io/valkey/commits/{SHA}/status?per_page=100",
-            "check",
-            "commit_status",
         ),
     ],
 )
@@ -885,40 +792,6 @@ def test_maximum_numeric_identifier_is_accepted_by_query_validation() -> None:
 
 
 @pytest.mark.parametrize(
-    "tag",
-    ["", "/bad", "bad tag", "bad?tag", "é", "x" * (MAX_TAG_BYTES + 1)],
-)
-def test_release_tag_has_an_exact_bounded_safe_syntax(tag: str) -> None:
-    with pytest.raises(LiveGitHubError, match="tag is malformed"):
-        read_live_github(ReleaseByTagQuery("valkey", tag), fetch=lambda *args: _response({}))
-
-
-def test_release_tag_slashes_are_encoded_only_in_the_api_path() -> None:
-    calls: list[str] = []
-    value = _release()
-    value["tag_name"] = "release/9.0"
-    value["html_url"] = "https://github.com/valkey-io/valkey/releases/tag/release/9.0"
-
-    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
-        calls.append(url)
-        return _response(value)
-
-    read_live_github(
-        ReleaseByTagQuery("valkey", "release/9.0"),
-        fetch=fetch,
-        observed_clock=lambda: OBSERVED,
-    )
-
-    assert calls == ["https://api.github.com/repos/valkey-io/valkey/releases/tags/release%2F9.0"]
-
-
-@pytest.mark.parametrize("commit", ["a" * 39, "A" * 40, "g" * 40, "main", ""])
-def test_commit_queries_require_a_full_lowercase_sha(commit: str) -> None:
-    with pytest.raises(LiveGitHubError, match="full lowercase Git SHA"):
-        read_live_github(CommitChecksQuery("valkey", commit), fetch=lambda *args: _response({}))
-
-
-@pytest.mark.parametrize(
     ("response", "message"),
     [
         (HttpResponse(404, {"content-type": "application/json"}, b"{}"), "HTTP 404"),
@@ -996,36 +869,6 @@ def test_duplicate_labels_are_rejected_instead_of_ambiguously_normalized() -> No
 
     with pytest.raises(LiveGitHubError, match="duplicate"):
         read_live_github(PullRequestQuery("valkey", 7), fetch=lambda *args: _response(value))
-
-
-@pytest.mark.parametrize("kind", ["checks", "status"])
-@pytest.mark.parametrize("total_count", [2, MAX_COLLECTION_ITEMS + 1])
-def test_commit_composites_fail_on_partial_or_over_bound_results(
-    kind: str, total_count: int
-) -> None:
-    if kind == "checks":
-        query: LiveGitHubQuery = CommitChecksQuery("valkey", SHA)
-        value = _commit_checks()
-    else:
-        query = CommitStatusQuery("valkey", SHA)
-        value = _commit_status()
-    value["total_count"] = total_count
-
-    with pytest.raises(LiveGitHubError, match="incomplete|collection bound"):
-        read_live_github(query, fetch=lambda *args: _response(value))
-
-
-@pytest.mark.parametrize("kind", ["checks", "status"])
-def test_commit_composites_reject_conflicting_commit_identity(kind: str) -> None:
-    if kind == "checks":
-        query: LiveGitHubQuery = CommitChecksQuery("valkey", SHA)
-        value = _commit_checks(commit=OTHER_SHA)
-    else:
-        query = CommitStatusQuery("valkey", SHA)
-        value = _commit_status(commit=OTHER_SHA)
-
-    with pytest.raises(LiveGitHubError, match="conflicting commit"):
-        read_live_github(query, fetch=lambda *args: _response(value))
 
 
 def test_projects_fail_clearly_without_an_authenticated_graphql_fetcher() -> None:
@@ -1272,19 +1115,6 @@ def test_injected_http_response_fields_keep_their_declared_runtime_types(
 ) -> None:
     with pytest.raises(LiveGitHubError, match=message):
         read_live_github(PullRequestQuery("valkey", 7), fetch=lambda *args: response)
-
-
-@pytest.mark.parametrize("location", ["combined", "item"])
-def test_commit_status_requires_both_canonical_github_urls(location: str) -> None:
-    value = _commit_status()
-    if location == "combined":
-        value["url"] = "https://api.github.com/repos/valkey-io/other/commits/main/status"
-    else:
-        statuses = cast(list[dict[str, object]], value["statuses"])
-        statuses[0]["url"] = "https://api.github.com/repos/valkey-io/valkey/statuses/13"
-
-    with pytest.raises(LiveGitHubError, match="canonical URL"):
-        read_live_github(CommitStatusQuery("valkey", SHA), fetch=lambda *args: _response(value))
 
 
 def test_projects_fetcher_must_return_the_declared_response_type() -> None:

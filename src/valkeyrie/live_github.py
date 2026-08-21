@@ -43,24 +43,6 @@ class LatestReleaseQuery:
 
 
 @dataclass(frozen=True)
-class ReleaseByTagQuery:
-    repository: str
-    tag: str
-
-
-@dataclass(frozen=True)
-class ReleaseByIdQuery:
-    repository: str
-    release_id: int
-
-
-@dataclass(frozen=True)
-class MilestoneQuery:
-    repository: str
-    number: int
-
-
-@dataclass(frozen=True)
 class WorkflowRunQuery:
     repository: str
     run_id: int
@@ -73,18 +55,6 @@ class CheckRunQuery:
 
 
 @dataclass(frozen=True)
-class CommitChecksQuery:
-    repository: str
-    commit: str
-
-
-@dataclass(frozen=True)
-class CommitStatusQuery:
-    repository: str
-    commit: str
-
-
-@dataclass(frozen=True)
 class ProjectQuery:
     number: int
 
@@ -94,13 +64,8 @@ LiveGitHubQuery: TypeAlias = (
     | IssueQuery
     | IssueSearchQuery
     | LatestReleaseQuery
-    | ReleaseByTagQuery
-    | ReleaseByIdQuery
-    | MilestoneQuery
     | WorkflowRunQuery
     | CheckRunQuery
-    | CommitChecksQuery
-    | CommitStatusQuery
     | ProjectQuery
 )
 
@@ -509,22 +474,7 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
     if isinstance(query, LatestReleaseQuery):
         repository = _repository(query.repository)
         url = f"{_API_ROOT}/repos/{OWNER}/{repository}/releases/latest"
-        return url, "release", lambda value: _release(value, repository, None)
-    if isinstance(query, ReleaseByTagQuery):
-        repository = _repository(query.repository)
-        tag = _tag(query.tag)
-        url = f"{_API_ROOT}/repos/{OWNER}/{repository}/releases/tags/{quote(tag, safe='')}"
-        return url, "release", lambda value: _release(value, repository, tag)
-    if isinstance(query, ReleaseByIdQuery):
-        repository = _repository(query.repository)
-        release_id = _entity_id(query.release_id, "release ID")
-        url = f"{_API_ROOT}/repos/{OWNER}/{repository}/releases/{release_id}"
-        return url, "release", lambda value: _release(value, repository, None, release_id)
-    if isinstance(query, MilestoneQuery):
-        repository = _repository(query.repository)
-        number = _entity_id(query.number, "milestone number")
-        url = f"{_API_ROOT}/repos/{OWNER}/{repository}/milestones/{number}"
-        return url, "issue", lambda value: _milestone(value, repository, number)
+        return url, "release", lambda value: _release(value, repository)
     if isinstance(query, WorkflowRunQuery):
         repository = _repository(query.repository)
         run_id = _entity_id(query.run_id, "workflow run ID")
@@ -535,16 +485,6 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         check_run_id = _entity_id(query.check_run_id, "check run ID")
         url = f"{_API_ROOT}/repos/{OWNER}/{repository}/check-runs/{check_run_id}"
         return url, "check", lambda value: _single_check_run(value, repository, check_run_id)
-    if isinstance(query, CommitChecksQuery):
-        repository = _repository(query.repository)
-        commit = _commit(query.commit)
-        url = f"{_API_ROOT}/repos/{OWNER}/{repository}/commits/{commit}/check-runs?per_page=100"
-        return url, "check", lambda value: _commit_checks(value, repository, commit)
-    if isinstance(query, CommitStatusQuery):
-        repository = _repository(query.repository)
-        commit = _commit(query.commit)
-        url = f"{_API_ROOT}/repos/{OWNER}/{repository}/commits/{commit}/status?per_page=100"
-        return url, "check", lambda value: _commit_status(value, repository, commit)
     raise LiveGitHubError("unsupported live GitHub query type")
 
 
@@ -735,18 +675,9 @@ def _search_milestone(value: object, repository: str) -> dict[str, object] | Non
     }
 
 
-def _release(
-    value: Mapping[str, object],
-    repository: str,
-    expected_tag: str | None,
-    expected_id: int | None = None,
-) -> dict[str, object]:
+def _release(value: Mapping[str, object], repository: str) -> dict[str, object]:
     release_id = _positive_integer(value, "id")
-    if expected_id is not None and release_id != expected_id:
-        raise LiveGitHubError("release response returned a conflicting ID")
     tag = _tag(_text(value, "tag_name", MAX_TAG_BYTES))
-    if expected_tag is not None and tag != expected_tag:
-        raise LiveGitHubError("release response returned a conflicting tag")
     api_url = f"{_API_ROOT}/repos/{OWNER}/{repository}/releases/{release_id}"
     web_url = f"{_WEB_ROOT}/{OWNER}/{repository}/releases/tag/{quote(tag, safe='/')}"
     return {
@@ -763,30 +694,6 @@ def _release(
         "author": _login(value, "author"),
         "created_at": _timestamp(value, "created_at"),
         "published_at": _nullable_timestamp(value, "published_at"),
-        "api_url": _exact_url(value, "url", api_url),
-        "url": _exact_url(value, "html_url", web_url),
-    }
-
-
-def _milestone(value: Mapping[str, object], repository: str, number: int) -> dict[str, object]:
-    api_url = f"{_API_ROOT}/repos/{OWNER}/{repository}/milestones/{number}"
-    web_url = f"{_WEB_ROOT}/{OWNER}/{repository}/milestone/{number}"
-    return {
-        "api_version": _API_VERSION,
-        "kind": "milestone",
-        "repository": repository,
-        "id": _positive_integer(value, "id"),
-        "number": _matching_integer(value, "number", number),
-        "state": _choice(value, "state", {"open", "closed"}),
-        "title": _text(value, "title", 1024),
-        "description": _nullable_text(value, "description", 128 * 1024),
-        "open_issues": _nonnegative_integer(value, "open_issues"),
-        "closed_issues": _nonnegative_integer(value, "closed_issues"),
-        "creator": _login(value, "creator"),
-        "created_at": _timestamp(value, "created_at"),
-        "updated_at": _timestamp(value, "updated_at"),
-        "due_on": _nullable_timestamp(value, "due_on"),
-        "closed_at": _nullable_timestamp(value, "closed_at"),
         "api_url": _exact_url(value, "url", api_url),
         "url": _exact_url(value, "html_url", web_url),
     }
@@ -882,60 +789,6 @@ def _check_run(
         "completed_at": _nullable_timestamp(value, "completed_at"),
         "api_url": _exact_url(value, "url", api_url),
         "url": _exact_url(value, "html_url", web_url),
-    }
-
-
-def _commit_checks(value: Mapping[str, object], repository: str, commit: str) -> dict[str, object]:
-    total_count = _bounded_count(value, "total_count")
-    runs = _list(value, "check_runs")
-    if total_count != len(runs):
-        raise LiveGitHubError("commit check-runs result is incomplete")
-    normalized = [_check_run(_object(run, "check run"), repository) for run in runs]
-    if any(run["head_sha"] != commit for run in normalized):
-        raise LiveGitHubError("commit check-runs response returned a conflicting commit")
-    return {
-        "api_version": _API_VERSION,
-        "kind": "commit_checks",
-        "repository": repository,
-        "commit": commit,
-        "total_count": total_count,
-        "check_runs": normalized,
-    }
-
-
-def _commit_status(value: Mapping[str, object], repository: str, commit: str) -> dict[str, object]:
-    if _sha(value, "sha") != commit:
-        raise LiveGitHubError("commit status response returned a conflicting commit")
-    total_count = _bounded_count(value, "total_count")
-    statuses = _list(value, "statuses")
-    if total_count != len(statuses):
-        raise LiveGitHubError("commit status result is incomplete")
-    api_url = f"{_API_ROOT}/repos/{OWNER}/{repository}/commits/{commit}/status"
-    return {
-        "api_version": _API_VERSION,
-        "kind": "commit_status",
-        "repository": repository,
-        "commit": commit,
-        "state": _choice(value, "state", {"error", "failure", "pending", "success"}),
-        "api_url": _exact_url(value, "url", api_url),
-        "total_count": total_count,
-        "statuses": [
-            _status(_object(status, "commit status"), repository, commit) for status in statuses
-        ],
-    }
-
-
-def _status(value: Mapping[str, object], repository: str, commit: str) -> dict[str, object]:
-    status_id = _positive_integer(value, "id")
-    api_url = f"{_API_ROOT}/repos/{OWNER}/{repository}/statuses/{commit}"
-    return {
-        "id": status_id,
-        "state": _choice(value, "state", {"error", "failure", "pending", "success"}),
-        "context": _text(value, "context", 1024),
-        "description": _nullable_text(value, "description", 1024),
-        "created_at": _timestamp(value, "created_at"),
-        "updated_at": _timestamp(value, "updated_at"),
-        "api_url": _exact_url(value, "url", api_url),
     }
 
 
@@ -1089,12 +942,6 @@ def _entity_id(value: object, label: str) -> int:
     return value
 
 
-def _commit(value: object) -> str:
-    if type(value) is not str or _SHA.fullmatch(value) is None:
-        raise LiveGitHubError("commit must be a full lowercase Git SHA")
-    return value
-
-
 def _tag(value: object) -> str:
     if type(value) is not str:
         raise LiveGitHubError("release tag is malformed")
@@ -1125,10 +972,6 @@ def _integer(value: Mapping[str, object], key: str) -> int:
     if type(result) is not int or not 0 <= result <= MAX_ENTITY_ID:
         raise LiveGitHubError(f"GitHub field {key} must be a bounded integer")
     return result
-
-
-def _nonnegative_integer(value: Mapping[str, object], key: str) -> int:
-    return _integer(value, key)
 
 
 def _matching_integer(value: Mapping[str, object], key: str, expected: int) -> int:
