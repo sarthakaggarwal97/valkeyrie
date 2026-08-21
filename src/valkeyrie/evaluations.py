@@ -1139,7 +1139,7 @@ def _retrieval_gates(
     gates = [
         _Gate(
             "retrieval.route_selection_rate",
-            _rate(_retrieval_bool(item, "route_selected") for item in results),
+            _rate(_metric_bool(item, "route_selected") for item in results),
             "at_least",
             threshold["retrieval.route.min"],
         ),
@@ -1151,7 +1151,7 @@ def _retrieval_gates(
         ),
         _Gate(
             "retrieval.generation_filter_presence_rate",
-            _rate(_retrieval_bool(item, "generation_filter_present") for item in results),
+            _rate(_metric_bool(item, "generation_filter_present") for item in results),
             "at_least",
             threshold["retrieval.filter.min"],
         ),
@@ -1197,7 +1197,7 @@ def _retrieval_gates(
         ),
         _Gate(
             "retrieval.fixture_p95_latency_seconds",
-            _p95(_retrieval_number(item, "measured_latency_seconds") for item in results),
+            _p95(_metric_number(item, "measured_latency_seconds") for item in results),
             "at_most",
             threshold["retrieval.latency.max"],
         ),
@@ -1300,12 +1300,12 @@ def _model_passes(case: EvaluationCase, result: ModelRun) -> bool:
 
 
 def _retrieval_passes(fixture: RetrievalFixture, result: RetrievalResult) -> bool:
-    if not _retrieval_bool(result, "route_selected") or not _retrieval_bool(
+    if not _metric_bool(result, "route_selected") or not _metric_bool(
         result, "generation_filter_present"
     ):
         return False
     if any(
-        _retrieval_int(result, name)
+        _metric_int(result, name)
         for name in (
             "cross_generation_leaks",
             "excluded_path_leaks",
@@ -1354,30 +1354,18 @@ def _sum_model(results: Sequence[ModelRun], name: str) -> float:
 
 
 def _sum_retrieval(results: Sequence[RetrievalResult], name: str) -> float:
-    return float(sum(_retrieval_int(item, name) for item in results))
+    return float(sum(_metric_int(item, name) for item in results))
 
 
-def _metric_bool(result: ModelRun, name: str) -> bool:
+def _metric_bool(result: ModelRun | RetrievalResult, name: str) -> bool:
     return cast(bool, result.metrics[name])
 
 
-def _metric_int(result: ModelRun, name: str) -> int:
+def _metric_int(result: ModelRun | RetrievalResult, name: str) -> int:
     return cast(int, result.metrics[name])
 
 
-def _metric_number(result: ModelRun, name: str) -> float:
-    return float(cast(float, result.metrics[name]))
-
-
-def _retrieval_bool(result: RetrievalResult, name: str) -> bool:
-    return cast(bool, result.metrics[name])
-
-
-def _retrieval_int(result: RetrievalResult, name: str) -> int:
-    return cast(int, result.metrics[name])
-
-
-def _retrieval_number(result: RetrievalResult, name: str) -> float:
+def _metric_number(result: ModelRun | RetrievalResult, name: str) -> float:
     return float(cast(float, result.metrics[name]))
 
 
