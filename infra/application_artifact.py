@@ -663,10 +663,6 @@ def _zip(files: Mapping[str, bytes]) -> bytes:
     return output.getvalue()
 
 
-def _load_json(path: Path) -> dict[str, object]:
-    return _load_manifest(_read(path), exact_fields=False)
-
-
 def _load_manifest(content: bytes, *, exact_fields: bool = True) -> dict[str, object]:
     def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
         value: dict[str, object] = {}
