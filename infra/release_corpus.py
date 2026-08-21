@@ -183,8 +183,8 @@ def execute_release(
     now_epoch: Callable[[], int],
     sleep: Callable[[float], None],
     lease_seconds: int = 300,
-    poll_interval_seconds: float = 5.0,
-    max_polls: int = 120,
+    poll_interval_seconds: float = 15.0,
+    max_polls: int = 480,
 ) -> Mapping[str, object]:
     """Publish, ingest, qualify, and optionally activate one prepared generation."""
     _validate_execution_inputs(
@@ -289,8 +289,8 @@ def preflight_result(
     *,
     owner: str,
     lease_seconds: int = 300,
-    poll_interval_seconds: float = 5.0,
-    max_polls: int = 120,
+    poll_interval_seconds: float = 15.0,
+    max_polls: int = 480,
 ) -> Mapping[str, object]:
     """Return the canonical, local-only release plan."""
     _validate_execution_inputs(
@@ -525,8 +525,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-active-generation")
     parser.add_argument("--activated-at")
     parser.add_argument("--lease-seconds", type=int, default=300)
-    parser.add_argument("--poll-interval-seconds", type=float, default=5.0)
-    parser.add_argument("--max-polls", type=int, default=120)
+    # 3,774 documents took ~35 minutes to ingest, so the former 120 x 5s (10 minute) bound
+    # made every successful refresh report failure. 480 x 15s allows 2 hours.
+    parser.add_argument("--poll-interval-seconds", type=float, default=15.0)
+    parser.add_argument("--max-polls", type=int, default=480)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 

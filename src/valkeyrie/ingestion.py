@@ -286,8 +286,8 @@ def run_ingestion(
     now_epoch: Callable[[], int],
     sleep: Callable[[float], None],
     lease_seconds: int = 300,
-    poll_interval_seconds: float = 5.0,
-    max_polls: int = 120,
+    poll_interval_seconds: float = 15.0,
+    max_polls: int = 480,
 ) -> IngestionResult:
     """Verify sealing, serialize the candidate, and poll Bedrock to successful completion."""
     verify_sealed_generation(publication_store, bundle)
