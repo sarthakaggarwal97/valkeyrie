@@ -249,7 +249,14 @@ def _validate_adopted_journal(
         (result_path, hashes.result_sha256),
     )
     for path, expected_hash in paths_and_hashes:
-        if path.is_symlink() or stat.S_IMODE(path.stat().st_mode) != 0o600:
+        if path.is_symlink():
+            raise DeployedEvaluationError("adopted journal file mode or type is unsafe")
+        mode = path.lstat().st_mode
+        # The protection that matters is that nobody but the owner can rewrite an adopted
+        # journal before its hash is checked. Requiring exactly 0o600 also rejected 0o400
+        # and 0o644, and journals committed to git necessarily check out as 0o644 because
+        # git records only the executable bit, so a fresh clone could never satisfy it.
+        if not stat.S_ISREG(mode) or stat.S_IMODE(mode) & (stat.S_IWGRP | stat.S_IWOTH):
             raise DeployedEvaluationError("adopted journal file mode or type is unsafe")
         if _sha256(path.read_bytes()) != expected_hash:
             raise DeployedEvaluationError("adopted journal hash differs from its explicit pin")
