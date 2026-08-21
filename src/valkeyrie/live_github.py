@@ -590,7 +590,12 @@ def _issue_search(
     incomplete = _boolean(value, "incomplete_results")
     items = _list(value, "items")
     total_count = _integer(value, "total_count")
-    if incomplete or total_count != len(items):
+    # total_count counts matches across every page, while items holds only the requested
+    # page, so total_count > len(items) is ordinary pagination rather than a failure. The
+    # bounded page is still an honest observation: the payload reports both numbers, so a
+    # consumer can see it is a partial view. Only GitHub's own incomplete_results flag, or
+    # more items than matches, means the result cannot be trusted.
+    if incomplete or total_count < len(items):
         raise LiveGitHubError("GitHub issue search result is incomplete")
     if len(items) > per_page:
         raise LiveGitHubError("GitHub issue search items exceed the requested page bound")

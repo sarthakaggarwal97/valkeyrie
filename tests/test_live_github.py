@@ -510,13 +510,12 @@ def test_issue_search_accepts_the_maximum_term_and_page_bounds() -> None:
 @pytest.mark.parametrize(
     ("total_count", "incomplete_results", "item_count"),
     [
-        (2, False, 1),
         (0, False, 1),
         (1, True, 1),
         (MAX_SEARCH_PER_PAGE + 1, False, MAX_SEARCH_PER_PAGE + 1),
     ],
 )
-def test_issue_search_rejects_truncation_partial_results_and_page_overruns(
+def test_issue_search_rejects_partial_results_and_page_overruns(
     total_count: int, incomplete_results: bool, item_count: int
 ) -> None:
     items = [_search_item(number=number) for number in range(1, item_count + 1)]
@@ -528,6 +527,24 @@ def test_issue_search_rejects_truncation_partial_results_and_page_overruns(
             IssueSearchQuery(("release", "status")),
             fetch=lambda *args: _response(value),
         )
+
+
+def test_issue_search_accepts_a_bounded_page_of_a_larger_match_set() -> None:
+    # total_count counts every match while items holds only the requested page, so a
+    # match set larger than one page is ordinary pagination. Rejecting it reported an
+    # app-layer refusal to users as an upstream GitHub outage.
+    value = _issue_search(_search_item(number=1), _search_item(number=2))
+    value["total_count"] = 137
+
+    observation = read_live_github(
+        IssueSearchQuery(("community", "meeting")),
+        fetch=lambda *args: _response(value),
+    )
+
+    payload = _decoded(observation)
+    assert payload["total_count"] == 137
+    assert len(cast(list[object], payload["items"])) == 2
+    assert payload["per_page"] == MAX_SEARCH_PER_PAGE
 
 
 def test_issue_search_rejects_duplicate_items() -> None:
