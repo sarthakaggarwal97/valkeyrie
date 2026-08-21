@@ -7,7 +7,6 @@ import hashlib
 import json
 import tempfile
 from collections import Counter
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, cast
@@ -28,12 +27,6 @@ from aws_cdk import aws_s3 as s3
 
 from infra.app import DEFAULT_CONFIG, build_app
 from infra.application_artifact import ApplicationArtifact, build_application_artifact
-from infra.application_comparison import (
-    ApplicationComparisonArtifact,
-    build_application_comparison_artifact,
-)
-
-DeployableApplicationArtifact = ApplicationArtifact | ApplicationComparisonArtifact
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_APPLICATION_OUTDIR = Path("cdk.application.out")
@@ -45,10 +38,19 @@ APPLICATION_FUNCTION_NAME: Final = "valkeyrie-development-application"
 APPLICATION_LOG_GROUP_NAME: Final = "/valkeyrie-development/application"
 APPLICATION_ARTIFACT_BUCKET: Final = "valkeyrie-dev-app-artifacts-968533178160-us-east-1"
 APPLICATION_ARTIFACT_PREFIX: Final = "artifacts"
-ROLLBACK_FABLE_ARTIFACT_SHA256: Final = (
-    "sha256:98bbbd6d9808f12518ba67654d36343984dab9122f5c5445b3a504261aa93cb9"
-)
 APPLICATION_SERVICE_ROLE_NAME: Final = "valkeyrie-development-application-cloudformation"
+# Owner-directed Claude Opus 5 route, retained as plain exact configuration so the runtime
+# grant does not depend on any comparison-artifact derivation. Immutable Lambda version 8
+# runs this model; the Sid matches the deployed policy so re-synthesis is a no-op.
+OWNER_DIRECTED_OPUS_SID: Final = "InvokeExactOwnerDirectedOpusComparisonRoute"
+OPUS_INFERENCE_PROFILE_ARN: Final = (
+    "arn:aws:bedrock:us-east-1:968533178160:inference-profile/us.anthropic.claude-opus-5"
+)
+OPUS_FOUNDATION_MODEL_ARNS: Final = (
+    "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-5",
+    "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-opus-5",
+    "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-opus-5",
+)
 APPLICATION_SERVICE_ROLE_ARN: Final = (
     "arn:aws:iam::968533178160:role/valkeyrie-development-application-cloudformation"
 )
@@ -63,7 +65,7 @@ D01_TEMPLATE_SHA256: Final = (
 
 @dataclass(frozen=True)
 class ApplicationSynthesis:
-    artifact: DeployableApplicationArtifact
+    artifact: ApplicationArtifact
     bootstrap_template_path: Path
     template_path: Path
     artifact_path: Path
@@ -81,8 +83,7 @@ class ApplicationBootstrapStack(Stack):
         scope: App,
         construct_id: str,
         *,
-        artifact: DeployableApplicationArtifact,
-        rollback_artifact_sha256: str | None = None,
+        artifact: ApplicationArtifact,
     ) -> None:
         super().__init__(
             scope,
@@ -197,9 +198,7 @@ class ApplicationBootstrapStack(Stack):
                     policy_name="ApplicationResourceLifecycle",
                     policy_document={
                         "Version": "2012-10-17",
-                        "Statement": _service_role_statements(
-                            self, artifact, rollback_artifact_sha256
-                        ),
+                        "Statement": _service_role_statements(self, artifact),
                     },
                 )
             ],
@@ -230,20 +229,13 @@ class ApplicationBootstrapStack(Stack):
 class ApplicationStack(Stack):
     """IAM-free application resources deployable only through the exact service role."""
 
-    def __init__(
-        self, scope: App, construct_id: str, *, artifact: DeployableApplicationArtifact
-    ) -> None:
-        comparison = isinstance(artifact, ApplicationComparisonArtifact)
+    def __init__(self, scope: App, construct_id: str, *, artifact: ApplicationArtifact) -> None:
         super().__init__(
             scope,
             construct_id,
             stack_name=APPLICATION_STACK_NAME,
             env=Environment(account=DEFAULT_CONFIG.account, region=DEFAULT_CONFIG.region),
-            description=(
-                "Valkeyrie private owner-directed model comparison (synthesis only)"
-                if comparison
-                else "Valkeyrie private qualified application (synthesis only)"
-            ),
+            description="Valkeyrie private qualified application (synthesis only)",
             tags=_tags("application"),
             synthesizer=LegacyStackSynthesizer(),
         )
@@ -267,11 +259,7 @@ class ApplicationStack(Stack):
             self,
             "ApplicationFunction",
             function_name=APPLICATION_FUNCTION_NAME,
-            description=(
-                f"Owner-directed comparison {artifact.application_revision}"
-                if comparison
-                else f"Qualified Valkeyrie application {artifact.application_revision}"
-            ),
+            description=f"Qualified Valkeyrie application {artifact.application_revision}",
             architectures=["x86_64"],
             code=lambda_.CfnFunction.CodeProperty(
                 s3_bucket=APPLICATION_ARTIFACT_BUCKET, s3_key=key
@@ -296,11 +284,7 @@ class ApplicationStack(Stack):
             reserved_concurrent_executions=1,
             role=role_arn,
             runtime="python3.11",
-            timeout=(
-                artifact.lambda_timeout_seconds
-                if isinstance(artifact, ApplicationComparisonArtifact)
-                else 30
-            ),
+            timeout=30,
             tracing_config=lambda_.CfnFunction.TracingConfigProperty(mode="PassThrough"),
             tags=owner,
         )
@@ -310,12 +294,7 @@ class ApplicationStack(Stack):
             "ApplicationVersion",
             code_sha256=base64.b64encode(bytes.fromhex(artifact.artifact_sha256[7:])).decode(),
             description=(
-                f"application={artifact.application_revision};selection={artifact.selection_id};"
-                f"authorization={artifact.authorization}"
-                if isinstance(artifact, ApplicationComparisonArtifact)
-                else (
-                    f"application={artifact.application_revision};selection={artifact.selection_id}"
-                )
+                f"application={artifact.application_revision};selection={artifact.selection_id}"
             ),
             function_name=function.ref,
         )
@@ -326,9 +305,7 @@ class ApplicationStack(Stack):
 
 def build_application_app(
     outdir: Path,
-    artifact: DeployableApplicationArtifact,
-    *,
-    rollback_artifact_sha256: str | None = None,
+    artifact: ApplicationArtifact,
 ) -> App:
     app = App(
         analytics_reporting=False, outdir=str(outdir), stack_traces=False, tree_metadata=False
@@ -337,7 +314,6 @@ def build_application_app(
         app,
         BOOTSTRAP_STACK_ID,
         artifact=artifact,
-        rollback_artifact_sha256=rollback_artifact_sha256,
     )
     ApplicationStack(app, APPLICATION_STACK_ID, artifact=artifact)
     return app
@@ -349,34 +325,12 @@ def synthesize_application(
     return _synthesize_application(root, outdir, build_application_artifact(root))
 
 
-def synthesize_application_comparison(
-    root: Path = ROOT, outdir: Path = Path("cdk.application-comparison.out")
-) -> ApplicationSynthesis:
-    return _synthesize_application(root, outdir, build_application_comparison_artifact(root))
-
-
-def synthesize_application_comparison_rollback_window(
-    root: Path = ROOT,
-    outdir: Path = Path("cdk.application-comparison-rollback.out"),
-) -> ApplicationSynthesis:
-    return _synthesize_application(
-        root,
-        outdir,
-        build_application_comparison_artifact(root),
-        rollback_artifact_sha256=ROLLBACK_FABLE_ARTIFACT_SHA256,
-    )
-
-
 def _synthesize_application(
     root: Path,
     outdir: Path,
-    artifact: DeployableApplicationArtifact,
-    *,
-    rollback_artifact_sha256: str | None = None,
+    artifact: ApplicationArtifact,
 ) -> ApplicationSynthesis:
-    build_application_app(
-        outdir, artifact, rollback_artifact_sha256=rollback_artifact_sha256
-    ).synth()
+    build_application_app(outdir, artifact).synth()
     bootstrap_path = outdir / f"{BOOTSTRAP_STACK_ID}.template.json"
     template_path = outdir / f"{APPLICATION_STACK_ID}.template.json"
     artifact_dir = outdir / "application-artifacts"
@@ -408,7 +362,7 @@ def _synthesize_application(
 
 
 def derive_application_evidence(
-    artifact: DeployableApplicationArtifact,
+    artifact: ApplicationArtifact,
     bootstrap_bytes: bytes,
     application_bytes: bytes,
     knowledge_bytes: bytes,
@@ -464,16 +418,8 @@ def derive_application_evidence(
             "selected_inference_config_revision": artifact.selected_inference_config_revision,
             "selected_report_id": artifact.selected_report_id,
             "selection_id": artifact.selection_id,
-            "execution_authorization": (
-                artifact.authorization
-                if isinstance(artifact, ApplicationComparisonArtifact)
-                else "qualified_model_selection"
-            ),
-            "qualification_status": (
-                artifact.qualification_status
-                if isinstance(artifact, ApplicationComparisonArtifact)
-                else "qualified"
-            ),
+            "execution_authorization": "qualified_model_selection",
+            "qualification_status": "qualified",
             "response_normalization_policy_revision": artifact.response_normalization_policy_revision,  # noqa: E501
             "raw_evidence_sha256": artifact.manifest["raw_evidence_sha256"],
         },
@@ -579,8 +525,7 @@ def derive_application_evidence(
 
 def _service_role_statements(
     stack: Stack,
-    artifact: DeployableApplicationArtifact,
-    rollback_artifact_sha256: str | None = None,
+    artifact: ApplicationArtifact,
 ) -> list[dict[str, object]]:
     function = stack.format_arn(
         service="lambda",
@@ -612,11 +557,6 @@ def _service_role_statements(
 
     current_artifact_arn = artifact_arn(artifact.artifact_sha256)
     artifact_resources: str | list[str] = current_artifact_arn
-    if rollback_artifact_sha256 is not None:
-        rollback_arn = artifact_arn(rollback_artifact_sha256)
-        if rollback_arn == current_artifact_arn:
-            raise ValueError("rollback artifact must differ from the target artifact")
-        artifact_resources = [rollback_arn, current_artifact_arn]
     return [
         {
             "Sid": "ReadExactApplicationArtifact",
@@ -730,38 +670,23 @@ def _deployer_statements(stack: Stack) -> list[dict[str, object]]:
     ]
 
 
-def _runtime_statements(
-    stack: Stack, artifact: DeployableApplicationArtifact
-) -> list[dict[str, object]]:
+def _runtime_statements(stack: Stack, artifact: ApplicationArtifact) -> list[dict[str, object]]:
     profile = cast(str, artifact.manifest["selected_inference_profile_arn"])
     models = cast(list[str], artifact.manifest["selected_foundation_model_arns"])
-    model_statements: list[dict[str, object]] = []
-    if isinstance(artifact, ApplicationComparisonArtifact):
-        base_manifest = artifact.manifest.get("base_manifest")
-        if not isinstance(base_manifest, Mapping):
-            raise ValueError("comparison artifact lacks its qualified base manifest")
-        model_statements.append(
-            {
-                "Sid": "InvokeExactQualifiedFableRoute",
-                "Effect": "Allow",
-                "Action": "bedrock:InvokeModel",
-                "Resource": [
-                    cast(str, base_manifest["selected_inference_profile_arn"]),
-                    *cast(list[str], base_manifest["selected_foundation_model_arns"]),
-                ],
-            }
-        )
-        model_sid = "InvokeExactOwnerDirectedOpusComparisonRoute"
-    else:
-        model_sid = "InvokeExactQualifiedFableRoute"
-    model_statements.append(
+    model_statements: list[dict[str, object]] = [
         {
-            "Sid": model_sid,
+            "Sid": "InvokeExactQualifiedFableRoute",
             "Effect": "Allow",
             "Action": "bedrock:InvokeModel",
             "Resource": [profile, *models],
-        }
-    )
+        },
+        {
+            "Sid": OWNER_DIRECTED_OPUS_SID,
+            "Effect": "Allow",
+            "Action": "bedrock:InvokeModel",
+            "Resource": [OPUS_INFERENCE_PROFILE_ARN, *OPUS_FOUNDATION_MODEL_ARNS],
+        },
+    ]
     table = stack.format_arn(
         service="dynamodb",
         resource="table",

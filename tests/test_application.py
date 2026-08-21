@@ -249,6 +249,7 @@ def test_service_role_and_existing_role_policies_are_exact(tmp_path: Path) -> No
     runtime = _statements(resources["ApplicationRuntimePolicy"])
     assert set(runtime) == {
         "InvokeExactQualifiedFableRoute",
+        "InvokeExactOwnerDirectedOpusComparisonRoute",
         "RetrieveExactKnowledgeBase",
         "ReadAndConditionallyAuditRequests",
         "ReadFailClosedRuntimeControls",
@@ -260,6 +261,15 @@ def test_service_role_and_existing_role_policies_are_exact(tmp_path: Path) -> No
         "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-fable-5",
         "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-fable-5",
         "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-fable-5",
+    ]
+    # Immutable Lambda version 8 runs Claude Opus 5 under owner-directed authorization, so the
+    # runtime keeps an exact Opus grant. Synthesis must reproduce the deployed policy exactly,
+    # otherwise a future bootstrap deploy would revoke that version's ability to invoke Opus.
+    assert runtime["InvokeExactOwnerDirectedOpusComparisonRoute"]["Resource"] == [
+        "arn:aws:bedrock:us-east-1:968533178160:inference-profile/us.anthropic.claude-opus-5",
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-5",
+        "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-opus-5",
+        "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-opus-5",
     ]
     assert runtime["RetrieveExactKnowledgeBase"] == {
         "Action": "bedrock:Retrieve",
