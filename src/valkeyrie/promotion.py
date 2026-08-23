@@ -129,7 +129,10 @@ def activate_candidate(
         )
     except RetrievalError as error:
         raise PromotionError(f"candidate generation-filtered smoke failed: {error}") from error
-    if approval_id is not None or approval_registry is not None:
+    # Only an explicitly supplied approval id requests the human gate. The release path
+    # always constructs an approval registry, so keying off the registry would force
+    # consumption of a None id and fail every unattended activation.
+    if approval_id is not None:
         _consume_approval(
             approval_registry,
             approval_id,

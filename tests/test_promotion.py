@@ -213,6 +213,32 @@ def activate_without_approval(
     )
 
 
+def test_unattended_activation_ignores_a_present_registry_when_no_approval_is_given(
+    suite: EvaluationSuite,
+) -> None:
+    # The release path always builds an approval registry, so keying the human gate off the
+    # registry rather than the id made every unattended activation fail with a malformed
+    # approval id. A registry may be present and still be unused.
+    report = _report(suite, GEN_A)
+    report_id = cast(str, report["report_id"])
+    store = MemoryPromotionStore([_record(GEN_A, report_id)])
+
+    active = activate_candidate_impl(
+        store,
+        suite,
+        report,
+        MemoryApprovalRegistry(()),
+        approval_id=None,
+        retrieval_client=SmokeClient(),
+        retrieval_config=CONFIG,
+        knowledge_base_id="ABCDEFGHIJ",
+        expected_active_generation=None,
+        activated_at=NOW,
+    )
+
+    assert active == ActiveGeneration(GEN_A, 1, report_id, NOW)
+
+
 def test_unattended_activation_needs_no_approval_but_still_requires_the_cas(
     suite: EvaluationSuite,
 ) -> None:
