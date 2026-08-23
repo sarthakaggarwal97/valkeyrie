@@ -1,0 +1,98 @@
+name: Corpus refresh
+
+# Refreshes the reviewed corpus once a week so answers stop drifting behind upstream.
+#
+# Measured cost on the complete 43-repository corpus (3,774 documents): lock 10s,
+# build 21 minutes warm and about 42 minutes cold, publish dominated by ~7,548
+# object writes, ingest about 35 minutes, evaluate 1s, activate seconds. That is
+# roughly 60 to 90 minutes warm, so the job timeout below leaves ~2.7x headroom and
+# the ingestion poll bound allows two hours on its own.
+#
+# This job runs in the `corpus` environment only. Per docs/repository-governance.md,
+# `corpus` carries corpus publication, ingestion, evaluation, and conditional
+# activation permission and must never also carry application or prompt deployment
+# permission. Do not add application deployment steps here.
+#
+# Activation needs no human approval: `activate_candidate` still requires a passing
+# evaluation report, a candidate recording that exact report, a live
+# generation-filtered retrieval smoke against the knowledge base, and a
+# compare-and-swap on the active pointer. Any failure leaves the previous corpus live.
+
+on:
+  schedule:
+    # Sundays 04:17 UTC. Scheduled runs drift under load, so nothing here may depend
+    # on an exact hour; the pipeline is idempotent and safe to start late.
+    - cron: "17 4 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: refresh
+    runs-on: ubuntu-24.04
+    environment: corpus
+    # ~2.7x the measured warm runtime, and enough for a fully cold clone of 43 repos.
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.11.19"
+          enable-cache: false
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      # A cold clone of 43 blobless repositories roughly doubles build time, so the
+      # bare-repository cache is restored across runs. A cache miss is not a failure.
+      - name: Restore reviewed source cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: ~/.cache/valkeyrie-git
+          key: valkeyrie-git-${{ hashFiles('sources.yaml') }}
+          restore-keys: valkeyrie-git-
+
+      - name: Assume the corpus role
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ secrets.CORPUS_REFRESH_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Resolve every reviewed source to an exact commit
+        run: |
+          uv run python -m infra.build_corpus --root . lock --output "$RUNNER_TEMP/corpus.lock.json"
+
+      - name: Publish, ingest, evaluate, and activate
+        run: |
+          uv run --with boto3==1.40.21 python -m infra.release_corpus \
+            --root . \
+            --lock "$RUNNER_TEMP/corpus.lock.json" \
+            --cache ~/.cache/valkeyrie-git \
+            --created-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --account-id "$CORPUS_ACCOUNT_ID" \
+            --region us-east-1 \
+            --bucket "$CORPUS_BUCKET" \
+            --state-table "$CORPUS_STATE_TABLE" \
+            --knowledge-base-id "$CORPUS_KNOWLEDGE_BASE_ID" \
+            --data-source-id "$CORPUS_DATA_SOURCE_ID" \
+            --owner "corpus-refresh-${GITHUB_RUN_ID}"
+        env:
+          CORPUS_ACCOUNT_ID: ${{ vars.CORPUS_ACCOUNT_ID }}
+          CORPUS_BUCKET: ${{ vars.CORPUS_BUCKET }}
+          CORPUS_STATE_TABLE: ${{ vars.CORPUS_STATE_TABLE }}
+          CORPUS_KNOWLEDGE_BASE_ID: ${{ vars.CORPUS_KNOWLEDGE_BASE_ID }}
+          CORPUS_DATA_SOURCE_ID: ${{ vars.CORPUS_DATA_SOURCE_ID }}

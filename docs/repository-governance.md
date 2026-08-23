@@ -22,7 +22,10 @@ The current private prototype must not apply any remote setting without explicit
 - Pull requests from workflows: disabled.
 - Every workflow declares top-level permissions explicitly.
 - Third-party Actions use immutable 40-character commit SHAs.
-- Phase 0 has no OIDC permission, deployment job, cloud credential, Slack credential, or mutation token.
+- Phase 0 has no Slack credential and no project-mutation token. The scheduled corpus refresh is the only
+  credentialed workflow: it assumes a corpus role through OIDC in the `corpus` environment and may publish,
+  ingest, evaluate, and activate a corpus. It has no application or prompt deployment permission, and no
+  workflow may combine both responsibilities.
 
 ## Dependency updates
 
