@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import time
 import uuid
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from secrets import compare_digest
 from typing import Any, cast
 
 import boto3
@@ -47,7 +49,7 @@ _PAGE = """<!doctype html>
  .outcome{{display:inline-block;padding:.1rem .5rem;border-radius:4px;background:#e8eef5}}
 </style></head><body>
 <h1>Ask Valkeyrie</h1>
-<form method="get" action="/">
+<form method="get" action="/">{token_field}
   <input name="q" value="{question}"
          placeholder="How do Valkey replication and failover behave?" autofocus>
   <button type="submit">Ask</button>
@@ -58,7 +60,12 @@ _PAGE = """<!doctype html>
 
 
 def _render(question: str, body: str) -> bytes:
-    return _PAGE.format(question=html.escape(question), answer=body).encode("utf-8")
+    field = ""
+    if Handler.token is not None:
+        field = f'<input type="hidden" name="t" value="{html.escape(Handler.token)}">'
+    return _PAGE.format(question=html.escape(question), answer=body, token_field=field).encode(
+        "utf-8"
+    )
 
 
 def _answer_html(result: dict[str, Any], elapsed_ms: float) -> str:
@@ -83,16 +90,26 @@ def _answer_html(result: dict[str, Any], elapsed_ms: float) -> str:
 
 class Handler(BaseHTTPRequestHandler):
     lambda_client: Any = None
+    token: str | None = None
 
     def do_GET(self) -> None:  # noqa: N802  (BaseHTTPRequestHandler API)
         if self.path.startswith("/favicon"):
             self.send_error(404)
             return
         question = ""
+        supplied = ""
         if "?" in self.path:
             from urllib.parse import parse_qs, urlsplit
 
-            question = parse_qs(urlsplit(self.path).query).get("q", [""])[0].strip()
+            query = parse_qs(urlsplit(self.path).query)
+            question = query.get("q", [""])[0].strip()
+            supplied = query.get("t", [""])[0]
+        # When ASK_TOKEN is set the server is assumed to be reachable by others, so every
+        # request must carry it. Each answer costs money, so an unprotected exposed URL
+        # would let anyone spend the account's Bedrock budget.
+        if Handler.token is not None and not compare_digest(supplied, Handler.token):
+            self.send_error(403, "missing or incorrect token")
+            return
         body = ""
         if question:
             try:
@@ -140,7 +157,12 @@ def main() -> int:
         region_name=REGION,
         config=Config(retries={"max_attempts": 0}, read_timeout=300, connect_timeout=20),
     )
+    Handler.token = os.environ.get("ASK_TOKEN") or None
     server = ThreadingHTTPServer(ADDRESS, Handler)
+    if Handler.token is None:
+        print("no ASK_TOKEN set: local use only, do not expose this port")
+    else:
+        print("ASK_TOKEN required; share URLs as .../?t=<token>&q=<question>")
     print(f"Ask Valkeyrie on http://{ADDRESS[0]}:{ADDRESS[1]}  (Ctrl-C to stop)")
     try:
         server.serve_forever()
