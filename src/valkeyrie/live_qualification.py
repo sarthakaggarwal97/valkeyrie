@@ -134,13 +134,20 @@ _EXPECTED_IDENTITY: Final = QualificationIdentity(
 
 # Exact local on-demand token prices in USD per one million tokens. Source:
 # https://aws.amazon.com/bedrock/pricing/ (US regions), captured for this fixed
-# qualification table as of 2026-08-19. The table is content-addressed below;
-# an unknown model is rejected rather than estimated.
+# qualification table as of 2026-08-19. The table is content-addressed below; a model
+# absent from the table is rejected rather than silently estimated. One entry is an
+# owner-set upper bound rather than a published price and says so at its definition.
 _PRICING_SOURCE: Final = "https://aws.amazon.com/bedrock/pricing/"
 _PRICING_AS_OF: Final = "2026-08-19"
 _PRICES: Final[Mapping[str, tuple[Decimal, Decimal]]] = {
     "us.anthropic.claude-fable-5": (Decimal("3.00"), Decimal("15.00")),
     "amazon.nova-pro-v1:0": (Decimal("0.80"), Decimal("3.20")),
+    # NOT published pricing. Claude Opus 5 is absent from the AWS Pricing API (the Bedrock
+    # price list carries only Claude 2.0, 3 Haiku and 3 Sonnet), so this is a deliberate
+    # upper bound chosen by the project owner. It can only overstate recorded cost, never
+    # understate it, and cost is recorded rather than used as a selection constraint.
+    # Replace with the published figures when they are available.
+    "us.anthropic.claude-opus-5": (Decimal("1000.00"), Decimal("1000.00")),
 }
 _PRICE_DOCUMENT: Final = {
     "api_version": "valkeyrie.io/qualification-pricing/1",

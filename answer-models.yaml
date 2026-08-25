@@ -6,6 +6,8 @@
 #
 # - us.anthropic.claude-fable-5: candidate requested by the project owner.
 # - amazon.nova-pro-v1:0: comparison candidate.
+# - us.anthropic.claude-opus-5: candidate requested by the project owner after two
+#   owner-directed runs where it answered every question Fable timed out on.
 api_version: valkeyrie.io/answer-models/1
 kind: AnswerModelInventory
 candidates:
@@ -21,3 +23,9 @@ candidates:
     temperature: 0.0
     top_p: 1.0
     reasoning_effort: null
+- model_id: us.anthropic.claude-opus-5
+  inference:
+    maximum_output_tokens: 2048
+    temperature: null
+    top_p: null
+    reasoning_effort: low

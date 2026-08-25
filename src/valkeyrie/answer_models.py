@@ -83,6 +83,11 @@ _INFERENCE_FIELDS = {
     "reasoning_effort",
 }
 _FABLE_MODEL = "us.anthropic.claude-fable-5"
+_OPUS_MODEL = "us.anthropic.claude-opus-5"
+# Both Claude revisions take reasoning_effort and reject sampling controls. Immutable
+# Lambda version 8 ran Opus with reasoning_effort "low" and null temperature/top_p, so
+# the constraint is a property of the Claude family rather than of Fable alone.
+_REASONING_EFFORT_MODELS = frozenset({_FABLE_MODEL, _OPUS_MODEL})
 _REASONING_EFFORTS = frozenset({"low", "medium", "high"})
 
 
@@ -257,12 +262,12 @@ def _validated_inference(
         raise AnswerModelError("reasoning_effort must be null, low, medium, or high")
     else:
         reasoning_effort_value = cast(ReasoningEffort, reasoning_effort)
-    if model_revision == _FABLE_MODEL and (
+    if model_revision in _REASONING_EFFORT_MODELS and (
         temperature_value is not None or top_p_value is not None
     ):
-        raise AnswerModelError("Fable sampling temperature and top_p must be null")
-    if model_revision != _FABLE_MODEL and reasoning_effort_value is not None:
-        raise AnswerModelError("reasoning_effort is supported only for Fable")
+        raise AnswerModelError("Claude sampling temperature and top_p must be null")
+    if model_revision not in _REASONING_EFFORT_MODELS and reasoning_effort_value is not None:
+        raise AnswerModelError("reasoning_effort is supported only for Claude revisions")
     return InferenceConfiguration(
         maximum_output_tokens, temperature_value, top_p_value, reasoning_effort_value
     )

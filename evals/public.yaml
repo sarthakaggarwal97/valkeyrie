@@ -100,7 +100,7 @@ cases:
     id: real-workstream-status
     family: core_docs_policy
     repositories: [valkey]
-    question: "What is the current status of the connection-storm workstream in valkey issue #1688?"
+    question: "What is the current status of valkey issue #1688?"
     assertions:
       - uses_only_validated_evidence
       - never_falls_back_to_stale_static_state

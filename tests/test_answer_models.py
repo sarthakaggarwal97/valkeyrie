@@ -53,6 +53,15 @@ INVENTORY_DOCUMENT: dict[str, object] = {
                 "reasoning_effort": None,
             },
         },
+        {
+            "model_id": "us.anthropic.claude-opus-5",
+            "inference": {
+                "maximum_output_tokens": 2048,
+                "temperature": None,
+                "top_p": None,
+                "reasoning_effort": "low",
+            },
+        },
     ],
 }
 
@@ -347,9 +356,11 @@ def test_inventory_binds_the_exact_approved_candidates() -> None:
     assert [candidate.model_revision for candidate in candidates] == [
         "us.anthropic.claude-fable-5",
         "amazon.nova-pro-v1:0",
+        "us.anthropic.claude-opus-5",
     ]
     assert candidates[0].inference == InferenceConfiguration(2048, None, None, "low")
     assert candidates[1].inference == InferenceConfiguration(1200, 0.0, 1.0, None)
+    assert candidates[2].inference == InferenceConfiguration(2048, None, None, "low")
     assert validate_answer_model_inventory(INVENTORY_DOCUMENT) == candidates
 
 
