@@ -36,6 +36,19 @@ def test_authorization_records_personal_vehicle_and_target_without_deployment() 
         assert value in AUTHORIZATION
 
 
+def test_tester_access_path_is_recorded_as_role_assumption_not_shared_credentials() -> None:
+    # Sharing a long-lived key would be unattributable and is not what is deployed.
+    for value in (
+        "access is granted by role assumption",
+        "valkeyrie-development-endpoint-caller",
+        "trusts account 468997136233",
+        "It grants nothing else",
+        "Both invoke actions are required",
+        "anonymous requests remain refused",
+    ):
+        assert value in NORMALIZED_AUTHORIZATION
+
+
 def test_public_endpoint_approval_is_recorded_with_its_exception() -> None:
     # Shipping a public URL while the document still claimed the prototype was non-public
     # would leave the authorization record a lie that still passed its own tests.

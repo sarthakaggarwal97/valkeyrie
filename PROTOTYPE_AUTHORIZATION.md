@@ -100,3 +100,21 @@ restore the world reach the automated mitigation removed.
 
 This does not authorize Slack credentials or traffic, live GitHub mutation, publication to an
 official Valkey repository, or release-readiness decisions, all of which remain gated.
+
+## Tester access path
+
+Testers are Amazon employees with their own AWS accounts, so access is granted by role assumption
+rather than by credential sharing. The role `valkeyrie-development-endpoint-caller` in account
+968533178160 trusts account 468997136233 and grants only `lambda:InvokeFunctionUrl` and
+`lambda:InvokeFunction` on the exact application function. It grants nothing else: policy
+simulation confirms implicit deny for code update, permission mutation, S3, DynamoDB, Bedrock,
+and role passing.
+
+A tester assumes that role and signs the request with SigV4. Because the assumed role is a
+principal in the account that owns the function, the call is same-account and the function needs
+no resource-based policy. The function has none, and anonymous requests remain refused.
+
+Both invoke actions are required. `lambda:InvokeFunctionUrl` alone returns 403 for a function url.
+
+The role is created outside CloudFormation, as the bootstrap execution role also is, because the
+bootstrap stack's own role deliberately cannot create IAM roles.
