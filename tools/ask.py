@@ -27,7 +27,10 @@ import boto3
 from botocore.config import Config
 
 FUNCTION = "valkeyrie-development-application"
-QUALIFIER = "8"
+# Version 7 is Fable, the candidate that passed qualification (Opus on v8 failed the
+# claim-to-evidence gate at 0.743). The corpus is resolved at runtime from the active
+# pointer, so this serves Fable over the complete 3,774-document generation.
+QUALIFIER = "7"
 KNOWLEDGE_BASE_ID = "ONVASJDDNX"
 REGION = "us-east-1"
 ADDRESS = ("127.0.0.1", 8765)
