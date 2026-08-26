@@ -281,10 +281,14 @@ class ApplicationStack(Stack):
                 system_log_level="WARN",
             ),
             memory_size=512,
-            reserved_concurrent_executions=1,
+            # Bounds both parallel spend and blast radius. A public URL with 1 would
+            # serialise every caller behind an 8-23 second answer.
+            reserved_concurrent_executions=5,
             role=role_arn,
             runtime="python3.11",
-            timeout=30,
+            # Fable exceeded 30s on the densest questions (multi-part replication and
+            # governance-process answers), which surfaced as a truncated request.
+            timeout=120,
             tracing_config=lambda_.CfnFunction.TracingConfigProperty(mode="PassThrough"),
             tags=owner,
         )
@@ -301,6 +305,27 @@ class ApplicationStack(Stack):
         version.add_resource_dependency(function)
         version.cfn_options.deletion_policy = CfnDeletionPolicy.RETAIN
         version.cfn_options.update_replace_policy = CfnDeletionPolicy.RETAIN
+
+        # Public unauthenticated endpoint for prototype testers. Both resources are
+        # required: a NONE-auth CfnUrl still returns 403 without the matching
+        # CfnPermission, because the URL auth type and the resource policy are
+        # separate checks. Both are Lambda resources, so the stack stays IAM-free.
+        url = lambda_.CfnUrl(
+            self,
+            "ApplicationUrl",
+            auth_type="NONE",
+            target_function_arn=function.ref,
+        )
+        url.add_resource_dependency(function)
+        permission = lambda_.CfnPermission(
+            self,
+            "ApplicationUrlPermission",
+            action="lambda:InvokeFunctionUrl",
+            function_name=function.ref,
+            function_url_auth_type="NONE",
+            principal="*",
+        )
+        permission.add_resource_dependency(function)
 
 
 def build_application_app(

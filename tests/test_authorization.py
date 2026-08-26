@@ -36,6 +36,19 @@ def test_authorization_records_personal_vehicle_and_target_without_deployment() 
         assert value in AUTHORIZATION
 
 
+def test_public_endpoint_approval_is_recorded_with_its_exception() -> None:
+    # Shipping a public URL while the document still claimed the prototype was non-public
+    # would leave the authorization record a lie that still passed its own tests.
+    for value in (
+        "Build the public URL with Fable",
+        "recorded in Home thread 338 on 2026-08-26",
+        "authorizes an unauthenticated public Lambda Function URL",
+        "deliberate exception to the non-public boundary",
+        "carries no authentication by owner instruction",
+    ):
+        assert value in NORMALIZED_AUTHORIZATION
+
+
 def test_p0_03_authorizes_local_phase_1_only() -> None:
     for value in (
         "Simplify the backlog gates and continue further implementation",

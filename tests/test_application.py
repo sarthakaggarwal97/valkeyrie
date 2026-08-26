@@ -324,6 +324,8 @@ def test_application_stack_is_iam_free_and_retains_exact_version(tmp_path: Path)
     assert Counter(item["Type"] for item in resources.values()) == {
         "AWS::Lambda::Function": 1,
         "AWS::Lambda::Version": 1,
+        "AWS::Lambda::Url": 1,
+        "AWS::Lambda::Permission": 1,
         "AWS::Logs::LogGroup": 1,
     }
     assert "Parameters" not in application and "Outputs" not in application
@@ -347,6 +349,19 @@ def test_application_stack_is_iam_free_and_retains_exact_version(tmp_path: Path)
         == base64.b64encode(bytes.fromhex(result.artifact.artifact_sha256[7:])).decode()
     )
     assert resources["ApplicationLogGroup"]["DeletionPolicy"] == "Retain"
+
+    # The URL is deliberately public. Both resources are required together: a NONE-auth
+    # URL without the matching permission returns 403, so a regression that drops either
+    # one silently breaks the endpoint rather than failing loudly.
+    assert resources["ApplicationUrl"]["Properties"]["AuthType"] == "NONE"
+    grant = resources["ApplicationUrlPermission"]["Properties"]
+    assert grant["Action"] == "lambda:InvokeFunctionUrl"
+    assert grant["FunctionUrlAuthType"] == "NONE"
+    assert grant["Principal"] == "*"
+    # A public caller must not be serialised behind one execution, and needs headroom
+    # beyond the 30s that cut off the densest answers.
+    assert function["ReservedConcurrentExecutions"] == 5
+    assert function["Timeout"] == 120
 
 
 def test_evidence_is_derived_executable_and_cost_truthful(tmp_path: Path) -> None:

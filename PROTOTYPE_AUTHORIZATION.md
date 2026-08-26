@@ -75,3 +75,24 @@ D-01 must approve the exact synthesized development knowledge-plane change set, 
 resource collision check, expected cost and quotas, approver, and timestamp before the first AWS
 mutation. D-02 separately protects the later application deployment because its deployable change set
 does not exist until after the knowledge plane is available.
+
+## Deployment and public endpoint approval
+
+The earlier sections record what was authorized on 2026-08-18 and remain accurate as history. Their
+non-public and no-deployment boundaries have since been superseded by later owner instructions in the
+same thread, recorded here so the document does not contradict what is deployed.
+
+AWS deployment was authorized in Home thread 338 and carried out against the recorded personal
+account: the development knowledge plane, and application versions 6, 7, and 8. Version 7 runs the
+qualified Fable model and version 8 runs Claude Opus 5 at explicit owner direction despite failing
+qualification.
+
+The instruction `Build the public URL with Fable`, recorded in Home thread 338 on 2026-08-26,
+authorizes an unauthenticated public Lambda Function URL serving the qualified Fable model over the
+active corpus generation. This is a deliberate exception to the non-public boundary above. It does not
+authorize Slack credentials or traffic, live GitHub mutation, publication to an official Valkey
+repository, or release-readiness decisions, all of which remain gated.
+
+The endpoint carries no authentication by owner instruction. Its cost and abuse exposure are bounded
+by reserved concurrency rather than by a credential, and it answers only Valkey project questions from
+a pinned corpus.
