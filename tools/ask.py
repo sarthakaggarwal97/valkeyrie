@@ -27,10 +27,16 @@ import boto3
 from botocore.config import Config
 
 FUNCTION = "valkeyrie-development-application"
-# Version 7 is Fable, the candidate that passed qualification (Opus on v8 failed the
-# claim-to-evidence gate at 0.743). The corpus is resolved at runtime from the active
-# pointer, so this serves Fable over the complete 3,774-document generation.
-QUALIFIER = "7"
+# Version 8 runs Claude Opus 5, chosen by the project owner for testing. The corpus is
+# resolved at runtime from the active pointer, so this serves the complete
+# 3,774-document generation, and v8's 240s timeout avoids the 30s cutoffs v7 hit.
+#
+# Owner-directed: Opus FAILED qualification. It scored claim_to_evidence_support 0.743
+# against a required 1.0, so roughly a quarter of its claims were not provable from the
+# evidence it cited, and 19 of 101 cases failed. Fable (v7) passed every gate. Answers
+# from this endpoint may attach citations that do not support the claim, so treat them
+# as unverified. Switch to QUALIFIER "7" for the qualified model.
+QUALIFIER = "8"
 KNOWLEDGE_BASE_ID = "ONVASJDDNX"
 REGION = "us-east-1"
 ADDRESS = ("127.0.0.1", 8765)
