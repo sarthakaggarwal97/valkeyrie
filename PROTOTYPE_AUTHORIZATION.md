@@ -88,11 +88,15 @@ qualified Fable model and version 8 runs Claude Opus 5 at explicit owner directi
 qualification.
 
 The instruction `Build the public URL with Fable`, recorded in Home thread 338 on 2026-08-26,
-authorizes an unauthenticated public Lambda Function URL serving the qualified Fable model over the
-active corpus generation. This is a deliberate exception to the non-public boundary above. It does not
-authorize Slack credentials or traffic, live GitHub mutation, publication to an official Valkey
-repository, or release-readiness decisions, all of which remain gated.
+authorized a Lambda Function URL serving the qualified Fable model over the active corpus
+generation. An unauthenticated url was attempted and is NOT in place: anonymous callers received
+403, Palisade detected the function as world accessible, and epoxy-engage_mitigations automatically
+removed the public permission. The endpoint is therefore scoped to this AWS account and requires
+SigV4 request signing by an identity in account 968533178160.
 
-The endpoint carries no authentication by owner instruction. Its cost and abuse exposure are bounded
-by reserved concurrency rather than by a credential, and it answers only Valkey project questions from
-a pinned corpus.
+World-accessible exposure of this prototype is treated as prohibited. Fronting the same function
+with a public CloudFront distribution was considered and deliberately rejected, because it would
+restore the world reach the automated mitigation removed.
+
+This does not authorize Slack credentials or traffic, live GitHub mutation, publication to an
+official Valkey repository, or release-readiness decisions, all of which remain gated.

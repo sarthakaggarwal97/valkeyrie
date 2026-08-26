@@ -42,9 +42,10 @@ def test_public_endpoint_approval_is_recorded_with_its_exception() -> None:
     for value in (
         "Build the public URL with Fable",
         "recorded in Home thread 338 on 2026-08-26",
-        "authorizes an unauthenticated public Lambda Function URL",
-        "deliberate exception to the non-public boundary",
-        "carries no authentication by owner instruction",
+        "An unauthenticated url was attempted and is NOT in place",
+        "epoxy-engage_mitigations automatically",
+        "scoped to this AWS account and requires",
+        "World-accessible exposure of this prototype is treated as prohibited",
     ):
         assert value in NORMALIZED_AUTHORIZATION
 

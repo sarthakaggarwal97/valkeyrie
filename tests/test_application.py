@@ -191,19 +191,26 @@ def test_service_role_and_existing_role_policies_are_exact(tmp_path: Path) -> No
         "Sid": "ReadExactApplicationArtifact",
     }
     assert set(service["ManageExactApplicationFunction"]["Action"]) == {
+        "lambda:AddPermission",
         "lambda:CreateFunction",
+        "lambda:CreateFunctionUrlConfig",
         "lambda:DeleteFunction",
         "lambda:DeleteFunctionConcurrency",
+        "lambda:DeleteFunctionUrlConfig",
         "lambda:GetFunction",
         "lambda:GetFunctionConcurrency",
         "lambda:GetFunctionConfiguration",
+        "lambda:GetFunctionUrlConfig",
+        "lambda:GetPolicy",
         "lambda:ListVersionsByFunction",
         "lambda:PublishVersion",
         "lambda:PutFunctionConcurrency",
+        "lambda:RemovePermission",
         "lambda:TagResource",
         "lambda:UntagResource",
         "lambda:UpdateFunctionCode",
         "lambda:UpdateFunctionConfiguration",
+        "lambda:UpdateFunctionUrlConfig",
     }
     assert service["PassExactRuntimeRoleToLambda"]["Condition"] == {
         "StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}
@@ -325,7 +332,6 @@ def test_application_stack_is_iam_free_and_retains_exact_version(tmp_path: Path)
         "AWS::Lambda::Function": 1,
         "AWS::Lambda::Version": 1,
         "AWS::Lambda::Url": 1,
-        "AWS::Lambda::Permission": 1,
         "AWS::Logs::LogGroup": 1,
     }
     assert "Parameters" not in application and "Outputs" not in application
@@ -350,14 +356,15 @@ def test_application_stack_is_iam_free_and_retains_exact_version(tmp_path: Path)
     )
     assert resources["ApplicationLogGroup"]["DeletionPolicy"] == "Retain"
 
-    # The URL is deliberately public. Both resources are required together: a NONE-auth
-    # URL without the matching permission returns 403, so a regression that drops either
-    # one silently breaks the endpoint rather than failing loudly.
-    assert resources["ApplicationUrl"]["Properties"]["AuthType"] == "NONE"
-    grant = resources["ApplicationUrlPermission"]["Properties"]
-    assert grant["Action"] == "lambda:InvokeFunctionUrl"
-    assert grant["FunctionUrlAuthType"] == "NONE"
-    assert grant["Principal"] == "*"
+    # The endpoint is account-scoped, never world accessible. A public function url is
+    # prohibited in this account and actively policed: AuthType NONE returned 403 for
+    # anonymous callers and Palisade raised epoxy-engage_mitigations against it. AWS_IAM
+    # needs no resource policy, so any Lambda::Permission here would only widen the
+    # function, and a public CloudFront front door would restore the world reach the
+    # mitigation removed. Both are asserted absent so a regression fails loudly.
+    assert resources["ApplicationUrl"]["Properties"]["AuthType"] == "AWS_IAM"
+    assert not any(item["Type"] == "AWS::Lambda::Permission" for item in resources.values())
+    assert not any(item["Type"].startswith("AWS::CloudFront::") for item in resources.values())
     # A public caller must not be serialised behind one execution, and needs headroom
     # beyond the 30s that cut off the densest answers.
     assert function["ReservedConcurrentExecutions"] == 5

@@ -306,26 +306,24 @@ class ApplicationStack(Stack):
         version.cfn_options.deletion_policy = CfnDeletionPolicy.RETAIN
         version.cfn_options.update_replace_policy = CfnDeletionPolicy.RETAIN
 
-        # Public unauthenticated endpoint for prototype testers. Both resources are
-        # required: a NONE-auth CfnUrl still returns 403 without the matching
-        # CfnPermission, because the URL auth type and the resource policy are
-        # separate checks. Both are Lambda resources, so the stack stays IAM-free.
+        # Account-scoped endpoint. A world-accessible function url is prohibited in
+        # this account and actively policed: an AuthType NONE url with a correct
+        # public permission returned 403 for anonymous callers, and Palisade then
+        # raised epoxy-engage_mitigations and stripped the public statement. Fronting
+        # the same function with a public CloudFront distribution would restore world
+        # reach and circumvent that mitigation, so it is deliberately not done.
+        #
+        # AWS_IAM needs no resource policy: a caller in this account authorizes with
+        # its own IAM identity and signs the request with SigV4, which is verified
+        # working. That keeps the grant in the caller's identity policy rather than
+        # widening the function itself.
         url = lambda_.CfnUrl(
             self,
             "ApplicationUrl",
-            auth_type="NONE",
+            auth_type="AWS_IAM",
             target_function_arn=function.ref,
         )
         url.add_resource_dependency(function)
-        permission = lambda_.CfnPermission(
-            self,
-            "ApplicationUrlPermission",
-            action="lambda:InvokeFunctionUrl",
-            function_name=function.ref,
-            function_url_auth_type="NONE",
-            principal="*",
-        )
-        permission.add_resource_dependency(function)
 
 
 def build_application_app(
@@ -593,19 +591,26 @@ def _service_role_statements(
             "Sid": "ManageExactApplicationFunction",
             "Effect": "Allow",
             "Action": [
+                "lambda:AddPermission",
                 "lambda:CreateFunction",
+                "lambda:CreateFunctionUrlConfig",
                 "lambda:DeleteFunction",
                 "lambda:DeleteFunctionConcurrency",
+                "lambda:DeleteFunctionUrlConfig",
                 "lambda:GetFunction",
                 "lambda:GetFunctionConcurrency",
                 "lambda:GetFunctionConfiguration",
+                "lambda:GetFunctionUrlConfig",
+                "lambda:GetPolicy",
                 "lambda:ListVersionsByFunction",
                 "lambda:PublishVersion",
                 "lambda:PutFunctionConcurrency",
+                "lambda:RemovePermission",
                 "lambda:TagResource",
                 "lambda:UntagResource",
                 "lambda:UpdateFunctionCode",
                 "lambda:UpdateFunctionConfiguration",
+                "lambda:UpdateFunctionUrlConfig",
             ],
             "Resource": [function, f"{function}:*"],
         },
