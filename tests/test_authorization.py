@@ -36,6 +36,20 @@ def test_authorization_records_personal_vehicle_and_target_without_deployment() 
         assert value in AUTHORIZATION
 
 
+def test_slack_authorization_is_recorded_with_its_transport_and_bounds() -> None:
+    # The earlier records exclude Slack credentials and traffic. Shipping a Slack app while
+    # leaving only those would make the document wrong about what is deployed.
+    for value in (
+        "recorded in Home thread 338 on 2026-09-08",
+        "authorizes a Slack app for this assistant",
+        "runs in Socket Mode",
+        "needs no inbound endpoint",
+        "Nothing is exposed to the internet by this integration",
+        "Authorization is bounded to answering questions",
+    ):
+        assert value in NORMALIZED_AUTHORIZATION
+
+
 def test_tester_access_path_is_recorded_as_role_assumption_not_shared_credentials() -> None:
     # Sharing a long-lived key would be unattributable and is not what is deployed.
     for value in (

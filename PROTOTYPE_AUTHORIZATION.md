@@ -118,3 +118,20 @@ Both invoke actions are required. `lambda:InvokeFunctionUrl` alone returns 403 f
 
 The role is created outside CloudFormation, as the bootstrap execution role also is, because the
 bootstrap stack's own role deliberately cannot create IAM roles.
+
+## Slack authorization
+
+The instruction to integrate with Slack, recorded in Home thread 338 on 2026-09-08, authorizes a
+Slack app for this assistant: app creation, workspace installation, a bot token, an app-level token,
+channel access, and real traffic. The owner holds workspace admin permission. This supersedes the
+earlier exclusions of Slack credentials and traffic at the P0-03 and endpoint records above, which
+remain accurate as history.
+
+The app runs in Socket Mode, which opens an outbound WebSocket to Slack and needs no inbound
+endpoint. That is a requirement rather than a preference: this account strips public Lambda
+permissions, demonstrated on both the application function url and the ops webhook receiver, so an
+Events API request url would be unreachable. Nothing is exposed to the internet by this integration.
+
+Authorization is bounded to answering questions. The app reads mentions and posts replies. It is not
+authorized to mutate Valkey, GitHub, release systems, or AWS, and it holds no capability to do so:
+its only backend call is invoking the qualified application function.
