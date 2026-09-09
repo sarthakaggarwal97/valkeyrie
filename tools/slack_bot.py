@@ -107,22 +107,32 @@ def _event_key(event: dict[str, Any]) -> str:
 
 
 def _format(result: dict[str, Any]) -> str:
+    """Render a response by its outcome. The runtime explains itself in `message`."""
     outcome = result.get("outcome", "unknown")
     claims = result.get("claims") or []
     citations = result.get("citations") or []
+    message = result.get("message")
 
-    if not claims:
-        # An abstention is a real answer: the assistant declines rather than guessing.
-        reason = result.get("abstention_reason") or result.get("reason")
-        text = f"I don't have grounded evidence for that ({outcome})."
-        return f"{text}\n_{reason}_" if reason else text
+    if claims:
+        body = "\n".join(f"• {c['text']}" for c in claims if c.get("text"))
+        if citations:
+            sources = "\n".join(
+                f"  <{c.split(': ', 1)[-1]}|{c.split(': ', 1)[0]}>" for c in citations
+            )
+            body += f"\n\n*Sources*\n{sources}"
+        return body
 
-    lines = [claim.get("text", "") for claim in claims if claim.get("text")]
-    body = "\n".join(f"• {line}" for line in lines)
-    if citations:
-        sources = "\n".join(f"  <{c.split(': ', 1)[-1]}|{c.split(': ', 1)[0]}>" for c in citations)
-        body += f"\n\n*Sources*\n{sources}"
-    return body
+    # No claims is not one situation. A clarification is the assistant asking something
+    # back, a partial means evidence was reachable but incomplete, and an abstention is a
+    # deliberate refusal. Collapsing all three into a refusal loses the actual reply.
+    if outcome == "clarification":
+        return message or "What would you like to know about the Valkey project?"
+    if outcome == "partial":
+        detail = message or "Some evidence could not be retrieved."
+        return f"{detail}\nI won't guess at the rest. Try asking without the live-status wording."
+    if message:
+        return message
+    return f"I don't have grounded evidence for that ({outcome})."
 
 
 def main() -> None:
