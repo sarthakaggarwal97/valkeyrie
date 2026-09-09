@@ -392,7 +392,7 @@ def test_public_evaluations_cover_sources_families_and_semantics() -> None:
     assert document["api_version"] == "valkeyrie.io/evaluations/1"
     assert document["kind"] == "PublicEvaluationSuite"
     cases = _cases(document)
-    assert len(cases) == 77
+    assert len(cases) == 81
     ids = [cast(str, case["id"]) for case in cases]
     assert len(ids) == len(set(ids))
     assert {cast(str, case["category"]) for case in cases} >= {

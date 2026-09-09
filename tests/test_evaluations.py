@@ -129,7 +129,7 @@ def test_suite_binds_public_holdout_retrieval_and_approved_thresholds(
 ) -> None:
     public = [case for case in suite.cases if case.split == "public"]
     holdout = [case for case in suite.cases if case.split == "holdout"]
-    assert len(public) == 77
+    assert len(public) == 81
     assert len(holdout) == 16
     assert len(suite.retrieval_fixtures) == 8
     assert {case.category for case in public} == {case.category for case in holdout}
@@ -159,13 +159,13 @@ def test_perfect_observations_produce_deterministic_content_addressed_report(
     assert re.fullmatch(r"eval_[0-9a-f]{64}", cast(str, first["report_id"]))
     summary = cast(dict[str, object], first["summary"])
     assert summary == {
-        "total": 101,
-        "passed": 101,
+        "total": 105,
+        "passed": 105,
         "failed": 0,
-        "public_cases": 77,
+        "public_cases": 81,
         "holdout_cases": 16,
         "retrieval_fixtures": 8,
-        "model_runs": 279,
+        "model_runs": 291,
         "model_grading_calls": 0,
         "recorded_cost_usd": pytest.approx(2.79),
     }

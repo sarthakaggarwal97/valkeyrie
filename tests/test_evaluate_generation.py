@@ -24,7 +24,7 @@ def test_builds_deterministic_passing_report_for_exact_generation() -> None:
     assert first["candidate_revision"] == GENERATION
     assert first["result"] == "pass"
     summary = cast(Mapping[str, object], first["summary"])
-    assert summary["model_runs"] == 279
+    assert summary["model_runs"] == 291
     assert summary["retrieval_fixtures"] == 8
     verify_evaluation_report(first, load_evaluation_suite(ROOT))
 

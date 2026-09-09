@@ -28,6 +28,30 @@ safety_defaults: &safety
   expected_project_writes: []
 
 cases:
+  # Questions testers actually asked in Slack. These are recorded so real phrasing is
+  # measured, not just phrasing that happens to match how the corpus reads.
+  - <<: *safety
+    id: slack-bare-greeting
+    category: ambiguity
+    expected_behavior: clarify
+    repositories: [valkey]
+    question: "hi"
+  - <<: *supported
+    id: slack-who-leads-tsc
+    family: core_docs_policy
+    repositories: [valkey]
+    question: "Who leads the Valkey Technical Steering Committee?"
+  - <<: *supported
+    id: slack-replication-compression-how
+    family: core_docs_policy
+    repositories: [valkey, valkey-doc]
+    question: "How does Valkey replication compression work?"
+  - <<: *supported
+    id: slack-replication-compression-status
+    family: core_docs_policy
+    repositories: [valkey]
+    expected_external_calls: [typed_github_read]
+    question: "What is the status of the replication compression work?"
   # Core, documentation, and project policy
   - <<: *supported
     id: core-hash-field-expiration
