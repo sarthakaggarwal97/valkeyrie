@@ -359,7 +359,9 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
 
     expected_url = (
         "https://api.github.com/search/issues?"
-        "q=org%3Avalkey-io+repo%3Avalkey-io%2Fvalkey+release+status"
+        # repo: alone. Sending org: alongside it makes GitHub union the two scopes and
+        # return sibling-repository items, which then fail the item repository check.
+        "q=repo%3Avalkey-io%2Fvalkey+release+status"
         "&sort=updated&order=desc&per_page=20"
     )
     assert calls == [(expected_url, REQUEST_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES)]
@@ -372,6 +374,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
             {
                 "api_url": "https://api.github.com/repos/valkey-io/valkey/issues/8",
                 "body": "Current status",
+                "body_truncated": False,
                 "closed_at": TIMESTAMP,
                 "kind": "issue",
                 "labels": ["release-tracker"],
@@ -392,6 +395,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
             {
                 "api_url": "https://api.github.com/repos/valkey-io/valkey/issues/9",
                 "body": "Current status",
+                "body_truncated": False,
                 "closed_at": TIMESTAMP,
                 "kind": "pull_request",
                 "labels": ["release-tracker"],
@@ -637,12 +641,33 @@ def test_issue_search_body_is_nullable_but_strictly_bounded() -> None:
     items = cast(list[dict[str, object]], _decoded(result)["items"])
     assert items[0]["body"] is None
 
+    # A body over the bound must NOT discard the whole result set. A long issue body is
+    # ordinary, and failing the search made every repository-scoped question return
+    # "Live GitHub data is temporarily unavailable". It is truncated, and the item says so.
     item["body"] = "x" * (MAX_SEARCH_BODY_BYTES + 1)
-    with pytest.raises(LiveGitHubError, match="byte bound"):
-        read_live_github(
-            IssueSearchQuery(("release", "status")),
-            fetch=lambda *args: _response(_issue_search(item)),
-        )
+    result = read_live_github(
+        IssueSearchQuery(("release", "status")),
+        fetch=lambda *args: _response(_issue_search(item)),
+        observed_clock=lambda: OBSERVED,
+    )
+    items = cast(list[dict[str, object]], _decoded(result)["items"])
+    assert items[0]["body_truncated"] is True
+    body = cast(str, items[0]["body"])
+    assert len(body.encode("utf-8")) == MAX_SEARCH_BODY_BYTES
+    # The observation is still complete: every matching item is present.
+    assert result.complete is True and result.truncated is False
+
+    # A multi-byte character must not be cut mid-sequence.
+    item["body"] = "\u00e9" * MAX_SEARCH_BODY_BYTES
+    result = read_live_github(
+        IssueSearchQuery(("release", "status")),
+        fetch=lambda *args: _response(_issue_search(item)),
+        observed_clock=lambda: OBSERVED,
+    )
+    items = cast(list[dict[str, object]], _decoded(result)["items"])
+    truncated_body = cast(str, items[0]["body"])
+    assert truncated_body == "\u00e9" * (MAX_SEARCH_BODY_BYTES // 2)
+    assert len(truncated_body.encode("utf-8")) <= MAX_SEARCH_BODY_BYTES
 
 
 @pytest.mark.parametrize(

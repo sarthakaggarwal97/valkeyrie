@@ -814,7 +814,10 @@ def test_runtime_exact_release_digest_fails_closed_without_record(
         manifest=manifest,
     )
     assert result["outcome"] == "abstention"
-    assert result["message"] == "I couldn’t find enough verified information to answer that."
+    # A refusal must also say what to try next, or the asker is left with nothing.
+    message = cast(str, result["message"])
+    assert message.startswith("I couldn’t find enough verified information")
+    assert "indexed Valkey repositories" in message
     assert services.retrieve_calls == []
     assert services.model_calls == []
 
@@ -1123,7 +1126,9 @@ def test_runtime_uses_natural_clarification_and_live_state_abstention(
         manifest=manifest,
     )
     assert current["outcome"] == "abstention"
-    assert current["message"] == "I couldn’t identify a supported live GitHub query."
+    live_message = cast(str, current["message"])
+    assert live_message.startswith("I couldn’t identify a supported live GitHub query.")
+    assert "name an issue or pull request number" in live_message
 
 
 def test_aws_converse_places_reviewed_answer_contract_after_untrusted_payload(
@@ -1361,7 +1366,10 @@ def test_projects_without_authenticated_graphql_and_live_failures_are_bounded(
         manifest=manifest,
     )
     assert result["outcome"] == "partial"
-    assert result["message"] == "Live GitHub data is temporarily unavailable."
+    unavailable = cast(str, result["message"])
+    assert unavailable.startswith("Live GitHub data is temporarily unavailable.")
+    # The corpus often answers the same topic, so the refusal points there.
+    assert "indexed corpus instead" in unavailable
     assert services.live_calls == [ProjectQuery(12)]
     assert services.retrieve_calls == []
     assert services.model_calls == []

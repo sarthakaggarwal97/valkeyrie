@@ -90,6 +90,30 @@ class RuntimeResult:
     request_fence: int | None = None
 
 
+# A refusal that only says evidence was insufficient leaves the asker with nothing to try.
+# These clauses name the next move. They are presentation, deliberately not part of the
+# prompt: what the model is allowed to claim must not depend on advice given to the user.
+_STATIC_GUIDANCE: Final = (
+    " I answer from indexed Valkey repositories, so naming the repository, command, or"
+    " document usually helps."
+)
+_LIVE_GUIDANCE: Final = (
+    " Ask without \u201ccurrent\u201d, \u201clatest\u201d, or \u201cstatus of\u201d and I will"
+    " answer from the indexed corpus instead."
+)
+_LIVE_TARGET_GUIDANCE: Final = (
+    " For live lookups, name an issue or pull request number, or ask for the latest release."
+)
+
+
+def _guided(message: str | None, guidance: str) -> str:
+    """Append a next step to a refusal, without restating it if already present."""
+    text = (message or "").strip()
+    if not text:
+        return guidance.strip()
+    return text if guidance.strip() in text else f"{text}{guidance}"
+
+
 class RuntimeServices(Protocol):
     """Exact deployed service operations used by one answer."""
 
@@ -380,7 +404,9 @@ def _answer(
     if provisional.outcome == "clarification":
         return RuntimeResult("clarification", request_id, provisional.question)
     if provisional.outcome == "abstention":
-        return RuntimeResult("abstention", request_id, provisional.reason)
+        return RuntimeResult(
+            "abstention", request_id, _guided(provisional.reason, _STATIC_GUIDANCE)
+        )
 
     evidence: tuple[RuntimeEvidence, ...]
     generation_id: str | None
@@ -391,17 +417,27 @@ def _answer(
             query = infer_live_query(question)
         except LiveGitHubError:
             return RuntimeResult(
-                "abstention", request_id, "I couldn’t identify a supported live GitHub query."
+                "abstention",
+                request_id,
+                _guided(
+                    "I couldn’t identify a supported live GitHub query.", _LIVE_TARGET_GUIDANCE
+                ),
             )
         if query is None:
             return RuntimeResult(
-                "abstention", request_id, "I couldn’t identify a supported live GitHub query."
+                "abstention",
+                request_id,
+                _guided(
+                    "I couldn’t identify a supported live GitHub query.", _LIVE_TARGET_GUIDANCE
+                ),
             )
         try:
             observation = services.read_live(query)
         except Exception:
             return RuntimeResult(
-                "partial", request_id, "Live GitHub data is temporarily unavailable."
+                "partial",
+                request_id,
+                _guided("Live GitHub data is temporarily unavailable.", _LIVE_GUIDANCE),
             )
         try:
             evidence = (_live_evidence(observation),)
@@ -429,7 +465,9 @@ def _answer(
         if decision.outcome == "clarification":
             return RuntimeResult("clarification", request_id, decision.question)
         if decision.outcome == "abstention":
-            return RuntimeResult("abstention", request_id, decision.reason)
+            return RuntimeResult(
+                "abstention", request_id, _guided(decision.reason, _STATIC_GUIDANCE)
+            )
         if generation is None:
             return RuntimeResult(
                 "partial", request_id, "The selected corpus is temporarily unavailable."
@@ -472,7 +510,11 @@ def _answer(
         evidence_mode = "static"
     if not evidence:
         return RuntimeResult(
-            "abstention", request_id, "I couldn’t find enough verified information to answer that."
+            "abstention",
+            request_id,
+            _guided(
+                "I couldn’t find enough verified information to answer that.", _STATIC_GUIDANCE
+            ),
         )
     package = load_prompt_package(root)
     prompt_by_name = {template.name: template.content for template in package.templates}

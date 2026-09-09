@@ -454,9 +454,14 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         terms = _search_terms(query.terms)
         search_repository = _optional_repository(query.repository)
         per_page = _search_per_page(query.per_page)
-        qualifiers = [f"org:{OWNER}"]
+        # A repo: qualifier already scopes to one repository. Sending org: alongside it
+        # makes GitHub union the two scopes and return items from sibling repositories,
+        # which _search_item then correctly rejects as conflicting with the query. That
+        # turned every repository-scoped search into a live-unavailable failure.
         if search_repository is not None:
-            qualifiers.append(f"repo:{OWNER}/{search_repository}")
+            qualifiers = [f"repo:{OWNER}/{search_repository}"]
+        else:
+            qualifiers = [f"org:{OWNER}"]
         encoded_query = urlencode(
             {
                 "q": " ".join((*qualifiers, *terms)),
@@ -617,6 +622,20 @@ def _issue_search(
     }
 
 
+def _search_body(value: Mapping[str, object]) -> tuple[str | None, bool]:
+    """Return a search item body bounded to MAX_SEARCH_BODY_BYTES, and whether it was cut."""
+    raw = value.get("body")
+    if raw is None:
+        return None, False
+    if type(raw) is not str:
+        raise LiveGitHubError("GitHub field body must be a string")
+    encoded = raw.encode("utf-8")
+    if len(encoded) <= MAX_SEARCH_BODY_BYTES:
+        return raw, False
+    # Cut on a character boundary so the retained text is always valid UTF-8.
+    return encoded[:MAX_SEARCH_BODY_BYTES].decode("utf-8", "ignore"), True
+
+
 def _search_item(value: Mapping[str, object], scoped_repository: str | None) -> dict[str, object]:
     repository_url = _text(value, "repository_url", 512)
     repository_prefix = f"{_API_ROOT}/repos/{OWNER}/"
@@ -625,6 +644,12 @@ def _search_item(value: Mapping[str, object], scoped_repository: str | None) -> 
     repository = _repository(repository_url.removeprefix(repository_prefix))
     if scoped_repository is not None and repository != scoped_repository:
         raise LiveGitHubError("GitHub search item repository conflicts with the query")
+
+    # A search returns up to 20 items, so its per-item body bound is tighter than the
+    # 128 KiB the single-issue paths allow. A body over that bound is normal on a long
+    # issue and must not discard the whole result set, so it is truncated and the item
+    # says so. The observation stays complete: every matching item is still present.
+    body, body_truncated = _search_body(value)
 
     number = _entity_id(_integer(value, "number"), "GitHub search item number")
     api_url = f"{_API_ROOT}/repos/{OWNER}/{repository}/issues/{number}"
@@ -647,7 +672,8 @@ def _search_item(value: Mapping[str, object], scoped_repository: str | None) -> 
         "repository": repository,
         "number": number,
         "title": _text(value, "title", 1024),
-        "body": _nullable_text(value, "body", MAX_SEARCH_BODY_BYTES),
+        "body": body,
+        "body_truncated": body_truncated,
         "state": _choice(value, "state", {"open", "closed"}),
         "labels": _labels(value),
         "milestone": _search_milestone(value.get("milestone"), repository),
