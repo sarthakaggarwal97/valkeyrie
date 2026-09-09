@@ -127,7 +127,12 @@ def _format(result: dict[str, Any]) -> str:
 
 def main() -> None:
     """Build the Slack app at startup so the answer path stays importable and testable."""
-    app = App(token=os.environ["SLACK_BOT_TOKEN"])
+    # request_verification_enabled=False because that middleware is for HTTP mode: it
+    # verifies a signing secret on inbound POSTs. Socket Mode has no inbound endpoint and
+    # events arrive over a pre-authenticated WebSocket, so Bolt would otherwise demand a
+    # signing secret that serves no purpose here. Token verification stays on, so a bad
+    # bot token fails at startup rather than on the first mention.
+    app = App(token=os.environ["SLACK_BOT_TOKEN"], request_verification_enabled=False)
     app.event("app_mention")(answer_mention)
     log.info("connecting to Slack in Socket Mode, serving %s:%s", FUNCTION, QUALIFIER)
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
