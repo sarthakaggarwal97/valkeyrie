@@ -1211,7 +1211,8 @@ def _verify_state(
             raise LiveQualificationError("partial evidence state digest is invalid")
 
     raw_observations = state.get("observations")
-    if not isinstance(raw_observations, list) or len(raw_observations) > 279:
+    # 97 cases x 3 runs. Derived from the case count, so it moves with the suite.
+    if not isinstance(raw_observations, list) or len(raw_observations) > 291:
         raise LiveQualificationError("raw evidence observations are not a bounded list")
     expected = [(case, run) for case in cases for run in range(1, 4)]
     if complete and len(raw_observations) != len(expected):
@@ -1427,7 +1428,11 @@ def _load_cases(root: Path, suite: EvaluationSuite) -> tuple[QualificationCase, 
             )
     expected = [(case.case_id, case.split, case.family, case.category) for case in suite.cases]
     actual = [(case.case_id, case.split, case.family, case.category) for case in cases]
-    if actual != expected or len(cases) != 93:
+    # 81 public + 16 holdout. Pinned deliberately: the comparison above proves the
+    # private definitions match the suite, and this proves the suite itself is the
+    # expected size, so a case silently disappearing from BOTH is still caught.
+    # Update when cases are added or removed.
+    if actual != expected or len(cases) != 97:
         raise LiveQualificationError("private case definitions do not match the exact suite")
     return tuple(cases)
 

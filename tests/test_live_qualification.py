@@ -228,7 +228,7 @@ def test_complete_runner_makes_exactly_558_calls_and_persists_authoritative_resu
 
     result = cast(Any, _run(root, client))
 
-    assert len(cases) == 93
+    assert len(cases) == 97
     assert len(client.calls) == 558
     assert len(client.payloads) == 558
     assert result.selection.profile.model_revision == "us.anthropic.claude-fable-5"
@@ -288,7 +288,7 @@ def test_complete_runner_makes_exactly_558_calls_and_persists_authoritative_resu
         report = json.loads(report_path.read_text(encoding="utf-8"))
         verify_evaluation_report(report, suite)
         assert report["result"] == "pass"
-        assert report["summary"]["model_runs"] == 279
+        assert report["summary"]["model_runs"] == 291
         assert report["summary"]["model_grading_calls"] == 0
 
     raw = [json.loads(path.read_text(encoding="utf-8")) for path in evidence_paths]
@@ -302,7 +302,7 @@ def test_complete_runner_makes_exactly_558_calls_and_persists_authoritative_resu
             "sha256:77adf9a69529b1d1197ab2b81a4a08493388e31ecfe856fdda8e75b1e816ac20"
         ),
     }
-    assert all(item["complete"] is True and len(item["observations"]) == 279 for item in raw)
+    assert all(item["complete"] is True and len(item["observations"]) == 291 for item in raw)
     assert all(
         item["scope"] == "fixed_evidence_bound_suite_only_not_general_capability" for item in raw
     )
