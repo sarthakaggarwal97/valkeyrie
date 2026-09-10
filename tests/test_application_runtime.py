@@ -540,6 +540,9 @@ def test_runtime_clarification_abstention_and_partial(manifest: dict[str, object
         manifest=manifest,
     )
     assert clarify["outcome"] == "clarification"
+    # A clarification is already a question to the user, so it must NOT be decorated with
+    # "try naming a repository" guidance meant for refusals.
+    assert "indexed Valkey repositories" not in cast(str, clarify["message"])
 
     no_evidence = FakeServices()
     no_evidence.retrieval = ()
@@ -547,6 +550,10 @@ def test_runtime_clarification_abstention_and_partial(manifest: dict[str, object
         _event(request_id="req_abstain"), no_evidence, root=ROOT, manifest=manifest
     )
     assert abstain["outcome"] == "abstention"
+    # The model writes its own reason. It still has to reach the user with a next step,
+    # which is why the guidance is applied where the parsed outcome becomes a result
+    # rather than at each return site.
+    assert "indexed Valkey repositories" in cast(str, abstain["message"])
 
     disabled = FakeServices()
     disabled.controls[next(iter(disabled.controls))] = "false"

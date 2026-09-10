@@ -686,6 +686,12 @@ def _execute_plan(
             request_revision=revision + 1,
             request_fence=fence,
         )
+    if outcome == "abstention":
+        # Applied here, at the single point where a parsed model outcome becomes a result,
+        # rather than at each return site. The model writes its own reason, so wrapping the
+        # sites individually left this one bare and would leave the next one bare too.
+        # A clarification is deliberately excluded: it is already a question to the user.
+        message = _guided(message, _STATIC_GUIDANCE)
     terminal = "answer" if outcome == "answer" else outcome
     if not services.complete_request(
         request_id=request_id,
