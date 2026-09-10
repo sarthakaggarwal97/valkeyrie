@@ -363,14 +363,20 @@ def test_final_objects_manifest_and_bedrock_sidecars_are_exact_and_keyed(
     _validator("generation_manifest").validate(manifest)
 
     for document, sidecar in zip(bundle.documents, bundle.metadata_sidecars, strict=True):
-        document_value = json.loads(document.content)
         sidecar_value = json.loads(sidecar.content)
         attributes = sidecar_value["metadataAttributes"]
-        _validator("normalized_document").validate(document_value)
         assert set(sidecar_value) == {"metadataAttributes"}
         assert sidecar.object_key == f"{document.object_key}.metadata.json"
+        # The published body is the document text itself. It used to be the canonical JSON
+        # envelope, which meant Bedrock embedded `{"api_version":...,"content":"` on every
+        # document and saw the body JSON-escaped. Provenance belongs in the sidecar, which
+        # Bedrock reads as metadata and never embeds.
+        body = document.content.decode("utf-8")
+        assert "valkeyrie.io/normalized-document" not in body
+        assert not body.startswith("{")
+        suffix = "md" if attributes["content_type"] == "text/markdown" else "txt"
         assert document.object_key == (
-            f"documents/{document.object_id.removeprefix('sha256:')}.json"
+            f"documents/{document.object_id.removeprefix('sha256:')}.{suffix}"
         )
         assert document.digest == _digest(document.content)
         assert sidecar.digest == _digest(sidecar.content)

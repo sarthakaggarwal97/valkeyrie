@@ -151,11 +151,14 @@ def create_generation_bundle(
     final_documents: list[CanonicalObject] = []
     sidecars: list[CanonicalObject] = []
     for document in inputs.documents:
-        document_bytes = canonical_document_bytes(document)
+        # The published body is the document text itself, not the canonical envelope. The
+        # envelope is still derived below for identity and contract validation, so the
+        # document ID is unchanged; only what Bedrock embeds differs.
+        document_bytes = document.content.encode("utf-8")
         metadata = _decode_object(canonical_metadata_identity_bytes(document), "metadata template")
         metadata["generation_id"] = generation_id
         metadata_bytes = _canonical_json({"metadataAttributes": metadata})
-        document_key = _document_object_key(document.document_id)
+        document_key = _document_object_key(document.document_id, document.content_type)
         final_documents.append(_object(document.document_id, document_key, document_bytes, limits))
         sidecars.append(
             _object(
@@ -602,10 +605,21 @@ def _validate_timestamp(value: object) -> None:
         raise GenerationError("created_at must be a UTC timestamp")
 
 
-def _document_object_key(document_id: str) -> str:
+# Bedrock parses a knowledge-base object by extension and embeds whatever text it finds.
+# Publishing the document body as .md or .txt means the embedding covers the prose. It used
+# to be a .json envelope, so every document's first chunk began with the identical
+# `{"api_version":...,"content":"` prefix and the body arrived JSON-escaped, which flattened
+# similarity scores and destroyed markdown structure. Provenance lives in the sidecar, which
+# Bedrock reads as metadata and never embeds.
+_DOCUMENT_SUFFIXES: Final[Mapping[str, str]] = {"text/markdown": "md"}
+_DEFAULT_DOCUMENT_SUFFIX: Final = "txt"
+
+
+def _document_object_key(document_id: str, content_type: str) -> str:
     if _DIGEST.fullmatch(document_id) is None:
         raise GenerationError("document ID is malformed for object-key derivation")
-    return f"documents/{document_id.removeprefix('sha256:')}.json"
+    suffix = _DOCUMENT_SUFFIXES.get(content_type, _DEFAULT_DOCUMENT_SUFFIX)
+    return f"documents/{document_id.removeprefix('sha256:')}.{suffix}"
 
 
 def _structured_object_key(record_id: str) -> str:
