@@ -1374,6 +1374,12 @@ def _normalize_dynamodb_value(value: object) -> object:
 def _runtime_retrieval_metadata(metadata: object) -> Mapping[str, object]:
     if not isinstance(metadata, Mapping):
         raise ApplicationRuntimeError("Bedrock retrieval metadata is malformed")
+    # Every field here comes from the metadata sidecar this project publishes, so it is
+    # provenance we control and can insist on. `x-amz-bedrock-kb-chunk-id` is deliberately
+    # NOT required: Bedrock omits it when a document produces a single chunk, so requiring
+    # it rejected every short document. valkey/MAINTAINERS.md is 1,462 bytes, yields one
+    # chunk, and names the TSC Chair, and this check was discarding it and failing the
+    # whole request. A chunk identifier is a Bedrock implementation detail, not provenance.
     required = (
         "generation_id",
         "document_id",
@@ -1383,7 +1389,6 @@ def _runtime_retrieval_metadata(metadata: object) -> Mapping[str, object]:
         "authority",
         "version_scope",
         "content_digest",
-        "x-amz-bedrock-kb-chunk-id",
     )
     if any(
         not isinstance(metadata.get(field), str) or not metadata.get(field) for field in required
@@ -1407,8 +1412,12 @@ def _runtime_retrieval_metadata(metadata: object) -> Mapping[str, object]:
     ):
         raise ApplicationRuntimeError("Bedrock retrieval path is unsafe")
     commit = cast(str, metadata["commit"])
+    # The chunk id distinguishes several chunks of one document. Bedrock omits it when a
+    # document yields a single chunk, in which case the document id already identifies the
+    # chunk uniquely, so a fixed marker keeps evidence ids stable and distinct.
+    chunk = metadata.get("x-amz-bedrock-kb-chunk-id") or "single-chunk"
     identity = json.dumps(
-        [metadata["generation_id"], metadata["document_id"], metadata["x-amz-bedrock-kb-chunk-id"]],
+        [metadata["generation_id"], metadata["document_id"], chunk],
         separators=(",", ":"),
     )
     return {

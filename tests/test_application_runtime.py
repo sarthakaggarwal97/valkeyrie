@@ -268,6 +268,14 @@ def test_aws_adapter_derives_runtime_evidence_from_bedrock_sidecar() -> None:
     first = _runtime_retrieval_metadata(metadata)
     second = _runtime_retrieval_metadata({**metadata, "x-amz-bedrock-kb-chunk-id": "chunk-2"})
 
+    # Bedrock omits the chunk id when a document produces a single chunk. Requiring it
+    # rejected every short document, including valkey/MAINTAINERS.md, which is 1,462 bytes
+    # and names the TSC Chair. A chunk identifier is not provenance.
+    single_chunk = {key: value for key, value in metadata.items() if not key.startswith("x-amz-")}
+    accepted = _runtime_retrieval_metadata(single_chunk)
+    assert accepted["repository"] == "valkey-doc"
+    assert accepted["commit"] == COMMIT
+
     evidence = _parse_evidence(
         {"text": "command documentation", "metadata": first}, generation_id=GENERATION
     )
