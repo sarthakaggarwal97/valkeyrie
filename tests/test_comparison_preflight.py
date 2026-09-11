@@ -22,7 +22,7 @@ def _identity() -> ComparisonEvaluationIdentity:
         "8",
         APPLICATION,
         ARTIFACT,
-        "sha256:64f9a99faefc432eca78ed0bbf68d3fb6da3a0867e558fc07111ced476e66193",
+        "sha256:394c725de332cb66cff5808d50c39f19a66979d27e377ac89c0eb4e62295ef89",
         "sha256:6760b22e3e09ac0e2ac64c9c23b3a77733f5bd1f8f8c9704c66d2c69d1362b60",
         "ONVASJDDNX",
         "us.anthropic.claude-opus-5",

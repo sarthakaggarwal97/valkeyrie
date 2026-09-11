@@ -219,7 +219,7 @@ def _walk_keys(value: object) -> set[str]:
     return set()
 
 
-def test_complete_runner_makes_exactly_558_calls_and_persists_authoritative_results(
+def test_complete_runner_makes_exactly_582_calls_and_persists_authoritative_results(
     tmp_path: Path,
 ) -> None:
     root = _root(tmp_path)
@@ -229,8 +229,8 @@ def test_complete_runner_makes_exactly_558_calls_and_persists_authoritative_resu
     result = cast(Any, _run(root, client))
 
     assert len(cases) == 97
-    assert len(client.calls) == 558
-    assert len(client.payloads) == 558
+    assert len(client.calls) == 582
+    assert len(client.payloads) == 582
     assert result.selection.profile.model_revision == "us.anthropic.claude-fable-5"
     assert result.selection_record["selected_model_revision"] == "us.anthropic.claude-fable-5"
     assert (
@@ -383,7 +383,7 @@ def test_grading_fields_and_expected_behavior_never_cross_the_model_boundary(
         if payload["question"] in holdout_questions
     ]
     assert len(holdout_requests) == 16 * 3 * 2
-    assert len(client.calls) == 558
+    assert len(client.calls) == 582
     for request in client.calls:
         assert not (_walk_keys(request) & FORBIDDEN_MODEL_KEYS)
         serialized = json.dumps(request, sort_keys=True)
@@ -512,7 +512,7 @@ def test_resume_retries_only_pending_and_missing_exact_runs(tmp_path: Path) -> N
 
     resumed = FakeConverse(cases)
     result = cast(Any, _run(root, resumed, resume=True))
-    assert len(resumed.calls) == 558 - 6
+    assert len(resumed.calls) == 582 - 6
     assert result.selection.profile.model_revision == "us.anthropic.claude-fable-5"
     assert not list((root / "evals/reports/evidence").glob(".*.partial.json"))
 
@@ -530,7 +530,7 @@ def test_api_failures_are_safely_recorded_and_fail_the_candidate_report(
     client = FakeConverse(cases, fail_calls=frozenset({1, 2, 3}))
     result = cast(Any, _run(root, client))
 
-    assert len(client.calls) == 558
+    assert len(client.calls) == 582
     reports = {report["candidate_revision"]: report for report in result.reports}
     fable = next(
         report
@@ -726,7 +726,7 @@ def test_successful_plain_text_is_a_conservative_failed_claim_not_an_exception(
     client = FakeConverse(cases, plain_text_calls=frozenset({1}))
     result = cast(Any, _run(root, client))
 
-    assert len(client.calls) == 558
+    assert len(client.calls) == 582
     fable_report = next(
         report
         for report in result.reports
@@ -1180,7 +1180,7 @@ def test_safety_stop_reason_is_a_successful_strict_non_answer(
 
     result = cast(Any, _run(root, client))
 
-    assert len(client.calls) == 558
+    assert len(client.calls) == 582
     assert result.selection.profile.model_revision == "us.anthropic.claude-fable-5"
     evidence = next(
         json.loads(path.read_text(encoding="utf-8"))

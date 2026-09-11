@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import shutil
 from copy import deepcopy
@@ -43,6 +44,16 @@ def _model_metrics(*, supported: bool) -> dict[str, object]:
         "invented_release_readiness_verdicts": 0,
         "dependency_failure_safe": True,
     }
+
+
+def _first_supported_index(suite: EvaluationSuite, runs: list[ModelRun]) -> int:
+    """Index of a run for a supported case.
+
+    Model grading and per-case answer metrics only apply to supported cases, so these tests
+    must not depend on which case happens to be first in the suite.
+    """
+    supported = {case.case_id for case in suite.cases if case.category == "supported"}
+    return next(index for index, run in enumerate(runs) if run.case_id in supported)
 
 
 def _passing_model_runs(suite: EvaluationSuite) -> list[ModelRun]:
@@ -167,7 +178,7 @@ def test_perfect_observations_produce_deterministic_content_addressed_report(
         "retrieval_fixtures": 8,
         "model_runs": 291,
         "model_grading_calls": 0,
-        "recorded_cost_usd": pytest.approx(2.79),
+        "recorded_cost_usd": pytest.approx(2.91),
     }
     assert all(gate["status"] == "pass" for gate in cast(list[dict[str, object]], first["gates"]))
     verify_evaluation_report(first, suite)
@@ -246,7 +257,11 @@ def test_nearest_rank_latency_and_request_reliability_thresholds(
 ) -> None:
     runs = _passing_model_runs(suite)
     slow = list(runs)
-    for index in range(14):
+    # Nearest-rank p95: the gate reads the ceil(0.95 * n)th value, so the number of slow runs
+    # needed is derived from the run total rather than pinned. A hardcoded 14 stopped working
+    # the moment the suite gained cases.
+    breaching = len(runs) - math.ceil(0.95 * len(runs)) + 1
+    for index in range(breaching):
         slow = _change_model(slow, index, latency_seconds=15.01)
     latency = _evaluate(suite, model_runs=slow)
     assert _gate(latency, "model.candidate_p95_latency_seconds")["status"] == "fail"
@@ -285,14 +300,16 @@ def test_model_grading_is_explicit_bounded_and_cost_is_reported(
     suite: EvaluationSuite,
 ) -> None:
     runs = _passing_model_runs(suite)
-    runs[0] = replace(runs[0], grading_method="model", grader_calls=1, cost_usd=1.25)
+    target = _first_supported_index(suite, runs)
+    runs[target] = replace(runs[target], grading_method="model", grader_calls=1, cost_usd=1.25)
     report = _evaluate(suite, model_runs=runs)
     summary = cast(dict[str, object], report["summary"])
     assert summary["model_grading_calls"] == 1
-    assert cast(float, summary["recorded_cost_usd"]) == pytest.approx(4.03)
+    assert cast(float, summary["recorded_cost_usd"]) == pytest.approx(4.15)
     assert report["result"] == "pass"
 
-    runs[0] = replace(runs[0], grader_calls=2)
+    target = _first_supported_index(suite, runs)
+    runs[target] = replace(runs[target], grader_calls=2)
     with pytest.raises(EvaluationError, match="invalid or unbounded grading"):
         _evaluate(suite, model_runs=runs)
 
@@ -417,7 +434,8 @@ def test_malformed_semantics_and_request_identity_fail_closed(
     suite: EvaluationSuite,
 ) -> None:
     runs = _passing_model_runs(suite)
-    runs[0] = replace(runs[0], metrics={**runs[0].metrics, "unexpected": True})
+    target = _first_supported_index(suite, runs)
+    runs[target] = replace(runs[target], metrics={**runs[target].metrics, "unexpected": True})
     with pytest.raises(EvaluationError, match="metric set"):
         _evaluate(suite, model_runs=runs)
 
@@ -560,7 +578,8 @@ def test_reviewed_criteria_and_holdout_semantics_cannot_be_relaxed(
 
 def test_boolean_grader_call_count_is_rejected(suite: EvaluationSuite) -> None:
     runs = _passing_model_runs(suite)
-    runs[0] = replace(runs[0], grading_method="model", grader_calls=True)
+    target = _first_supported_index(suite, runs)
+    runs[target] = replace(runs[target], grading_method="model", grader_calls=True)
     with pytest.raises(EvaluationError, match="grader_calls.*integer"):
         _evaluate(suite, model_runs=runs)
 

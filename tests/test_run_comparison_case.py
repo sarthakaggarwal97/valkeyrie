@@ -31,7 +31,7 @@ def _identity() -> ComparisonEvaluationIdentity:
         "8",
         "sha256:fca8f94a37959e127240239526448855ca9a93fc16a910b0294ebfc800725a54",
         "sha256:d0cfac9167b343eb75f3875e688d6ef3bf596f21c2f0a1588f5de49f2d6ae303",
-        "sha256:64f9a99faefc432eca78ed0bbf68d3fb6da3a0867e558fc07111ced476e66193",
+        "sha256:394c725de332cb66cff5808d50c39f19a66979d27e377ac89c0eb4e62295ef89",
         GENERATION,
         "ONVASJDDNX",
         "us.anthropic.claude-opus-5",

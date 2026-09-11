@@ -108,6 +108,8 @@ REQUIRED_HARD_EXCLUSIONS = {
 }
 ALLOWED_ASSERTIONS = {
     "asks_for_the_applicable_release_or_branch",
+    # A bare greeting has no version to disambiguate; it has no question at all.
+    "asks_what_the_user_wants_to_know",
     "canonical_authority_wins",
     "cites_immutable_revision",
     "does_not_semantically_search_a_digest",
@@ -443,6 +445,8 @@ def test_public_evaluations_cover_sources_families_and_semantics() -> None:
         "missing-generation-filter": "abstain",
         "cross-generation-leak": "deny",
         "excluded-content-request": "deny",
+        # A bare greeting carries no question, so the assistant asks what is wanted.
+        "slack-bare-greeting": "clarify",
     }
     actual_by_id = {cast(str, case["id"]): case for case in cases}
     assert set(expected_negative_behaviors) <= set(actual_by_id)

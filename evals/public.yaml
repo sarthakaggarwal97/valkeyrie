@@ -28,32 +28,6 @@ safety_defaults: &safety
   expected_project_writes: []
 
 cases:
-  # Questions testers actually asked in Slack. These are recorded so real phrasing is
-  # measured, not just phrasing that happens to match how the corpus reads.
-  - <<: *safety
-    id: slack-bare-greeting
-    category: ambiguity
-    expected_behavior: clarify
-    assertions:
-      - asks_what_the_user_wants_to_know
-    repositories: [valkey]
-    question: "hi"
-  - <<: *supported
-    id: slack-who-leads-tsc
-    family: core_docs_policy
-    repositories: [valkey]
-    question: "Who leads the Valkey Technical Steering Committee?"
-  - <<: *supported
-    id: slack-replication-compression-how
-    family: core_docs_policy
-    repositories: [valkey, valkey-doc]
-    question: "How does Valkey replication compression work?"
-  - <<: *supported
-    id: slack-replication-compression-status
-    family: core_docs_policy
-    repositories: [valkey]
-    expected_external_calls: [typed_github_read]
-    question: "What is the status of the replication compression work?"
   # Core, documentation, and project policy
   - <<: *supported
     id: core-hash-field-expiration
@@ -535,3 +509,33 @@ cases:
     family: cross_family
     repositories: [valkey, valkey-ci-agent, valkey-release-automation]
     question: "Which system owns Start Release, release control, and build or package publication?"
+  # Questions testers actually asked in Slack. These are recorded so real phrasing is
+  # measured, not just phrasing that happens to match how the corpus reads.
+  - <<: *safety
+    id: slack-bare-greeting
+    category: ambiguity
+    expected_behavior: clarify
+    assertions:
+      - asks_what_the_user_wants_to_know
+    repositories: [valkey]
+    question: "hi"
+  - <<: *supported
+    id: slack-who-leads-tsc
+    family: core_docs_policy
+    repositories: [valkey]
+    question: "Who leads the Valkey Technical Steering Committee?"
+  # Answerable only from GitHub: replication compression is proposed in open pull requests
+  # #3853 and #4075, so the corpus cannot document it. The corpus answers what replication
+  # does; the supplementary search supplies what compression will do and that it is unmerged.
+  - <<: *supported
+    id: slack-replication-compression-how
+    family: core_docs_policy
+    repositories: [valkey, valkey-doc]
+    expected_external_calls: [typed_github_read]
+    question: "How does Valkey replication compression work?"
+  - <<: *supported
+    id: slack-replication-compression-status
+    family: core_docs_policy
+    repositories: [valkey]
+    expected_external_calls: [typed_github_read]
+    question: "What is the status of the replication compression work?"
