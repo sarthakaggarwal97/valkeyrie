@@ -29,6 +29,7 @@ from valkeyrie.live_github import (
     LiveGitHubError,
     LiveGitHubQuery,
     infer_live_query,
+    infer_supplementary_search,
     read_live_github,
 )
 from valkeyrie.prompts import load_prompt_package
@@ -505,7 +506,9 @@ def _answer(
                 generation_id=generation_id,
                 question=question,
             )
-            evidence = _evidence(retrieved, generation_id)
+            evidence = _evidence(retrieved, generation_id) + _supplementary_live_evidence(
+                services, question
+            )
         plan_knowledge_base_id = knowledge_base_id
         evidence_mode = "static"
     if not evidence:
@@ -787,6 +790,32 @@ def _accept_output(
         for object_type, observed_at, citation_url in sorted(live_targets)
     )
     return "answer", tuple(claims), citations, None
+
+
+def _supplementary_live_evidence(
+    services: RuntimeServices, question: str
+) -> tuple[RuntimeEvidence, ...]:
+    """Supplement corpus evidence with a GitHub search, when the question warrants one.
+
+    The corpus cannot document a feature that has not shipped, so a question like "How does
+    Valkey replication compression work?" is answerable only from the open pull requests that
+    propose it. This adds that evidence beside the corpus evidence so one answer can say what
+    the feature does AND that it is unmerged, rather than refusing.
+
+    Best effort by design: anonymous GitHub reads are rate limited, and a corpus answer must
+    not fail because a supplement was unavailable. Every failure yields no supplement.
+    """
+    try:
+        query = infer_supplementary_search(question)
+    except LiveGitHubError:
+        return ()
+    if query is None:
+        return ()
+    try:
+        observation = services.read_live(query)
+        return (_live_evidence(observation),)
+    except Exception:
+        return ()
 
 
 def _evidence(

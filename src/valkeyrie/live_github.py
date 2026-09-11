@@ -309,6 +309,37 @@ def infer_live_query(question: str) -> LiveGitHubQuery | None:
     return IssueSearchQuery(terms=terms[:MAX_SEARCH_TERMS], repository=repository)
 
 
+def infer_supplementary_search(question: str) -> IssueSearchQuery | None:
+    """Infer a repository-scoped issue search to supplement corpus evidence.
+
+    ``infer_live_query`` decides the live ROUTE and deliberately requires a discovery word
+    such as "status" or "release", so "How does Valkey replication compression work?" infers
+    nothing. That question is answerable: the design lives in open pull requests, and the
+    corpus cannot document a feature that has not shipped. This inference drops the
+    discovery-word gate so the corpus can be supplemented, and it never changes routing.
+
+    Returns ``None`` when the question is too thin to search, so ordinary command questions
+    do not spend GitHub quota.
+    """
+    if type(question) is not str:
+        raise LiveGitHubError("live query question must be text")
+    try:
+        encoded = question.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise LiveGitHubError("live query question must be valid UTF-8") from error
+    if not 1 <= len(encoded) <= 4096:
+        raise LiveGitHubError("live query question is outside its byte bound")
+    if _UNSAFE_INFERRED_QUERY.search(question) is not None:
+        raise LiveGitHubError("live query question contains an unsupported qualifier or URL")
+    repository = _inferred_repository(question)
+    terms = _inferred_search_terms(question, repository)
+    # Two terms is the floor for a search worth making: one term matches too much of the
+    # repository to be evidence, and zero means the question carried no subject at all.
+    if len(terms) < 2:
+        return None
+    return IssueSearchQuery(terms=terms[:MAX_SEARCH_TERMS], repository=repository)
+
+
 def _single_inferred_id(question: str, pattern: re.Pattern[str], label: str) -> int | None:
     matches = {int(value) for value in pattern.findall(question)}
     if len(matches) > 1:

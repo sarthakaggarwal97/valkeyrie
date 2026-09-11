@@ -1506,3 +1506,57 @@ def test_aws_live_adapter_delegates_to_anonymous_live_reader(
     query = LatestReleaseQuery("valkey")
     assert service.read_live(query) is observation
     assert calls == [query]
+
+
+def test_static_answers_are_supplemented_by_github_and_degrade_without_it(
+    manifest: dict[str, object],
+) -> None:
+    """A shipped-feature question must not refuse when only GitHub documents the answer.
+
+    The corpus cannot document a feature that has not merged, so "How does Valkey
+    replication compression work?" is answerable only from the open pull requests that
+    propose it. That evidence now arrives beside the corpus evidence.
+    """
+    question = "How does Valkey replication compression work?"
+
+    supplemented = FakeServices()
+    supplemented.live_observation = _live_observation(
+        kind="issue_search",
+        object_type="issue",
+        source_url="https://api.github.com/search/issues?q=repo%3Avalkey-io%2Fvalkey+replication",
+        url=None,
+    )
+    run_runtime_event(
+        _event(request_id="req_supplemented", question=question),
+        supplemented,
+        root=ROOT,
+        manifest=manifest,
+    )
+    # The corpus was consulted and GitHub was consulted alongside it, not instead of it.
+    assert supplemented.retrieve_calls, "the corpus must still be retrieved"
+    assert len(supplemented.live_calls) == 1
+    supplement = cast(IssueSearchQuery, supplemented.live_calls[0])
+    assert supplement.terms == ("replication", "compression", "work")
+
+    # Anonymous GitHub reads are rate limited, so a corpus answer must survive without the
+    # supplement rather than failing the request.
+    degraded = FakeServices()
+    degraded.live_error = RuntimeError("GitHub returned HTTP 403")
+    result = run_runtime_event(
+        _event(request_id="req_degraded", question=question),
+        degraded,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert degraded.live_calls, "the supplement must have been attempted"
+    assert result["outcome"] in {"answer", "abstention", "clarification"}
+    assert "403" not in json.dumps(result), "a supplement failure must not leak to the caller"
+
+
+def test_thin_questions_do_not_spend_github_quota(manifest: dict[str, object]) -> None:
+    """A greeting carries no subject, so it must not trigger a GitHub search."""
+    services = FakeServices()
+    run_runtime_event(
+        _event(request_id="req_thin", question="hi"), services, root=ROOT, manifest=manifest
+    )
+    assert services.live_calls == []
