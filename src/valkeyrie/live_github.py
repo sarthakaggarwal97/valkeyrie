@@ -143,6 +143,9 @@ MAX_SEARCH_TERMS: Final = 8
 MAX_SEARCH_TERM_BYTES: Final = 64
 MAX_SEARCH_BODY_BYTES: Final = 16 * 1024
 MAX_SEARCH_PER_PAGE: Final = 20
+# Supplementary searches carry whole issue bodies, so they take a smaller page than
+# a routed search: twenty bodies exceed MAX_RESPONSE_BYTES.
+SUPPLEMENT_PER_PAGE: Final = 5
 SEARCH_SORT: Final = "updated"
 SEARCH_ORDER: Final = "desc"
 PROJECTS_GRAPHQL_QUERY: Final = """\
@@ -337,7 +340,13 @@ def infer_supplementary_search(question: str) -> IssueSearchQuery | None:
     # repository to be evidence, and zero means the question carried no subject at all.
     if len(terms) < 2:
         return None
-    return IssueSearchQuery(terms=terms[:MAX_SEARCH_TERMS], repository=repository)
+    # Five items, not the default twenty. A search returns whole issue bodies, and twenty of
+    # them exceeds MAX_RESPONSE_BYTES, which made every supplemented answer fail with
+    # "REST response exceeded its byte bound". Five is enough to establish what a proposed
+    # feature does and whether it has landed, which is all a supplement is for.
+    return IssueSearchQuery(
+        terms=terms[:MAX_SEARCH_TERMS], repository=repository, per_page=SUPPLEMENT_PER_PAGE
+    )
 
 
 def _single_inferred_id(question: str, pattern: re.Pattern[str], label: str) -> int | None:
