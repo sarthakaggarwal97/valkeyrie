@@ -13,7 +13,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
-from infra.run_deployed_case import _assert_unattempted
 from valkeyrie.aws_adapters import AwsLambdaInvoker, create_lambda_client
 from valkeyrie.deployed_evaluation import (
     DeployedEvaluationError,
@@ -543,3 +542,35 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# Moved here from infra/run_deployed_case.py when the deployed-evaluation tooling was
+# retired. This comparison runner is its only remaining caller.
+def _assert_unattempted(
+    ledger: Path,
+    case_index: int,
+    case_id: str,
+    request_id: str,
+) -> None:
+    matches: list[Path] = []
+    for path in ledger.rglob("*.json"):
+        if path.parent.name != "attempts":
+            continue
+        try:
+            value = json.loads(path.read_bytes())
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise DeployedEvaluationError(
+                "dispatch ledger contains an unreadable attempt"
+            ) from error
+        if not isinstance(value, Mapping):
+            raise DeployedEvaluationError("dispatch ledger contains a malformed attempt")
+        if (
+            value.get("index") == case_index
+            or value.get("case_id") == case_id
+            or value.get("request_id") == request_id
+        ):
+            matches.append(path)
+    if matches:
+        raise DeployedEvaluationError(
+            f"case {case_index} already has a journaled attempt; retry is forbidden"
+        )
