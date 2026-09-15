@@ -15,6 +15,8 @@ from valkeyrie.application_runtime import (
     RuntimeEvidence,
     StaticRuntimeEvidence,
     _bedrock_retrieval_text,
+    _evidence_value,
+    _live_evidence,
     _normalize_dynamodb_mapping,
     _parse_evidence,
     _runtime_retrieval_metadata,
@@ -1560,3 +1562,38 @@ def test_thin_questions_do_not_spend_github_quota(manifest: dict[str, object]) -
         _event(request_id="req_thin", question="hi"), services, root=ROOT, manifest=manifest
     )
     assert services.live_calls == []
+
+
+def test_a_plan_may_hold_both_kinds_and_live_evidence_never_gains_a_generation() -> None:
+    """Supplementing a corpus answer with GitHub puts both kinds in one plan.
+
+    The old guard rejected that outright. It is safe to allow because the two metadata shapes
+    are matched exactly and the live shape has no generation_id field, so a live record cannot
+    claim the plan's corpus generation however the plan is parsed.
+    """
+    static_value = {
+        "text": "Replication documentation.",
+        "metadata": {
+            "generation_id": GENERATION,
+            "evidence_id": "ev_static",
+            "repository": "valkey-doc",
+            "path": "topics/replication.md",
+            "commit": COMMIT,
+            "authority": "canonical",
+            "version_scope": "unstable",
+            "content_digest": "sha256:" + "c" * 64,
+            "immutable_url": f"https://github.com/valkey-io/valkey-doc/blob/{COMMIT}/topics/replication.md",
+        },
+    }
+    live = _live_evidence(_live_observation(kind="issue_search", object_type="issue", url=None))
+    live_value = _evidence_value(live)
+
+    parsed_static = _parse_evidence(static_value, generation_id=GENERATION)
+    parsed_live = _parse_evidence(live_value, generation_id=GENERATION)
+
+    assert isinstance(parsed_static, StaticRuntimeEvidence)
+    assert parsed_static.generation_id == GENERATION
+    assert isinstance(parsed_live, LiveRuntimeEvidence)
+    # The live record carries no generation, so the answer's corpus binding cannot be
+    # attributed to GitHub evidence.
+    assert not hasattr(parsed_live, "generation_id") or parsed_live.generation_id is None

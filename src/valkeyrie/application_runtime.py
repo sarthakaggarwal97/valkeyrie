@@ -843,8 +843,12 @@ def _parse_evidence(value: object, *, generation_id: str | None = None) -> Runti
     if fields == _STATIC_METADATA:
         return _parse_static_evidence(text, metadata, generation_id)
     if fields == _LIVE_METADATA:
-        if generation_id is not None:
-            raise ApplicationRuntimeError("live evidence cannot claim a static generation")
+        # No generation check here, deliberately. `generation_id` is the PLAN's corpus
+        # generation, which describes its static evidence. _LIVE_METADATA carries no
+        # generation_id field at all and the two shapes are matched exactly, so a live
+        # record structurally cannot claim a generation whatever the plan's is. The old
+        # guard rejected any plan holding both kinds, which was unreachable until corpus
+        # answers began being supplemented with GitHub, and which broke every such answer.
         return _parse_live_evidence(text, metadata)
     raise ApplicationRuntimeError("retrieval metadata is not an exact supported field set")
 
