@@ -10,12 +10,15 @@ from typing import cast
 import pytest
 
 from valkeyrie.application_runtime import (
+    _MAX_EVIDENCE,
+    _MAX_EVIDENCE_BYTES,
     ApplicationRuntimeError,
     AwsRuntimeServices,
     LiveRuntimeEvidence,
     RuntimeEvidence,
     StaticRuntimeEvidence,
     _bedrock_retrieval_text,
+    _bounded_evidence,
     _evidence_value,
     _live_evidence,
     _normalize_dynamodb_mapping,
@@ -1651,3 +1654,43 @@ def test_github_token_is_read_once_and_every_failure_degrades_to_anonymous(
     unused = _Secrets("github_pat_example")
     assert _services(unused)._github_token() is None
     assert unused.calls == 0
+
+
+def test_live_supplements_cannot_carry_evidence_past_its_bounds() -> None:
+    """A supplement is an addition to the package, not an exemption from its limits.
+
+    Static evidence is bounded when it is parsed, so appending live records could previously
+    hand the model more evidence than the bound admits: ten static records plus one per search
+    kind is twelve. The supplement is dropped rather than the request failing, because the
+    static evidence can already support an answer.
+    """
+
+    def static(evidence_id: str, size: int) -> StaticRuntimeEvidence:
+        return StaticRuntimeEvidence(
+            evidence_id,
+            "s" * size,
+            "gen",
+            "valkey",
+            "src/x.c",
+            "c" * 40,
+            "primary",
+            "none",
+            "sha256:" + "0" * 64,
+            "https://github.com/valkey-io/valkey/blob/c/src/x.c",
+        )
+
+    full = tuple(static(f"ev_{index:02d}", 100) for index in range(_MAX_EVIDENCE))
+    live = LiveRuntimeEvidence(
+        "ev_live", "l" * 100, "obs_1", "2026-01-01T00:00:00Z", "issue", "dg", "u", "u"
+    )
+
+    assert _bounded_evidence(full) == full
+    over_count = _bounded_evidence((*full, live))
+    assert len(over_count) == _MAX_EVIDENCE
+    assert live not in over_count
+
+    heavy = (static("ev_big", _MAX_EVIDENCE_BYTES),)
+    over_bytes = _bounded_evidence((*heavy, live))
+    assert over_bytes == heavy
+    total = sum(len(item.text.encode("utf-8")) for item in over_bytes)
+    assert total <= _MAX_EVIDENCE_BYTES

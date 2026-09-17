@@ -511,8 +511,9 @@ def _answer(
                 generation_id=generation_id,
                 question=question,
             )
-            evidence = _evidence(retrieved, generation_id) + _supplementary_live_evidence(
-                services, question
+            evidence = _bounded_evidence(
+                _evidence(retrieved, generation_id)
+                + _supplementary_live_evidence(services, question)
             )
         plan_knowledge_base_id = knowledge_base_id
         evidence_mode = "static"
@@ -829,6 +830,29 @@ def _supplementary_live_evidence(
         if record is not None:
             evidence.append(record)
     return tuple(evidence)
+
+
+def _bounded_evidence(values: tuple[RuntimeEvidence, ...]) -> tuple[RuntimeEvidence, ...]:
+    """Re-apply the record and byte bounds to a combined static-plus-live package.
+
+    _evidence bounds only the static tuple, so appending live supplements could carry the
+    package past both limits: the model would receive more evidence than the bound admits.
+    Live records are dropped rather than the request failing, because a supplement is an
+    optional addition to an answer the static evidence can already support.
+    """
+    if len(values) <= _MAX_EVIDENCE and (
+        sum(len(item.text.encode("utf-8")) for item in values) <= _MAX_EVIDENCE_BYTES
+    ):
+        return values
+    kept: list[RuntimeEvidence] = []
+    total = 0
+    for item in values:
+        size = len(item.text.encode("utf-8"))
+        if len(kept) + 1 > _MAX_EVIDENCE or total + size > _MAX_EVIDENCE_BYTES:
+            continue
+        kept.append(item)
+        total += size
+    return tuple(kept)
 
 
 def _evidence(
