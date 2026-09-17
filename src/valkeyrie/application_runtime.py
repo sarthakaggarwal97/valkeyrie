@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol, TypeAlias, cast
 from urllib.parse import quote, urlsplit
@@ -25,6 +26,7 @@ from valkeyrie.bedrock_response import (
     normalize_bedrock_response,
 )
 from valkeyrie.drafting import DraftingError, _screened_model_text
+from valkeyrie.github import fetch_public_github
 from valkeyrie.live_github import (
     LiveGitHubError,
     LiveGitHubQuery,
@@ -178,6 +180,9 @@ _TIMESTAMP: Final = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
 )
 _MAX_QUESTION_BYTES: Final = 8 * 1024
+# Distinguishes "not yet looked up" from "looked up and absent", so an absent token is
+# not re-fetched on every question.
+_UNSET: Final = object()
 _MAX_EVIDENCE: Final = 10
 _MAX_EVIDENCE_BYTES: Final = 64 * 1024
 _RELEASE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
@@ -1494,6 +1499,11 @@ def _runtime_retrieve(
 class AwsRuntimeServices:
     """Minimal native Lambda adapters; boto3 is imported only when an AWS action runs."""
 
+    # Class-level default so an instance created without __init__ still reads anonymously.
+    # Assignment in _github_token creates an instance attribute, so the cache never leaks
+    # between instances.
+    _github_token_cached: object = _UNSET
+
     def __init__(self) -> None:
         self._table_name = os.environ["STATE_TABLE_NAME"]
         self._model_id = os.environ["SELECTED_INFERENCE_PROFILE_ARN"]
@@ -1538,7 +1548,39 @@ class AwsRuntimeServices:
         return _normalize_dynamodb_mapping(state)
 
     def read_live(self, query: LiveGitHubQuery) -> LiveObservation:
-        return read_live_github(query)
+        token = self._github_token()
+        if token is None:
+            return read_live_github(query)
+        return read_live_github(
+            query,
+            fetch=partial(fetch_public_github, token=token),
+        )
+
+    def _github_token(self) -> str | None:
+        """Return the read-only GitHub token, or None to read anonymously.
+
+        Anonymous reads are limited to 60 an hour per IP, which the supplementary search
+        exhausts quickly and then silently stops supplementing. A token raises that to 5,000
+        an hour. Read once per container and cached, because a Secrets Manager call on every
+        question would be its own rate limit.
+
+        Every failure returns None rather than raising: an absent, empty, or unreadable secret
+        must degrade to anonymous reads, not break answering.
+        """
+        if self._github_token_cached is not _UNSET:
+            return cast("str | None", self._github_token_cached)
+        token: str | None = None
+        secret_id = os.environ.get("GITHUB_TOKEN_SECRET_ID", "")
+        if secret_id:
+            try:
+                value = self._boto3().client("secretsmanager").get_secret_value(SecretId=secret_id)
+                candidate = value.get("SecretString")
+                if isinstance(candidate, str) and candidate.strip():
+                    token = candidate.strip()
+            except Exception:
+                token = None
+        self._github_token_cached = token
+        return token
 
     def retrieve(
         self, *, knowledge_base_id: str, generation_id: str, question: str

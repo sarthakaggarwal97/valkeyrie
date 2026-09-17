@@ -40,8 +40,16 @@ def fetch_public_github(
     max_bytes: int,
     *,
     elapsed_clock: Callable[[], float] = monotonic,
+    token: str | None = None,
 ) -> HttpResponse:
-    """Issue one bounded credential-free GET without redirects or arbitrary origins."""
+    """Issue one bounded GET without redirects or arbitrary origins.
+
+    ``token`` is optional and read-only in effect. It authenticates the request so GitHub
+    applies the account rate limit of 5,000 requests an hour rather than the anonymous
+    60 an hour tied to the caller's IP address, which the runtime exhausts quickly. It is
+    sent only on api.github.com requests, never on the git-refs path, and every URL, byte
+    and time bound below applies unchanged.
+    """
     if (
         not isinstance(timeout_seconds, (int, float))
         or isinstance(timeout_seconds, bool)
@@ -73,6 +81,8 @@ def fetch_public_github(
     }
     if api_request:
         headers["X-GitHub-Api-Version"] = "2022-11-28"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
     target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
     deadline = elapsed_clock() + float(timeout_seconds)
 

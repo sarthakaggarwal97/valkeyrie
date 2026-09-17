@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -1597,3 +1598,52 @@ def test_a_plan_may_hold_both_kinds_and_live_evidence_never_gains_a_generation()
     # The live record carries no generation, so the answer's corpus binding cannot be
     # attributed to GitHub evidence.
     assert not hasattr(parsed_live, "generation_id") or parsed_live.generation_id is None
+
+
+def test_github_token_is_read_once_and_every_failure_degrades_to_anonymous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token raises the GitHub limit from 60 to 5,000 an hour, but is never load-bearing.
+
+    An absent, empty, or unreadable secret must fall back to anonymous reads. Failing the
+    answer because a rate-limit optimisation was unavailable would be worse than the limit.
+    """
+    monkeypatch.setenv("STATE_TABLE_NAME", "table")
+    monkeypatch.setenv("SELECTED_INFERENCE_PROFILE_ARN", "arn:aws:bedrock:::profile/x")
+
+    class _Secrets:
+        def __init__(self, value: object, error: Exception | None = None) -> None:
+            self.value, self.error, self.calls = value, error, 0
+
+        def get_secret_value(self, **_: object) -> dict[str, object]:
+            self.calls += 1
+            if self.error is not None:
+                raise self.error
+            return {"SecretString": self.value}
+
+    def _services(secrets: object) -> AwsRuntimeServices:
+        services = AwsRuntimeServices()
+        monkeypatch.setattr(
+            type(services),
+            "_boto3",
+            staticmethod(lambda: SimpleNamespace(client=lambda _: secrets)),
+        )
+        return services
+
+    monkeypatch.setenv("GITHUB_TOKEN_SECRET_ID", "valkeyrie/development/github-read-token")
+    good = _Secrets("github_pat_example")
+    services = _services(good)
+    assert services._github_token() == "github_pat_example"
+    # Cached: a Secrets Manager call per question would be its own rate limit.
+    assert services._github_token() == "github_pat_example"
+    assert good.calls == 1
+
+    for value, error in (("", None), ("   ", None), (None, None), ("x", RuntimeError("denied"))):
+        secrets = _Secrets(value, error)
+        assert _services(secrets)._github_token() is None
+
+    # No secret configured at all is the same as an unreadable one, and makes no AWS call.
+    monkeypatch.delenv("GITHUB_TOKEN_SECRET_ID", raising=False)
+    unused = _Secrets("github_pat_example")
+    assert _services(unused)._github_token() is None
+    assert unused.calls == 0

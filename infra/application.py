@@ -56,6 +56,14 @@ APPLICATION_SERVICE_ROLE_ARN: Final = (
 )
 APPLICATION_DEPLOYER_ROLE_NAME: Final = "valkeyrie-development-application-deployer"
 APPLICATION_RUNTIME_ROLE_NAME: Final = "valkeyrie-development-runtime"
+# The exact secret holding the read-only GitHub token. Named in full rather than by prefix:
+# a wildcard would grant the runtime every secret in the account, including the ops webhook
+# signing secret. The version suffix is part of the ARN Secrets Manager assigned.
+GITHUB_TOKEN_SECRET_ARN: Final = (
+    "arn:aws:secretsmanager:us-east-1:968533178160:secret:"
+    "valkeyrie/development/github-read-token-0mNbc2"
+)
+GITHUB_TOKEN_SECRET_ID: Final = "valkeyrie/development/github-read-token"
 KNOWLEDGE_STACK_NAME: Final = "valkeyrie-development-knowledge-plane"
 KNOWLEDGE_BASE_ID: Final = "ONVASJDDNX"
 D01_TEMPLATE_SHA256: Final = (
@@ -268,6 +276,10 @@ class ApplicationStack(Stack):
                 variables={
                     "APPLICATION_REVISION": artifact.application_revision,
                     "STATE_TABLE_NAME": "valkeyrie-development-state",
+                    # Only the secret's name. The token itself is never an environment
+                    # variable: those are readable in the console and recorded in the
+                    # CloudFormation template.
+                    "GITHUB_TOKEN_SECRET_ID": GITHUB_TOKEN_SECRET_ID,
                     "SELECTED_INFERENCE_PROFILE_ARN": cast(
                         str, artifact.manifest["selected_inference_profile_arn"]
                     ),
@@ -709,6 +721,12 @@ def _runtime_statements(stack: Stack, artifact: ApplicationArtifact) -> list[dic
             "Effect": "Allow",
             "Action": "bedrock:InvokeModel",
             "Resource": [profile, *models],
+        },
+        {
+            "Sid": "ReadExactGitHubTokenSecret",
+            "Effect": "Allow",
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": GITHUB_TOKEN_SECRET_ARN,
         },
         {
             "Sid": OWNER_DIRECTED_OPUS_SID,

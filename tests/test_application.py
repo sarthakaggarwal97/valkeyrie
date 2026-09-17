@@ -257,11 +257,21 @@ def test_service_role_and_existing_role_policies_are_exact(tmp_path: Path) -> No
     assert set(runtime) == {
         "InvokeExactQualifiedFableRoute",
         "InvokeExactOwnerDirectedOpusComparisonRoute",
+        "ReadExactGitHubTokenSecret",
         "RetrieveExactKnowledgeBase",
         "ReadAndConditionallyAuditRequests",
         "ReadFailClosedRuntimeControls",
         "WriteExactApplicationTelemetry",
     }
+    # One exact secret, never a prefix or wildcard: the account also holds the ops webhook
+    # signing secret, which the answer runtime has no business reading.
+    secret_grant = runtime["ReadExactGitHubTokenSecret"]
+    assert secret_grant["Action"] == "secretsmanager:GetSecretValue"
+    assert secret_grant["Resource"] == (
+        "arn:aws:secretsmanager:us-east-1:968533178160:secret:"
+        "valkeyrie/development/github-read-token-0mNbc2"
+    )
+    assert "*" not in secret_grant["Resource"]
     model_resources = runtime["InvokeExactQualifiedFableRoute"]["Resource"]
     assert model_resources == [
         "arn:aws:bedrock:us-east-1:968533178160:inference-profile/us.anthropic.claude-fable-5",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from unittest import mock
 
 import pytest
 
@@ -158,3 +159,50 @@ def test_transport_enforces_one_deadline_across_slow_body_chunks(
         )
 
     assert connection.closed is True
+
+
+def test_token_authenticates_api_requests_only_and_is_optional() -> None:
+    """The token exists to raise the rate limit, so it goes only where limits are counted.
+
+    It is sent on api.github.com and never on the git-refs path, which is a different origin
+    serving pack advertisements and has no reason to see a credential.
+    """
+    captured: list[dict[str, str]] = []
+
+    class _Connection:
+        def __init__(self, host: str, timeout: float) -> None:
+            self.sock = None
+
+        def request(self, method: str, target: str, headers: dict[str, str]) -> None:
+            captured.append(dict(headers))
+
+        def getresponse(self) -> object:
+            class _Response:
+                status = 200
+
+                @staticmethod
+                def getheaders() -> list[tuple[str, str]]:
+                    return [("Content-Type", "application/vnd.github+json")]
+
+                @staticmethod
+                def read1(_: int) -> bytes:
+                    return b"{}"
+
+                @staticmethod
+                def read(_: int = -1) -> bytes:
+                    return b""
+
+            return _Response()
+
+        def close(self) -> None:
+            return None
+
+    with mock.patch("http.client.HTTPSConnection", _Connection):
+        fetch_public_github(
+            "https://api.github.com/repos/valkey-io/valkey/pulls/1", 5.0, 1024, token="secret-token"
+        )
+        fetch_public_github("https://api.github.com/repos/valkey-io/valkey/pulls/1", 5.0, 1024)
+
+    assert captured[0]["Authorization"] == "Bearer secret-token"
+    # Absent token means no header at all, not an empty one.
+    assert "Authorization" not in captured[1]
