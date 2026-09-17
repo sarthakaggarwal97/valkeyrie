@@ -810,17 +810,25 @@ def _supplementary_live_evidence(
     Best effort by design: anonymous GitHub reads are rate limited, and a corpus answer must
     not fail because a supplement was unavailable. Every failure yields no supplement.
     """
-    try:
-        query = infer_supplementary_search(question)
-    except LiveGitHubError:
-        return ()
-    if query is None:
-        return ()
-    try:
-        observation = services.read_live(query)
-        return (_live_evidence(observation),)
-    except Exception:
-        return ()
+    # Both kinds, because GitHub requires an explicit is:issue or is:pull-request and the two
+    # answer different halves of the same question: a pull request carries the design and
+    # whether it merged, an issue carries discussion and current status.
+    evidence: list[RuntimeEvidence] = []
+    for kind in ("pull-request", "issue"):
+        try:
+            query = infer_supplementary_search(question, kind=kind)
+        except LiveGitHubError:
+            return ()
+        if query is None:
+            return ()
+        # Each kind fails independently: one unavailable half must not discard the other.
+        try:
+            record: RuntimeEvidence | None = _live_evidence(services.read_live(query))
+        except Exception:
+            record = None
+        if record is not None:
+            evidence.append(record)
+    return tuple(evidence)
 
 
 def _evidence(

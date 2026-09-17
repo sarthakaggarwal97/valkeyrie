@@ -1537,7 +1537,11 @@ def test_static_answers_are_supplemented_by_github_and_degrade_without_it(
     )
     # The corpus was consulted and GitHub was consulted alongside it, not instead of it.
     assert supplemented.retrieve_calls, "the corpus must still be retrieved"
-    assert len(supplemented.live_calls) == 1
+    # Two calls: a pull request carries the design and whether it merged, an issue carries
+    # discussion and current status, and GitHub requires the kind to be stated explicitly.
+    assert len(supplemented.live_calls) == 2
+    kinds = [cast(IssueSearchQuery, call).kind for call in supplemented.live_calls]
+    assert kinds == ["pull-request", "issue"]
     supplement = cast(IssueSearchQuery, supplemented.live_calls[0])
     assert supplement.terms == ("replication", "compression", "work")
 

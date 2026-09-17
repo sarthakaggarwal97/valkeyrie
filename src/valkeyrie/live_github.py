@@ -35,6 +35,10 @@ class IssueSearchQuery:
     terms: tuple[str, ...]
     repository: str | None = None
     per_page: int = 20
+    # GitHub requires an explicit is:issue or is:pull-request on authenticated
+    # search/issues requests and returns 422 without one. Anonymous requests are not yet
+    # enforced, which is why this was invisible until the runtime started authenticating.
+    kind: str = "issue"
 
 
 @dataclass(frozen=True)
@@ -312,7 +316,9 @@ def infer_live_query(question: str) -> LiveGitHubQuery | None:
     return IssueSearchQuery(terms=terms[:MAX_SEARCH_TERMS], repository=repository)
 
 
-def infer_supplementary_search(question: str) -> IssueSearchQuery | None:
+def infer_supplementary_search(
+    question: str, *, kind: str = "pull-request"
+) -> IssueSearchQuery | None:
     """Infer a repository-scoped issue search to supplement corpus evidence.
 
     ``infer_live_query`` decides the live ROUTE and deliberately requires a discovery word
@@ -345,7 +351,10 @@ def infer_supplementary_search(question: str) -> IssueSearchQuery | None:
     # "REST response exceeded its byte bound". Five is enough to establish what a proposed
     # feature does and whether it has landed, which is all a supplement is for.
     return IssueSearchQuery(
-        terms=terms[:MAX_SEARCH_TERMS], repository=repository, per_page=SUPPLEMENT_PER_PAGE
+        terms=terms[:MAX_SEARCH_TERMS],
+        repository=repository,
+        per_page=SUPPLEMENT_PER_PAGE,
+        kind=kind,
     )
 
 
@@ -502,9 +511,11 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
             qualifiers = [f"repo:{OWNER}/{search_repository}"]
         else:
             qualifiers = [f"org:{OWNER}"]
+        if query.kind not in {"issue", "pull-request"}:
+            raise LiveGitHubError("issue search kind must be issue or pull-request")
         encoded_query = urlencode(
             {
-                "q": " ".join((*qualifiers, *terms)),
+                "q": " ".join((*qualifiers, f"is:{query.kind}", *terms)),
                 "sort": SEARCH_SORT,
                 "order": SEARCH_ORDER,
                 "per_page": str(per_page),
