@@ -1326,9 +1326,26 @@ def _report_id(preimage: Mapping[str, object]) -> str:
     return f"eval_{hashlib.sha256(canonical).hexdigest()}"
 
 
+def _is_calendar_timestamp(value: str) -> bool:
+    """Reject impossible dates and times the shape regex admits.
+
+    The regex pins digit layout only, so 2026-99-99T99:99:99Z matches it. Parsing is what
+    establishes the value names a real instant.
+    """
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _time_range(started_at: str, completed_at: str) -> None:
     def parse(value: object, name: str) -> datetime:
-        if not isinstance(value, str) or not _TIMESTAMP.fullmatch(value):
+        if (
+            not isinstance(value, str)
+            or not _TIMESTAMP.fullmatch(value)
+            or not _is_calendar_timestamp(value)
+        ):
             raise EvaluationError(f"{name} must be a UTC timestamp")
         try:
             return datetime.fromisoformat(value[:-1] + "+00:00")

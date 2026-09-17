@@ -5,12 +5,14 @@ from __future__ import annotations
 import base64
 import json
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
 from infra.application_handler import handler
+from valkeyrie.application_runtime import _TIMESTAMP
 
 
 class _Recorder:
@@ -36,15 +38,29 @@ def _run(monkeypatch: pytest.MonkeyPatch, event: dict[str, object]) -> tuple[dic
     captured: dict[str, Any] = {}
 
     def fake_run(
-        request: object, services: object, *, root: object, manifest: object
+        request: object,
+        services: object,
+        *,
+        root: object,
+        manifest: object,
+        completion_clock: object = None,
     ) -> dict[str, object]:
         captured["request"] = request
+        captured["completion_clock"] = completion_clock
         return {"outcome": "answer", "claims": [], "citations": [], "generation_id": None}
 
     monkeypatch.setattr("infra.application_handler.run_runtime_event", fake_run)
     monkeypatch.setattr("infra.application_handler.AwsRuntimeServices", lambda: object())
     _patch_manifest(monkeypatch)
     response = handler(event, None)
+    # An invariant of every handler path, not one case: the completion instant must come from the
+    # deployment's own clock. The event's completed_at is built before the model runs, so it
+    # describes when the caller was preparing the request, not when it finished.
+    # Rejected requests never reach the runtime, so the clock is only required where it ran.
+    if "request" in captured:
+        clock = captured.get("completion_clock")
+        assert callable(clock), "the handler did not supply a completion clock"
+        assert _TIMESTAMP.fullmatch(cast(Callable[[], str], clock)()) is not None
     return cast(dict[str, Any], response), captured.get("request")
 
 
@@ -161,9 +177,15 @@ def test_a_raw_runtime_event_is_not_treated_as_http(monkeypatch: pytest.MonkeyPa
     captured: dict[str, Any] = {}
 
     def fake_run(
-        request: object, services: object, *, root: object, manifest: object
+        request: object,
+        services: object,
+        *,
+        root: object,
+        manifest: object,
+        completion_clock: object = None,
     ) -> dict[str, object]:
         captured["request"] = request
+        captured["completion_clock"] = completion_clock
         return {"outcome": "answer"}
 
     monkeypatch.setattr("infra.application_handler.run_runtime_event", fake_run)

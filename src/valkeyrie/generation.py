@@ -593,8 +593,25 @@ def _validate_limits(limits: object) -> None:
         raise GenerationError("generation bounds must be positive integers")
 
 
+def _is_calendar_timestamp(value: str) -> bool:
+    """Reject impossible dates and times the shape regex admits.
+
+    The regex pins digit layout only, so 2026-99-99T99:99:99Z matches it. Parsing is what
+    establishes the value names a real instant.
+    """
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _validate_timestamp(value: object) -> None:
-    if not isinstance(value, str) or _TIMESTAMP.fullmatch(value) is None:
+    if (
+        not isinstance(value, str)
+        or _TIMESTAMP.fullmatch(value) is None
+        or not _is_calendar_timestamp(value)
+    ):
         raise GenerationError("created_at must be a canonical UTC timestamp")
     try:
         parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")

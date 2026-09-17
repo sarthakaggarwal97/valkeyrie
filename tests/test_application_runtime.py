@@ -181,7 +181,14 @@ class FakeServices:
         return dict(item)
 
     def complete_request(
-        self, *, request_id: str, revision: int, fence: int, outcome: str, completed_at: str
+        self,
+        *,
+        request_id: str,
+        revision: int,
+        fence: int,
+        outcome: str,
+        completed_at: str,
+        result: Mapping[str, object] | None = None,
     ) -> bool:
         if not self.complete:
             return False
@@ -189,6 +196,8 @@ class FakeServices:
         if item["revision"] != revision or item["fence"] != fence or "outcome" in item:
             return False
         item.update({"outcome": outcome, "completed_at": completed_at, "revision": revision + 1})
+        if result is not None:
+            item["result"] = dict(result)
         return True
 
     def converse(
@@ -1694,3 +1703,89 @@ def test_live_supplements_cannot_carry_evidence_past_its_bounds() -> None:
     assert over_bytes == heavy
     total = sum(len(item.text.encode("utf-8")) for item in over_bytes)
     assert total <= _MAX_EVIDENCE_BYTES
+
+
+def test_completion_time_comes_from_the_runtime_clock_when_one_is_supplied(
+    manifest: dict[str, object],
+) -> None:
+    """Completion must describe when execution ended, not when its caller was preparing.
+
+    Every adapter builds completed_at before the model runs, so the event field cannot describe
+    completion and nothing stops it naming an arbitrary instant. A deployment passes a clock; a
+    caller reproducing a recorded run omits it and the event value is used unchanged, which is
+    what keeps recorded runs byte-identical.
+    """
+    # A caller-supplied value that is plainly not the completion instant.
+    stale = _event(completed_at="2020-01-01T00:00:00Z")
+
+    services = FakeServices()
+    result = run_runtime_event(
+        dict(stale),
+        services,
+        root=ROOT,
+        manifest=manifest,
+        completion_clock=lambda: "2026-09-17T23:30:00Z",
+    )
+    assert result["outcome"] == "answer"
+    assert services.requests["req_runtime-1"]["completed_at"] == "2026-09-17T23:30:00Z"
+
+    # Omitting the clock preserves the recorded value exactly, so replays stay byte-identical.
+    replay = FakeServices()
+    assert run_runtime_event(dict(stale), replay, root=ROOT, manifest=manifest)["outcome"] == (
+        "answer"
+    )
+    assert replay.requests["req_runtime-1"]["completed_at"] == "2020-01-01T00:00:00Z"
+
+    # A clock producing a malformed instant is refused rather than silently falling back.
+    broken = FakeServices()
+    refused = run_runtime_event(
+        dict(stale),
+        broken,
+        root=ROOT,
+        manifest=manifest,
+        completion_clock=lambda: "not-a-timestamp",
+    )
+    assert refused["outcome"] == "error"
+
+
+def test_an_identical_redelivery_returns_the_recorded_answer(
+    manifest: dict[str, object],
+) -> None:
+    """A redelivery is normal, not an error: Slack retries an event it did not see acked.
+
+    The request ID is derived from the event identity, so the retry arrives as the same request.
+    Previously only the outcome was recorded, so the second delivery raised "already terminal" and
+    the asker saw an error instead of the answer that had been produced and paid for.
+    """
+    services = FakeServices()
+    first = run_runtime_event(_event(), services, root=ROOT, manifest=manifest)
+    assert first["outcome"] == "answer"
+    assert first["claims"]
+
+    second = run_runtime_event(_event(), services, root=ROOT, manifest=manifest)
+    assert second["outcome"] == first["outcome"]
+    assert second["claims"] == first["claims"]
+    assert second["citations"] == first["citations"]
+    assert second["generation_id"] == first["generation_id"]
+    # Replayed from the record: the model must not be asked a second time.
+    assert len(services.model_calls) == 1
+
+
+def test_a_reused_request_id_with_a_different_question_is_refused(
+    manifest: dict[str, object],
+) -> None:
+    """Replay must be pinned to the question, or a reused ID leaks another answer.
+
+    The request ID is the idempotency key. Without checking the recorded question digest, a caller
+    reusing an ID with different content would receive the previous question's claims as though
+    they answered the new one.
+    """
+    services = FakeServices()
+    assert run_runtime_event(_event(), services, root=ROOT, manifest=manifest)["outcome"] == (
+        "answer"
+    )
+
+    hijacked = _event(question="How do I configure TLS for cluster bus traffic?")
+    result = run_runtime_event(hijacked, services, root=ROOT, manifest=manifest)
+    assert result["outcome"] == "error"
+    assert not result.get("claims")

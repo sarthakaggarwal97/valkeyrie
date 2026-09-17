@@ -8,8 +8,9 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Final, Protocol, cast
 
 from valkeyrie.aws_adapters import (
     DynamoApprovalRegistry,
@@ -458,6 +459,19 @@ def _validate_resources(resources: ReleaseResources) -> None:
         raise CorpusReleaseError("data source ID is malformed")
 
 
+def _is_calendar_timestamp(value: str) -> bool:
+    """Reject impossible dates and times the shape regex admits.
+
+    The regex pins digit layout only, so 2026-99-99T99:99:99Z matches it. Parsing is what
+    establishes the value names a real instant.
+    """
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _validate_activation_inputs(
     *,
     evaluation_report_path: Path | None,
@@ -483,9 +497,16 @@ def _validate_activation_inputs(
     expected = None if expected_active_generation == "none" else expected_active_generation
     if expected is not None and _DIGEST.fullmatch(expected) is None:
         raise CorpusReleaseError("expected active generation is malformed")
-    if _TIMESTAMP.fullmatch(activated_at) is None:
+    if _TIMESTAMP.fullmatch(activated_at) is None or not _is_calendar_timestamp(activated_at):
         raise CorpusReleaseError("activation timestamp is malformed")
     return expected
+
+
+# Mirrors of the bounds run_ingestion enforces, kept beside the preflight that must not admit a
+# value ingestion would reject. test_release_corpus pins them against ingestion's own limits.
+_INGESTION_LEASE_BOUND: Final = (30, 3600)
+_INGESTION_POLL_INTERVAL_BOUND: Final = (0, 60)
+_INGESTION_MAX_POLLS_BOUND: Final = (1, 1000)
 
 
 def _validate_execution_inputs(
@@ -497,16 +518,30 @@ def _validate_execution_inputs(
 ) -> None:
     if not isinstance(owner, str) or not owner or len(owner) > 128:
         raise CorpusReleaseError("ingestion owner is malformed")
-    if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool) or lease_seconds < 1:
-        raise CorpusReleaseError("ingestion lease seconds must be a positive integer")
+    # These bounds are ingestion's own, not merely compatible with them. A preflight that admits
+    # a value ingestion rejects turns a rejection into a partial release: execute_release
+    # publishes objects and creates lifecycle state before ingestion ever sees the value, and a
+    # published generation cannot be unpublished.
+    if (
+        not isinstance(lease_seconds, int)
+        or isinstance(lease_seconds, bool)
+        or not _INGESTION_LEASE_BOUND[0] <= lease_seconds <= _INGESTION_LEASE_BOUND[1]
+    ):
+        raise CorpusReleaseError("ingestion lease seconds is outside its bound")
     if (
         not isinstance(poll_interval_seconds, (int, float))
         or isinstance(poll_interval_seconds, bool)
-        or poll_interval_seconds < 0
+        or not _INGESTION_POLL_INTERVAL_BOUND[0]
+        <= poll_interval_seconds
+        <= _INGESTION_POLL_INTERVAL_BOUND[1]
     ):
-        raise CorpusReleaseError("ingestion poll interval must be nonnegative")
-    if not isinstance(max_polls, int) or isinstance(max_polls, bool) or max_polls < 1:
-        raise CorpusReleaseError("ingestion max polls must be a positive integer")
+        raise CorpusReleaseError("ingestion poll interval is outside its bound")
+    if (
+        not isinstance(max_polls, int)
+        or isinstance(max_polls, bool)
+        or not _INGESTION_MAX_POLLS_BOUND[0] <= max_polls <= _INGESTION_MAX_POLLS_BOUND[1]
+    ):
+        raise CorpusReleaseError("ingestion poll count is outside its bound")
 
 
 def _parser() -> argparse.ArgumentParser:

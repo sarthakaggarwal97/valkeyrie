@@ -298,6 +298,15 @@ def _run_git(
     environment = {
         **os.environ,
         "GIT_CONFIG_NOSYSTEM": "1",
+        # A commit ID is the identity this module acquires content under, and a replacement ref
+        # makes Git serve different content while still reporting that ID. An existing bare cache
+        # can carry refs/replace, so reading a locked commit is not by itself sufficient.
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        # The inherited environment is not trusted to describe Git's configuration: a global
+        # config found through HOME can reintroduce replacement, alternates, or transport
+        # rewriting that the system-config suppression above does not cover.
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0",
     }

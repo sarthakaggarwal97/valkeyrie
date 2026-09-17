@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
 import pytest
 
 from valkeyrie.git_acquisition import (
     GitAcquisitionError,
     GitObjectAcquirer,
+    _run_git,
     create_source_lock,
     load_source_lock,
 )
@@ -175,3 +179,28 @@ def test_git_object_acquirer_fails_closed_on_blob_identity_conflict(
 
     with pytest.raises(GitAcquisitionError, match="content conflicts"):
         GitObjectAcquirer(cache, run_git=FakeGit(malformed_batch=True)).acquire(inventory, revision)
+
+
+def test_git_commands_refuse_replacement_and_untrusted_configuration() -> None:
+    """A commit ID must name exactly one content tree, whatever the host or cache contains.
+
+    Git's replacement mechanism makes ls-tree serve substituted content while still reporting the
+    locked commit ID, and an existing bare cache can carry refs/replace. Suppressing system
+    configuration alone leaves a global config reachable through HOME, which can reintroduce
+    replacement, alternates, or transport rewriting.
+    """
+    captured: dict[str, dict[str, str]] = {}
+
+    def fake_run(arguments: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        captured["env"] = dict(cast(dict[str, str], kwargs["env"]))
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b"")
+
+    with mock.patch("subprocess.run", fake_run):
+        _run_git(("--version",), input_bytes=b"", maximum_output_bytes=1024)
+
+    environment = captured["env"]
+    assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    # Pointed at the null device rather than merely unset, so an inherited HOME cannot supply one.
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert environment["GIT_CONFIG_SYSTEM"] == os.devnull

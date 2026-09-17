@@ -265,8 +265,25 @@ def _validated_https_url(value: object) -> str:
     return value
 
 
+def _is_calendar_timestamp(value: str) -> bool:
+    """Reject impossible dates and times the shape regex admits.
+
+    The regex pins digit layout only, so 2026-99-99T99:99:99Z matches it. Parsing is what
+    establishes the value names a real instant.
+    """
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _validated_timestamp(value: object, label: str) -> datetime:
-    if not isinstance(value, str) or _TIMESTAMP.fullmatch(value) is None:
+    if (
+        not isinstance(value, str)
+        or _TIMESTAMP.fullmatch(value) is None
+        or not _is_calendar_timestamp(value)
+    ):
         raise RequestAuditError(f"{label} is malformed")
     try:
         parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")

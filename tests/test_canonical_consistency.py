@@ -14,16 +14,22 @@ produce, so any divergence fails here instead of corrupting stored identities.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Final
 
 import pytest
 
+from infra import release_corpus
 from valkeyrie import (
+    application_runtime,
     deployed_evaluation,
+    evaluations,
     evidence,
     generation,
     git_acquisition,
+    live_github,
     live_qualification,
     normalization,
+    promotion,
     publication,
     request_audit,
     structured,
@@ -62,6 +68,17 @@ _DIGESTS: tuple[tuple[str, Callable[[bytes], str]], ...] = (
 )
 
 
+_CALENDAR_TIMESTAMP_COPIES: Final = (
+    ("application_runtime", application_runtime._is_calendar_timestamp),
+    ("evaluations", evaluations._is_calendar_timestamp),
+    ("generation", generation._is_calendar_timestamp),
+    ("live_github", live_github._is_calendar_timestamp),
+    ("promotion", promotion._is_calendar_timestamp),
+    ("release_corpus", release_corpus._is_calendar_timestamp),
+    ("request_audit", request_audit._is_calendar_timestamp),
+)
+
+
 @pytest.mark.parametrize(("module", "encode"), _CANONICAL_JSON)
 def test_every_canonical_json_copy_emits_the_pinned_bytes(
     module: str, encode: Callable[[object], bytes]
@@ -86,3 +103,18 @@ def test_canonical_json_rejects_values_that_would_break_identity_stability() -> 
         assert encode({"b": 1, "a": 2}) == encode({"a": 2, "b": 1}), (
             f"{module} is not order-independent"
         )
+
+
+@pytest.mark.parametrize(("module", "validator"), _CALENDAR_TIMESTAMP_COPIES)
+def test_every_calendar_timestamp_copy_rejects_impossible_instants(
+    module: str, validator: Callable[[str], bool]
+) -> None:
+    """Each copy must reject what the shape regex admits, or one module drifts permissive.
+
+    The regex pins digit layout only, so an impossible calendar date matches it. A module that
+    keeps the regex alone would accept 2026-99-99T99:99:99Z and persist it.
+    """
+    assert validator("2026-09-17T22:00:00Z") is True, module
+    assert validator("2026-09-17T22:00:00.123Z") is True, module
+    for impossible in ("2026-99-99T99:99:99Z", "2026-02-30T00:00:00Z", "2026-13-01T00:00:00Z"):
+        assert validator(impossible) is False, f"{module} accepted {impossible}"

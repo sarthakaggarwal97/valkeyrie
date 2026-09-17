@@ -488,3 +488,46 @@ def test_resources_and_activation_inputs_are_explicit_and_fail_closed(
             approval_id="approval_activate-generation",
             activated_at=NOW,
         )
+
+
+def test_preflight_rejects_every_value_ingestion_would_reject() -> None:
+    """The preflight must not admit a value ingestion rejects.
+
+    execute_release publishes objects and creates lifecycle state before run_ingestion sees these
+    values, and a published generation cannot be unpublished. So a preflight that is merely
+    compatible with ingestion converts a clean rejection into a partial release.
+    """
+    # The mirrored bounds must equal the ones ingestion actually enforces.
+    assert release_corpus._INGESTION_LEASE_BOUND == (30, 3600)
+    assert release_corpus._INGESTION_POLL_INTERVAL_BOUND == (0, 60)
+    assert release_corpus._INGESTION_MAX_POLLS_BOUND == (1, 1000)
+
+    def preflight(**overrides: object) -> None:
+        arguments: dict[str, object] = {
+            "owner": "release",
+            "lease_seconds": 300,
+            "poll_interval_seconds": 15.0,
+            "max_polls": 480,
+        }
+        arguments.update(overrides)
+        release_corpus._validate_execution_inputs(**arguments)
+
+    preflight()
+    # The exact values the review reproduced a partial release with.
+    for overrides in (
+        {"lease_seconds": 1},
+        {"lease_seconds": 29},
+        {"lease_seconds": 3601},
+        {"poll_interval_seconds": 61},
+        {"poll_interval_seconds": -1},
+        {"max_polls": 1001},
+        {"max_polls": 0},
+    ):
+        with pytest.raises(CorpusReleaseError):
+            preflight(**overrides)
+
+    # Boundaries themselves remain admissible.
+    preflight(lease_seconds=30)
+    preflight(lease_seconds=3600)
+    preflight(poll_interval_seconds=60)
+    preflight(max_polls=1000)

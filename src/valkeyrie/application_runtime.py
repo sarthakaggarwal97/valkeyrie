@@ -11,7 +11,7 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -46,6 +46,7 @@ from valkeyrie.routing import QuestionRequest, route_question
 from valkeyrie.structured import ReleaseArtifactIdentifier
 
 RuntimeOutcome = Literal["answer", "clarification", "abstention", "partial", "error"]
+_RUNTIME_OUTCOMES: Final = frozenset({"answer", "clarification", "abstention", "partial", "error"})
 
 
 class ApplicationRuntimeError(ValueError):
@@ -158,6 +159,7 @@ class RuntimeServices(Protocol):
         fence: int,
         outcome: str,
         completed_at: str,
+        result: Mapping[str, object] | None = None,
     ) -> bool: ...
 
     def converse(
@@ -233,8 +235,16 @@ def run_runtime_event(
     *,
     root: Path,
     manifest: Mapping[str, object],
+    completion_clock: Callable[[], str] | None = None,
 ) -> dict[str, object]:
-    """Run one exact private action and return a bounded JSON-compatible value."""
+    """Run one exact private action and return a bounded JSON-compatible value.
+
+    ``completion_clock`` supplies the instant a request finished. Callers that must reproduce a
+    recorded run omit it, and the event's own ``completed_at`` is used, which is what every
+    deterministic caller already does. A live deployment passes a real clock, because the event
+    field is supplied by the caller before the model runs: it cannot describe when execution
+    ended, and nothing stops it naming an arbitrary past or future instant.
+    """
     _validate_manifest(manifest)
     if not isinstance(event, Mapping) or not isinstance(event.get("action"), str):
         raise ApplicationRuntimeError("runtime event has an unknown or missing action")
@@ -248,7 +258,13 @@ def run_runtime_event(
     try:
         if services is None:
             raise ApplicationRuntimeError("runtime services are unavailable")
-        result = _answer(event, services, root=root, manifest=manifest)
+        result = _answer(
+            event,
+            services,
+            root=root,
+            manifest=manifest,
+            completion_clock=completion_clock,
+        )
     except (ApplicationRuntimeError, DraftingError) as error:
         result = RuntimeResult("error", request_id, str(error))
     return _result_value(result)
@@ -335,12 +351,26 @@ def _health(event: Mapping[str, object], manifest: Mapping[str, object]) -> dict
     }
 
 
+def _completion_timestamp(clock: Callable[[], str] | None, supplied: str) -> str:
+    """Return the instant to record as completion, preferring a trusted clock.
+
+    A clock that returns a malformed value is refused rather than silently falling back: a
+    deployment that passes one is asserting the caller's value is not to be trusted, and quietly
+    substituting it would defeat that.
+    """
+    if clock is None:
+        return supplied
+    produced = clock()
+    return _timestamp(produced, "completion timestamp")
+
+
 def _answer(
     event: Mapping[str, object],
     services: RuntimeServices,
     *,
     root: Path,
     manifest: Mapping[str, object],
+    completion_clock: Callable[[], str] | None = None,
 ) -> RuntimeResult:
     expected = {
         "action",
@@ -396,6 +426,7 @@ def _answer(
             lease_expires_at=lease_expires_at,
             completed_at=completed_at,
             manifest=manifest,
+            completion_clock=completion_clock,
         )
 
     provisional = route_question(
@@ -584,6 +615,7 @@ def _answer(
         revision=1,
         fence=1,
         completed_at=completed_at,
+        completion_clock=completion_clock,
     )
 
 
@@ -602,7 +634,11 @@ def _resume_existing(
     lease_expires_at: str,
     completed_at: str,
     manifest: Mapping[str, object],
+    completion_clock: Callable[[], str] | None = None,
 ) -> RuntimeResult:
+    replayed = _replayed_result(item, request_digest, manifest, request_id=request_id)
+    if replayed is not None:
+        return replayed
     plan, revision, fence = _existing_plan(item, request_digest, manifest)
     expected_owner = _bounded_text(item.get("owner"), "request owner", 128)
     existing_expiry = _timestamp(item.get("lease_expires_at"), "request lease expiration")
@@ -629,6 +665,7 @@ def _resume_existing(
         revision=recovered_revision,
         fence=recovered_fence,
         completed_at=completed_at,
+        completion_clock=completion_clock,
     )
 
 
@@ -640,6 +677,7 @@ def _execute_plan(
     revision: int,
     fence: int,
     completed_at: str,
+    completion_clock: Callable[[], str] | None = None,
 ) -> RuntimeResult:
     generation_id = _plan_generation_id(plan)
     if not _controls_enabled(services):
@@ -673,6 +711,9 @@ def _execute_plan(
             request_revision=revision,
             request_fence=fence,
         )
+    # Generated here, after execution and immediately before the completing write, so the audit
+    # records when the request actually finished rather than when its caller was preparing it.
+    terminal_at = _completion_timestamp(completion_clock, completed_at)
     try:
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
         outcome, claims, citations, message = _accept_output(normalized.response_text, evidence)
@@ -682,7 +723,7 @@ def _execute_plan(
             revision=revision,
             fence=fence,
             outcome="error",
-            completed_at=completed_at,
+            completed_at=terminal_at,
         ):
             return RuntimeResult(
                 "partial", request_id, "Request completion could not be confirmed."
@@ -702,12 +743,23 @@ def _execute_plan(
         # A clarification is deliberately excluded: it is already a question to the user.
         message = _guided(message, _STATIC_GUIDANCE)
     terminal = "answer" if outcome == "answer" else outcome
+    completed = RuntimeResult(
+        cast(RuntimeOutcome, terminal),
+        request_id,
+        message,
+        claims,
+        citations,
+        generation_id=generation_id,
+    )
     if not services.complete_request(
         request_id=request_id,
         revision=revision,
         fence=fence,
         outcome=terminal,
-        completed_at=completed_at,
+        completed_at=terminal_at,
+        # Recorded with the outcome so a redelivery can be answered from the record rather than
+        # charged for a second inference that could answer differently.
+        result=_replayable_result(completed),
     ):
         return RuntimeResult("partial", request_id, "Request completion could not be confirmed.")
     return RuntimeResult(
@@ -1021,6 +1073,92 @@ def _live_evidence(observation: object) -> LiveRuntimeEvidence:
     )
 
 
+def _replayable_result(value: RuntimeResult) -> dict[str, object]:
+    """The parts of a result that a redelivery must reproduce.
+
+    Revision and fence are deliberately excluded: they describe the write that completed the
+    request, not the answer, and a replay is not that write.
+    """
+    return {
+        "outcome": value.outcome,
+        "message": value.message,
+        "claims": [dict(item) for item in value.claims],
+        "citations": list(value.citations),
+        "generation_id": value.generation_id,
+    }
+
+
+def _dynamo_value(value: object) -> object:
+    """Convert a result payload into DynamoDB-safe types.
+
+    DynamoDB rejects float, which is what json numbers decode to, so numbers are carried as
+    Decimal. Nothing else in a result needs converting.
+    """
+    if isinstance(value, bool) or value is None or isinstance(value, (str, int, Decimal)):
+        return value
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, Mapping):
+        return {str(key): _dynamo_value(item) for key, item in value.items()}
+    if isinstance(value, Sequence):
+        return [_dynamo_value(item) for item in value]
+    raise ApplicationRuntimeError("result payload holds an unsupported type")
+
+
+def _replayed_result(
+    item: Mapping[str, object],
+    request_digest: str,
+    manifest: Mapping[str, object],
+    *,
+    request_id: str,
+) -> RuntimeResult | None:
+    """Return the recorded answer for an already-completed request, or None if it is still open.
+
+    A redelivery is the normal case, not an error: Slack retries an event it did not see acked,
+    and the request ID is derived from the event identity so the retry arrives as the same
+    request. Recomputing would charge for a second inference and could answer differently, so the
+    recorded result is returned instead.
+
+    The digest is checked first. Without it, a caller reusing a request ID with a different
+    question would receive the previous question's answer.
+    """
+    if item.get("outcome") is None:
+        return None
+    plan = item.get("plan")
+    if not isinstance(plan, Mapping):
+        raise ApplicationRuntimeError("request audit state is malformed")
+    if plan.get("question_digest") != request_digest:
+        raise ApplicationRuntimeError("request is pinned to different content")
+    if plan.get("application_revision") != manifest["application_revision"]:
+        raise ApplicationRuntimeError("request is pinned to a different application revision")
+    stored = item.get("result")
+    if not isinstance(stored, Mapping):
+        # Completed before results were recorded. Replaying is impossible and recomputing would
+        # break the single-completion guarantee, so this stays an error.
+        raise ApplicationRuntimeError("request audit is already terminal")
+    outcome = stored.get("outcome")
+    if outcome not in _RUNTIME_OUTCOMES:
+        raise ApplicationRuntimeError("recorded result outcome is unsupported")
+    claims = stored.get("claims", ())
+    citations = stored.get("citations", ())
+    if not isinstance(claims, Sequence) or not isinstance(citations, Sequence):
+        raise ApplicationRuntimeError("recorded result is malformed")
+    message = stored.get("message")
+    if message is not None and not isinstance(message, str):
+        raise ApplicationRuntimeError("recorded result message is malformed")
+    generation_id = stored.get("generation_id")
+    if generation_id is not None and not isinstance(generation_id, str):
+        raise ApplicationRuntimeError("recorded result generation is malformed")
+    return RuntimeResult(
+        cast(RuntimeOutcome, outcome),
+        request_id,
+        message,
+        tuple(dict(cast(Mapping[str, object], claim)) for claim in claims),
+        tuple(str(citation) for citation in citations),
+        generation_id=generation_id,
+    )
+
+
 def _existing_plan(
     item: Mapping[str, object],
     request_digest: str,
@@ -1144,8 +1282,25 @@ def _bounded_text(value: object, label: str, maximum: int) -> str:
     return value
 
 
+def _is_calendar_timestamp(value: str) -> bool:
+    """Reject impossible dates and times the shape regex admits.
+
+    The regex pins digit layout only, so 2026-99-99T99:99:99Z matches it. Parsing is what
+    establishes the value names a real instant.
+    """
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _timestamp(value: object, label: str) -> str:
-    if not isinstance(value, str) or _TIMESTAMP.fullmatch(value) is None:
+    if (
+        not isinstance(value, str)
+        or _TIMESTAMP.fullmatch(value) is None
+        or not _is_calendar_timestamp(value)
+    ):
         raise ApplicationRuntimeError(f"{label} is malformed")
     _timestamp_value(value)
     return value
@@ -1764,21 +1919,31 @@ class AwsRuntimeServices:
         fence: int,
         outcome: str,
         completed_at: str,
+        result: Mapping[str, object] | None = None,
     ) -> bool:
+        # The result is written in the SAME conditional update as the outcome. A second write
+        # could be lost, leaving a terminal record with no answer to replay, which is the state
+        # that turns a Slack redelivery into an error.
+        expression = "SET outcome = :outcome, completed_at = :completed, revision = :next"
+        values: dict[str, object] = {
+            ":outcome": outcome,
+            ":completed": completed_at,
+            ":next": revision + 1,
+            ":revision": revision,
+            ":fence": fence,
+        }
+        if result is not None:
+            expression += ", #result = :result"
+            values[":result"] = _dynamo_value(result)
         try:
             self._table().update_item(
                 Key={"pk": f"request#{request_id}"},
-                UpdateExpression="SET outcome = :outcome, completed_at = :completed, revision = :next",  # noqa: E501
+                UpdateExpression=expression,
                 ConditionExpression=(
                     "revision = :revision AND fence = :fence AND attribute_not_exists(outcome)"
                 ),
-                ExpressionAttributeValues={
-                    ":outcome": outcome,
-                    ":completed": completed_at,
-                    ":next": revision + 1,
-                    ":revision": revision,
-                    ":fence": fence,
-                },
+                ExpressionAttributeNames={"#result": "result"},
+                ExpressionAttributeValues=values,
             )
         except Exception as error:
             if _aws_error_code(error) == "ConditionalCheckFailedException":

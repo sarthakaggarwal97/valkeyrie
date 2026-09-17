@@ -17,6 +17,7 @@ from infra.application_artifact import (
     _NON_RUNTIME_MODULES,
     _RUNTIME_MODULES,
     ApplicationArtifactError,
+    _assert_target_abi,
     _revision,
     _validate_source_inventory,
     build_application_artifact,
@@ -266,3 +267,44 @@ def test_verifier_requires_caller_expected_content_identity(qualified_root: Path
             artifact.content,
             expected_application_revision="sha256:" + "0" * 64,
         )
+
+
+def test_vendored_native_extensions_must_match_the_declared_architecture() -> None:
+    """A build on the wrong host must fail here, not as an ImportError after deployment.
+
+    Dependencies are vendored from the host environment while the artifact and the function both
+    declare x86_64 Linux, and the digest is computed over whatever bytes were copied. So a macOS
+    arm64 build produces extensions the runtime cannot import and still verifies. The ELF header
+    is read rather than the filename trusted, because the filename is what was already wrong.
+    """
+    # A 64-bit little-endian ELF for x86_64 (e_machine 0x3E) is the only accepted shape.
+    linux_x86_64 = (
+        b"\x7fELF\x02\x01\x01\x00"
+        + bytes(8)
+        + (2).to_bytes(2, "little")
+        + (0x3E).to_bytes(2, "little")
+    )
+    _assert_target_abi("rpds/rpds.cpython-311-x86_64-linux-gnu.so", linux_x86_64)
+
+    rejected = {
+        # Darwin arm64 Mach-O, which is what an Apple silicon build produces.
+        "mach-o": b"\xcf\xfa\xed\xfe\x0c\x00\x00\x01" + bytes(12),
+        # Linux aarch64 ELF (e_machine 0xB7): right OS, wrong machine.
+        "aarch64": b"\x7fELF\x02\x01\x01\x00"
+        + bytes(8)
+        + (2).to_bytes(2, "little")
+        + (0xB7).to_bytes(2, "little"),
+        # 32-bit ELF: right machine family, wrong class.
+        "elf32": b"\x7fELF\x01\x01\x01\x00"
+        + bytes(8)
+        + (2).to_bytes(2, "little")
+        + (0x03).to_bytes(2, "little"),
+    }
+    for label, content in rejected.items():
+        with pytest.raises(ApplicationArtifactError, match="Linux x86_64"):
+            _assert_target_abi("rpds/rpds.cpython-311-x86_64-linux-gnu.so", content)
+        assert label
+
+    # Pure-Python files carry no ABI and must pass through untouched.
+    _assert_target_abi("yaml/loader.py", b"import os\n")
+    _assert_target_abi("attrs/__init__.py", b"")

@@ -573,6 +573,28 @@ def _content_id(domain: str, value: object) -> str:
     return _framed(domain.encode(), (_canonical(value),))
 
 
+def _assert_target_abi(relative: str, content: bytes) -> None:
+    """Refuse a native extension that cannot load on the Lambda this artifact declares.
+
+    Dependencies are vendored from the host environment while the artifact and the function both
+    declare x86_64 Linux. A build on another platform therefore produces extensions the runtime
+    cannot import, and every other check still passes: the digest is computed over whatever bytes
+    were copied, so the artifact verifies and the failure only appears as an ImportError after
+    deployment. The ELF header is what distinguishes them, so it is read here rather than trusted
+    from the filename.
+    """
+    if not relative.endswith((".so", ".pyd", ".dylib")):
+        return
+    # ELF magic, then EI_CLASS 2 (64-bit) and EI_DATA 1 (little endian), then e_machine 0x3E.
+    header = content[:20]
+    machine = int.from_bytes(header[18:20], "little") if len(header) >= 20 else 0
+    if header[:4] != b"\x7fELF" or header[4] != 2 or header[5] != 1 or machine != 0x3E:
+        raise ApplicationArtifactError(
+            f"vendored native extension is not Linux x86_64 and cannot load on the "
+            f"declared architecture: {relative}. Build in a Linux x86_64 environment."
+        )
+
+
 def _vendored_dependencies() -> tuple[dict[str, bytes], list[dict[str, object]]]:
     files: dict[str, bytes] = {}
     entries: list[dict[str, object]] = []
@@ -591,7 +613,9 @@ def _vendored_dependencies() -> tuple[dict[str, bytes], list[dict[str, object]]]
             for candidate in candidates:
                 if candidate.is_file():
                     relative = candidate.relative_to(site).as_posix()
-                    files[relative] = _read(candidate)
+                    content = _read(candidate)
+                    _assert_target_abi(relative, content)
+                    files[relative] = content
                     resolved_roots.append(relative)
                 elif candidate.is_dir():
                     resolved_roots.append(candidate.relative_to(site).as_posix())
@@ -604,7 +628,9 @@ def _vendored_dependencies() -> tuple[dict[str, bytes], list[dict[str, object]]]
                             and path.suffix != ".pyc"
                         ):
                             relative = path.relative_to(site).as_posix()
-                            files[relative] = _read(path)
+                            content = _read(path)
+                            _assert_target_abi(relative, content)
+                            files[relative] = content
                 else:
                     raise ApplicationArtifactError(f"locked dependency root is absent: {root}")
         entries.append({"name": name, "version": version, "roots": sorted(resolved_roots)})

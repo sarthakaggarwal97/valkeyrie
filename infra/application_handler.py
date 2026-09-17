@@ -58,7 +58,23 @@ def handler(
     dependencies = services
     if dependencies is None and isinstance(event, Mapping) and event.get("action") == "answer":
         dependencies = AwsRuntimeServices()
-    return run_runtime_event(event, dependencies, root=_ROOT, manifest=manifest)
+    return run_runtime_event(
+        event,
+        dependencies,
+        root=_ROOT,
+        manifest=manifest,
+        completion_clock=_completion_now,
+    )
+
+
+def _completion_now() -> str:
+    """The instant a request finished, read at completion rather than supplied by the caller.
+
+    The event's completed_at is built before the model runs, so it describes when the caller was
+    preparing the request. This is the deployment's own clock, which is what makes the audit
+    record duration truthful.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def _is_http_request(event: object) -> bool:
@@ -96,7 +112,13 @@ def _handle_http(
     }
     dependencies = services if services is not None else AwsRuntimeServices()
     try:
-        result = run_runtime_event(request, dependencies, root=_ROOT, manifest=manifest)
+        result = run_runtime_event(
+            request,
+            dependencies,
+            root=_ROOT,
+            manifest=manifest,
+            completion_clock=_completion_now,
+        )
     except Exception:
         # Never surface internals to an unauthenticated caller.
         return _response(500, {"error": "the request could not be completed"})

@@ -1133,9 +1133,22 @@ def _nested_sha(value: Mapping[str, object], key: str) -> str:
     return _sha(_object(value.get(key), f"GitHub field {key}"), "sha")
 
 
+def _is_calendar_timestamp(value: str) -> bool:
+    """Reject impossible dates and times the shape regex admits.
+
+    The regex pins digit layout only, so 2026-99-99T99:99:99Z matches it. Parsing is what
+    establishes the value names a real instant.
+    """
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _timestamp(value: Mapping[str, object], key: str) -> str:
     result = _text(value, key, 64)
-    if _TIMESTAMP.fullmatch(result) is None:
+    if _TIMESTAMP.fullmatch(result) is None or not _is_calendar_timestamp(result):
         raise LiveGitHubError(f"GitHub field {key} must be a canonical UTC timestamp")
     try:
         datetime.fromisoformat(result.removesuffix("Z") + "+00:00")
