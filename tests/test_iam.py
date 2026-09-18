@@ -132,13 +132,20 @@ def test_github_roles_preserve_exact_repository_audience_and_environment_trust(
     tmp_path: Path,
 ) -> None:
     roles = _roles(_template(tmp_path / "assembly"))
+
+    # GitHub now issues the subject with immutable owner and repository ids embedded; the bare
+    # name form never matched it and every scheduled refresh failed at the credential step. Both
+    # forms are trusted as an exact-match list: the id form is STRICTER than the name (a repository
+    # recreated under the same name has a different id), and there is still no wildcard.
+    def subjects(environment: str) -> list[str]:
+        return [
+            f"repo:sarthakaggarwal97@25262500/valkeyrie@1338597592:environment:{environment}",
+            f"repo:sarthakaggarwal97/valkeyrie:environment:{environment}",
+        ]
+
     expected_subjects = {
-        "valkeyrie-development-application-deployer": (
-            "repo:sarthakaggarwal97/valkeyrie:environment:application"
-        ),
-        "valkeyrie-development-corpus-publisher": (
-            "repo:sarthakaggarwal97/valkeyrie:environment:corpus"
-        ),
+        "valkeyrie-development-application-deployer": subjects("application"),
+        "valkeyrie-development-corpus-publisher": subjects("corpus"),
     }
     for role_name, subject in expected_subjects.items():
         statement = _trust(roles[role_name][1])
@@ -153,9 +160,10 @@ def test_github_roles_preserve_exact_repository_audience_and_environment_trust(
             "Effect": "Allow",
             "Principal": {"Federated": OIDC_PROVIDER},
         }
-        assert "*" not in subject
-        assert ":ref:" not in subject
-        assert ":pull_request" not in subject
+        for form in subject:
+            assert "*" not in form
+            assert ":ref:" not in form
+            assert ":pull_request" not in form
 
 
 def test_runtime_trust_is_lambda_only_and_operator_role_is_deferred(tmp_path: Path) -> None:

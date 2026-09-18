@@ -39,6 +39,14 @@ _NAME = re.compile(r"^[a-z][a-z0-9-]*$")
 _ACCOUNT = re.compile(r"^[0-9]{12}$")
 _REGION = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-[0-9]+$")
 GITHUB_REPOSITORY: Final = "sarthakaggarwal97/valkeyrie"
+# GitHub's immutable numeric ids for the owner and repository. Its OIDC tokens now carry the
+# subject as repo:<owner>@<owner_id>/<name>@<repo_id>:environment:<env>, which survives a rename;
+# a trust on the bare name never matched it, and every scheduled refresh since August failed at
+# the credential step with "Not authorized to perform sts:AssumeRoleWithWebIdentity", seen in
+# CloudTrail. Pinning the ids is STRICTER than the name: a repository recreated under the same
+# name has a different id and does not match. Confirmed against the GitHub API on 2026-09-18.
+GITHUB_OWNER_ID: Final = 25262500
+GITHUB_REPOSITORY_ID: Final = 1338597592
 APPLICATION_ENVIRONMENT: Final = "application"
 CORPUS_ENVIRONMENT: Final = "corpus"
 INFRASTRUCTURE_OWNER: Final = "sarthakaggarwal97"
@@ -166,12 +174,19 @@ class KnowledgePlaneStack(Stack):
 
         def github_environment(environment: str) -> iam.FederatedPrincipal:
             claims = "token.actions.githubusercontent.com"
+            owner, name = GITHUB_REPOSITORY.split("/")
             return iam.FederatedPrincipal(
                 oidc_provider,
                 {
                     "StringEquals": {
                         f"{claims}:aud": "sts.amazonaws.com",
-                        f"{claims}:sub": (f"repo:{GITHUB_REPOSITORY}:environment:{environment}"),
+                        # Both subject forms GitHub has issued. StringEquals with a list is an OR
+                        # of exact matches; there is still no wildcard anywhere in the trust.
+                        f"{claims}:sub": [
+                            f"repo:{owner}@{GITHUB_OWNER_ID}/{name}@{GITHUB_REPOSITORY_ID}"
+                            f":environment:{environment}",
+                            f"repo:{GITHUB_REPOSITORY}:environment:{environment}",
+                        ],
                     }
                 },
                 "sts:AssumeRoleWithWebIdentity",
