@@ -1945,9 +1945,15 @@ class AwsRuntimeServices:
             ":revision": revision,
             ":fence": fence,
         }
+        # "result" is a DynamoDB reserved word, so it needs a placeholder name. The placeholder may
+        # only be DECLARED when the expression actually uses it: DynamoDB rejects an unused entry in
+        # ExpressionAttributeNames, which made every completion that carries no result -- the error
+        # path -- fail with a ValidationException instead of recording the error.
+        names: dict[str, str] = {}
         if result is not None:
             expression += ", #result = :result"
             values[":result"] = _dynamo_value(result)
+            names["#result"] = "result"
         try:
             self._table().update_item(
                 Key={"pk": f"request#{request_id}"},
@@ -1955,8 +1961,8 @@ class AwsRuntimeServices:
                 ConditionExpression=(
                     "revision = :revision AND fence = :fence AND attribute_not_exists(outcome)"
                 ),
-                ExpressionAttributeNames={"#result": "result"},
                 ExpressionAttributeValues=values,
+                **({"ExpressionAttributeNames": names} if names else {}),
             )
         except Exception as error:
             if _aws_error_code(error) == "ConditionalCheckFailedException":

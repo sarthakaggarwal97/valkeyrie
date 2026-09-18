@@ -1804,3 +1804,52 @@ def test_a_reused_request_id_with_a_different_question_is_refused(
     result = run_runtime_event(hijacked, services, root=ROOT, manifest=manifest)
     assert result["outcome"] == "error"
     assert not result.get("claims")
+
+
+def test_completion_declares_the_result_placeholder_only_when_it_uses_it() -> None:
+    """DynamoDB rejects an expression attribute name the expression never references.
+
+    "result" is a reserved word, so it needs a placeholder. Declaring the placeholder
+    unconditionally made every completion that carries no result fail with a ValidationException,
+    and the error path is exactly the one that carries none: a request that failed then could not
+    even record that it failed. This asserts the same rule DynamoDB enforces, because a fake table
+    that accepts anything cannot catch it.
+    """
+    calls: list[dict[str, object]] = []
+
+    class FakeTable:
+        @staticmethod
+        def update_item(**kwargs: object) -> None:
+            expression = cast(str, kwargs["UpdateExpression"])
+            declared = cast(dict[str, str], kwargs.get("ExpressionAttributeNames", {}))
+            for placeholder in declared:
+                if placeholder not in expression:
+                    raise AssertionError(
+                        f"ExpressionAttributeNames declares {placeholder} unused in expressions"
+                    )
+            for placeholder in cast(dict[str, object], kwargs["ExpressionAttributeValues"]):
+                assert placeholder in expression or placeholder in {":revision", ":fence"}
+            calls.append(dict(kwargs))
+
+    services = object.__new__(AwsRuntimeServices)
+    services._table = lambda: FakeTable()  # type: ignore[method-assign]
+
+    # The error path carries no result and must still record the outcome.
+    assert services.complete_request(
+        request_id="req_x",
+        revision=1,
+        fence=1,
+        outcome="error",
+        completed_at="2026-01-01T00:00:00Z",
+    )
+    assert "ExpressionAttributeNames" not in calls[-1]
+
+    assert services.complete_request(
+        request_id="req_x",
+        revision=1,
+        fence=1,
+        outcome="answer",
+        completed_at="2026-01-01T00:00:00Z",
+        result={"outcome": "answer", "claims": [], "citations": [], "message": None},
+    )
+    assert calls[-1]["ExpressionAttributeNames"] == {"#result": "result"}
