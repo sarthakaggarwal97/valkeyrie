@@ -259,11 +259,18 @@ _SEARCH_STOP_WORDS: Final = frozenset(
         "how",
         "i",
         "in",
+        # Pronouns and demonstratives carry no subject, so a question made only of them would
+        # otherwise clear the two-term floor and spend a search on "it work".
+        "it",
+        "its",
         "is",
         "of",
         "on",
         "or",
         "the",
+        "them",
+        "they",
+        "this",
         "to",
         "what",
         "when",
@@ -316,6 +323,42 @@ def infer_live_query(question: str) -> LiveGitHubQuery | None:
     return IssueSearchQuery(terms=terms[:MAX_SEARCH_TERMS], repository=repository)
 
 
+# Words that mark a question as being about how something was designed, whether it shipped, or
+# what state it is in. A supplementary GitHub search is only worth its latency and its share of the
+# authenticated 30-per-minute search budget for these: issue and pull request search cannot see
+# file contents, so a documentation or governance question ("how do I use GET", "who leads the
+# TSC") gets nothing back but unrelated bug reports, measured.
+#
+# This is deliberately a SUPERSET of what previously reached a search, judged by intent rather than
+# by retrieval score: score does not separate these cases, and was measured inverted, with the
+# compression question scoring HIGHER than the documentation questions that need no supplement.
+_SUPPLEMENT_INTENT_TERMS: Final = frozenset(
+    {
+        "available",
+        "design",
+        "designed",
+        "implement",
+        "implemented",
+        "implementation",
+        "landed",
+        "mechanism",
+        "merged",
+        "negotiate",
+        "negotiated",
+        "planned",
+        "proposal",
+        "proposed",
+        "rfc",
+        "supported",
+        "supports",
+        "upcoming",
+        "work",
+        "working",
+        "works",
+    }
+)
+
+
 def infer_supplementary_search(
     question: str, *, kind: str = "pull-request"
 ) -> IssueSearchQuery | None:
@@ -327,8 +370,13 @@ def infer_supplementary_search(
     corpus cannot document a feature that has not shipped. This inference drops the
     discovery-word gate so the corpus can be supplemented, and it never changes routing.
 
-    Returns ``None`` when the question is too thin to search, so ordinary command questions
-    do not spend GitHub quota.
+    Returns ``None`` when the question shows no design, shipped-state, or live-state intent, so a
+    documentation or governance question spends no GitHub quota and adds no latency.
+
+    The gate is intent, not precision. A documented mechanism phrased as "how does X work" still
+    searches, because language cannot tell a documented feature from an unshipped one: only whether
+    the corpus could answer can, and that is known after drafting rather than before. Erring toward
+    searching keeps every question that works today working.
     """
     if type(question) is not str:
         raise LiveGitHubError("live query question must be text")
@@ -345,6 +393,9 @@ def infer_supplementary_search(
     # Two terms is the floor for a search worth making: one term matches too much of the
     # repository to be evidence, and zero means the question carried no subject at all.
     if len(terms) < 2:
+        return None
+    lowered = {word.strip("?.,:;!()").lower() for word in question.split()}
+    if not lowered & (_SUPPLEMENT_INTENT_TERMS | _LIVE_DISCOVERY_TERMS):
         return None
     # Five items, not the default twenty. A search returns whole issue bodies, and twenty of
     # them exceeds MAX_RESPONSE_BYTES, which made every supplemented answer fail with

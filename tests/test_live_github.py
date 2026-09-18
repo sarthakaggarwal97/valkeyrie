@@ -31,6 +31,7 @@ from valkeyrie.live_github import (
     PullRequestQuery,
     WorkflowRunQuery,
     infer_live_query,
+    infer_supplementary_search,
     normalize_project_response,
     read_live_github,
 )
@@ -1172,3 +1173,35 @@ def test_projects_fetcher_must_return_the_declared_response_type() -> None:
 
     with pytest.raises(LiveGitHubError, match="wrong response type"):
         read_live_github(ProjectQuery(14), projects_fetch=projects_fetch)
+
+
+def test_supplementary_search_only_fires_on_design_or_state_intent() -> None:
+    """A supplement is only worth its latency and quota where GitHub can actually answer.
+
+    Issue and pull request search cannot see file contents, so a documentation or governance
+    question returns unrelated bug reports: searching GitHub for "who leads the TSC" returns an
+    issue about assigning PR owners, while the corpus answers it from MAINTAINERS.md. Those
+    questions previously spent two searches each and capped throughput against the authenticated
+    thirty-per-minute search budget.
+    """
+    # Answerable from indexed files. GitHub search cannot see files, so it must not be asked.
+    for question in (
+        "How do I use GET?",
+        "What does SET do?",
+        "Who leads the TSC?",
+        "How do I contribute to Valkey?",
+        "Where should documentation for a newly added command be written?",
+    ):
+        assert infer_supplementary_search(question) is None, question
+
+    # Design, shipped-state, and live-state intent all still reach a search.
+    for question in (
+        "How does Valkey replication compression work?",
+        "Is streaming compression merged yet?",
+        "What is the proposed design for dual channel replication?",
+        "What is the roadmap for 9.1?",
+    ):
+        assert infer_supplementary_search(question) is not None, question
+
+    # The floor on subject terms still applies, so intent alone cannot force a search.
+    assert infer_supplementary_search("does it work?") is None
