@@ -28,6 +28,7 @@ from valkeyrie.application_runtime import (
 )
 from valkeyrie.bedrock_response import BedrockTextResponse
 from valkeyrie.live_github import (
+    IssueQuery,
     IssueSearchQuery,
     LatestReleaseQuery,
     LiveGitHubError,
@@ -199,6 +200,19 @@ class FakeServices:
         if result is not None:
             item["result"] = dict(result)
         return True
+
+    # Default: the router declines, so every existing test exercises the keyword path it was
+    # written against. A test that wants routing sets router_reply.
+    router_reply: str | None = None
+
+    def route(self, *, system: str, question: str) -> str:
+        # Per-instance: a class-level list would be shared by every test.
+        if not hasattr(self, "route_calls"):
+            self.route_calls: list[str] = []
+        self.route_calls.append(question)
+        if self.router_reply is None:
+            raise RuntimeError("router unavailable in this test")
+        return self.router_reply
 
     def converse(
         self,
@@ -1853,3 +1867,105 @@ def test_completion_declares_the_result_placeholder_only_when_it_uses_it() -> No
         result={"outcome": "answer", "claims": [], "citations": [], "message": None},
     )
     assert calls[-1]["ExpressionAttributeNames"] == {"#result": "result"}
+
+
+def test_the_model_router_chooses_lookups_the_keyword_router_could_not(
+    manifest: dict[str, object],
+) -> None:
+    """A phrasing the term lists do not know still reaches the right lookup.
+
+    "is 9.2 rc1 released?" abstained: the discovery terms hold "release" but not "released", and
+    every phrasing outside the lists degrades the same way. The model has no such gap. It chooses
+    from a closed catalog and everything downstream is unchanged, so the routed plan is executed,
+    pinned, and answered exactly as a keyword-routed one.
+    """
+    services = FakeServices()
+    services.router_reply = '{"lookups":[{"kind":"issue","repository":"valkey","number":8}]}'
+    services.live_observation = _live_observation()
+    evidence_id = "ev_" + services.live_observation.observation_id.removeprefix("obs_")
+    services.output = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": "answer",
+        "claims": [
+            {"claim_id": "c1", "text": "Number 8 is a release.", "evidence_ids": [evidence_id]}
+        ],
+    }
+
+    # No discovery term, no "#", no "issue": the keyword path would have gone to the corpus.
+    result = run_runtime_event(
+        _event(question="did anything happen with number 8"), services, root=ROOT, manifest=manifest
+    )
+
+    assert services.route_calls == ["did anything happen with number 8"]
+    assert services.live_calls == [IssueQuery("valkey", 8)]
+    # The keyword path was never consulted: no retrieval happened.
+    assert services.retrieve_calls == []
+    assert result["outcome"] == "answer"
+    assert cast(dict[str, object], services.requests["req_runtime-1"]["plan"])["evidence_mode"] == (
+        "live"
+    )
+
+
+def test_a_routed_plan_may_combine_corpus_and_live_evidence(
+    manifest: dict[str, object],
+) -> None:
+    services = FakeServices()
+    services.router_reply = (
+        '{"lookups":[{"kind":"corpus_search"},{"kind":"issue","repository":"valkey","number":8}]}'
+    )
+    services.live_observation = _live_observation()
+
+    run_runtime_event(_event(), services, root=ROOT, manifest=manifest)
+
+    assert len(services.retrieve_calls) == 1
+    assert services.live_calls == [IssueQuery("valkey", 8)]
+    # Mixed evidence is a static plan, as the supplement already established.
+    plan = cast(dict[str, object], services.requests["req_runtime-1"]["plan"])
+    assert plan["evidence_mode"] == "static"
+    assert plan["generation_id"] == GENERATION
+
+
+def test_router_failure_falls_back_to_the_keyword_path_unchanged(
+    manifest: dict[str, object],
+) -> None:
+    """The router may only add coverage. When it cannot decide, nothing is lost."""
+    services = FakeServices()
+    services.router_reply = None  # the fake raises: model unavailable
+
+    result = run_runtime_event(_event(), services, root=ROOT, manifest=manifest)
+
+    assert result["outcome"] == "answer"
+    assert len(services.route_calls) == 1
+    assert len(services.retrieve_calls) == 1
+
+    # Malformed output degrades identically to unavailability.
+    malformed = FakeServices()
+    malformed.router_reply = "I would search the corpus for that."
+    assert run_runtime_event(_event(), malformed, root=ROOT, manifest=manifest)["outcome"] == (
+        "answer"
+    )
+
+
+def test_an_empty_routed_plan_defers_to_the_keyword_path(manifest: dict[str, object]) -> None:
+    """Choosing nothing is a statement the question needs no lookup; the existing greeting and
+    clarification handling then applies, rather than the router short-circuiting to an answer."""
+    services = FakeServices()
+    services.router_reply = '{"lookups":[]}'
+    result = run_runtime_event(_event(), services, root=ROOT, manifest=manifest)
+    assert result["outcome"] == "answer"
+    assert len(services.retrieve_calls) == 1
+
+
+def test_one_failed_live_lookup_does_not_discard_the_others(manifest: dict[str, object]) -> None:
+    services = FakeServices()
+    services.router_reply = (
+        '{"lookups":[{"kind":"corpus_search"},{"kind":"issue","repository":"valkey","number":8}]}'
+    )
+    services.live_error = LiveGitHubError("GitHub unavailable")
+
+    result = run_runtime_event(_event(), services, root=ROOT, manifest=manifest)
+
+    # The live half failed; the corpus half still produced an answer.
+    assert result["outcome"] == "answer"
+    assert len(services.retrieve_calls) == 1

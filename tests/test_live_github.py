@@ -29,6 +29,7 @@ from valkeyrie.live_github import (
     LiveGitHubQuery,
     ProjectQuery,
     PullRequestQuery,
+    ReleaseListQuery,
     WorkflowRunQuery,
     infer_live_query,
     infer_supplementary_search,
@@ -841,7 +842,9 @@ def test_maximum_numeric_identifier_is_accepted_by_query_validation() -> None:
     [
         (HttpResponse(404, {"content-type": "application/json"}, b"{}"), "HTTP 404"),
         (HttpResponse(200, {"content-type": "text/html"}, b"{}"), "content type"),
-        (HttpResponse(200, {"content-type": "application/json"}, b"[]"), "must be an object"),
+        # An array is now accepted by the transport for list endpoints, so an object query fed one
+        # fails one step later, on the first field a single object must carry.
+        (HttpResponse(200, {"content-type": "application/json"}, b"[]"), "bounded integer"),
         (
             HttpResponse(200, {"content-type": "application/json"}, b'{"id":1,"id":2}'),
             "strict JSON",
@@ -1226,3 +1229,33 @@ def test_supplementary_search_only_fires_on_design_or_state_intent() -> None:
 
     # The floor on subject terms still applies, so intent alone cannot force a search.
     assert infer_supplementary_search("does it work?") is None
+
+
+def test_release_list_includes_prereleases_that_latest_omits() -> None:
+    """/releases/latest omits prereleases, so it cannot say whether a release candidate exists.
+
+    With 9.2.0-rc1 published, that endpoint still reported 9.1.2, and a question about the rc
+    answered from it would have been answered wrongly. The list endpoint returns a bare JSON array,
+    which the transport wraps so one response contract serves every normalizer.
+    """
+    rc = _release()
+    rc.update({"id": 91, "tag_name": "9.2.0-rc1", "prerelease": True})
+    rc["url"] = "https://api.github.com/repos/valkey-io/valkey/releases/91"
+    rc["html_url"] = "https://github.com/valkey-io/valkey/releases/tag/9.2.0-rc1"
+    stable = _release()
+
+    observation = read_live_github(
+        ReleaseListQuery("valkey", 4), fetch=lambda *args: _response([rc, stable])
+    )
+    payload = json.loads(observation.canonical_payload)
+    assert payload["kind"] == "release_list"
+    assert [item["tag"] for item in payload["releases"]] == ["9.2.0-rc1", "v9.0.0"]
+    assert payload["releases"][0]["prerelease"] is True
+    assert observation.source_url.endswith("/releases?per_page=4")
+
+    # More elements than the requested page is a response that cannot be trusted.
+    with pytest.raises(LiveGitHubError, match="exceeds the requested page bound"):
+        read_live_github(ReleaseListQuery("valkey", 1), fetch=lambda *args: _response([rc, stable]))
+    # And the page size itself is bounded.
+    with pytest.raises(LiveGitHubError, match="outside its bound"):
+        read_live_github(ReleaseListQuery("valkey", 500), fetch=lambda *args: _response([]))

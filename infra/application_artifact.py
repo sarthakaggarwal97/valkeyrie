@@ -65,6 +65,7 @@ _RUNTIME_MODULES: Final = (
     "generation.py",
     "github.py",
     "live_github.py",
+    "lookup_router.py",
     "normalization.py",
     "prompts.py",
     "request_audit.py",

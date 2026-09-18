@@ -34,6 +34,7 @@ from valkeyrie.live_github import (
     infer_supplementary_search,
     read_live_github,
 )
+from valkeyrie.lookup_router import route_lookups
 from valkeyrie.prompts import load_prompt_package
 from valkeyrie.request_audit import LiveObservation, RequestAuditError, live_observation_value
 from valkeyrie.retrieval import (
@@ -173,6 +174,14 @@ class RuntimeServices(Protocol):
         reasoning_effort: str,
     ) -> BedrockTextResponse: ...
 
+    def route(self, *, system: str, question: str) -> str:
+        """One short model turn with no evidence, used to choose lookups.
+
+        Distinct from converse because it carries no evidence and its output is a lookup plan
+        rather than an answer: nothing it returns is ever shown to the asker or cited.
+        """
+        ...
+
 
 _REQUEST_ID: Final = re.compile(r"^req_[a-z0-9-]+$")
 _DIGEST: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -222,7 +231,7 @@ _LIVE_METADATA: Final = frozenset(
 _LIVE_KINDS: Final[Mapping[str, frozenset[str]]] = {
     "pull_request": frozenset({"pull_request"}),
     "issue": frozenset({"issue", "issue_search", "milestone"}),
-    "release": frozenset({"release"}),
+    "release": frozenset({"release", "release_list"}),
     "workflow_run": frozenset({"workflow_run"}),
     "check": frozenset({"check_run", "commit_checks", "commit_status"}),
     "controller_status": frozenset({"project"}),
@@ -449,7 +458,12 @@ def _answer(
     generation_id: str | None
     plan_knowledge_base_id: str | None
     evidence_mode: Literal["static", "live"]
-    if provisional.routes[0] == "live_read":
+    routed = _routed_evidence(
+        services, question, requested=requested, knowledge_base_id=knowledge_base_id
+    )
+    if routed is not None:
+        evidence, generation_id, plan_knowledge_base_id, evidence_mode = routed
+    elif provisional.routes[0] == "live_read":
         try:
             query = infer_live_query(question)
         except LiveGitHubError:
@@ -848,6 +862,64 @@ def _accept_output(
         for object_type, observed_at, citation_url in sorted(live_targets)
     )
     return "answer", tuple(claims), citations, None
+
+
+def _routed_evidence(
+    services: RuntimeServices,
+    question: str,
+    *,
+    requested: str | None,
+    knowledge_base_id: str,
+) -> tuple[tuple[RuntimeEvidence, ...], str | None, str | None, Literal["static", "live"]] | None:
+    """Let the model choose the lookups, then execute exactly those.
+
+    Returns None whenever the keyword path should run instead: the router failed, chose nothing,
+    or every lookup it chose failed. The router adds phrasing coverage; it never removes a
+    capability the keyword path has, so falling through is always safe.
+
+    A plan with corpus evidence is a static plan (the supplement already mixes live records into
+    one), and a plan with only live evidence is a live plan, so the pinned-plan contract is
+    unchanged by routing.
+    """
+    plan = route_lookups(
+        question, lambda system, prompt: services.route(system=system, question=prompt)
+    )
+    if plan is None or (not plan.corpus_search and not plan.live):
+        return None
+
+    records: list[RuntimeEvidence] = []
+    generation_id: str | None = None
+    if plan.corpus_search:
+        generation = services.read_generation(requested)
+        if generation is None or not all(
+            generation.get(flag) is True
+            for flag in ("sealed", "available", "ingested", "retrievable")
+        ):
+            return None
+        generation_id = _generation_id(generation)
+        try:
+            retrieved = services.retrieve(
+                knowledge_base_id=knowledge_base_id,
+                generation_id=generation_id,
+                question=question,
+            )
+            records.extend(_evidence(retrieved, generation_id))
+        except Exception:
+            return None
+    for query in plan.live:
+        # Each live lookup fails independently: one unavailable object must not discard the rest.
+        try:
+            record: RuntimeEvidence | None = _live_evidence(services.read_live(query))
+        except Exception:
+            record = None
+        if record is not None:
+            records.append(record)
+    if not records:
+        return None
+    evidence = _bounded_evidence(tuple(records))
+    if plan.corpus_search:
+        return evidence, generation_id, knowledge_base_id, "static"
+    return evidence, None, None, "live"
 
 
 def _supplementary_live_evidence(
@@ -2019,6 +2091,23 @@ class AwsRuntimeServices:
         blocks = response.get("output", {}).get("message", {}).get("content", [])
         text = "".join(block.get("text", "") for block in blocks if isinstance(block, Mapping))
         return BedrockTextResponse(text, response.get("stopReason"))
+
+    def route(self, *, system: str, question: str) -> str:
+        # Same qualified model as the answer turn, so the router's judgement is the judgement
+        # that was qualified. Small output bound: a lookup plan is a few dozen tokens, and a
+        # reply that runs longer than that is not a lookup plan.
+        response = (
+            self._boto3()
+            .client("bedrock-runtime")
+            .converse(
+                modelId=self._model_id,
+                system=[{"text": system}],
+                messages=[{"role": "user", "content": [{"text": question}]}],
+                inferenceConfig={"maxTokens": 300},
+            )
+        )
+        blocks = response.get("output", {}).get("message", {}).get("content", [])
+        return "".join(block.get("text", "") for block in blocks if isinstance(block, Mapping))
 
 
 def _aws_error_code(error: Exception) -> str | None:

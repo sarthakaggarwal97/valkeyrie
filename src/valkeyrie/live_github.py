@@ -47,6 +47,19 @@ class LatestReleaseQuery:
 
 
 @dataclass(frozen=True)
+class ReleaseListQuery:
+    """The most recent releases INCLUDING prereleases.
+
+    /releases/latest omits prereleases, so a question about a release candidate answered from it
+    is answered wrongly: with 9.2.0-rc1 published, that endpoint still reports 9.1.2. The list
+    endpoint is the only one that can say whether an rc exists.
+    """
+
+    repository: str
+    per_page: int = 8
+
+
+@dataclass(frozen=True)
 class WorkflowRunQuery:
     repository: str
     run_id: int
@@ -68,6 +81,7 @@ LiveGitHubQuery: TypeAlias = (
     | IssueQuery
     | IssueSearchQuery
     | LatestReleaseQuery
+    | ReleaseListQuery
     | WorkflowRunQuery
     | CheckRunQuery
     | ProjectQuery
@@ -144,6 +158,7 @@ MAX_ENTITY_ID: Final = 2**63 - 1
 MAX_TAG_BYTES: Final = 255
 MIN_SEARCH_TERMS: Final = 2
 MAX_SEARCH_TERMS: Final = 8
+MAX_RELEASE_LIST: Final = 20
 MAX_SEARCH_TERM_BYTES: Final = 64
 MAX_SEARCH_BODY_BYTES: Final = 16 * 1024
 MAX_SEARCH_PER_PAGE: Final = 20
@@ -582,6 +597,13 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         repository = _repository(query.repository)
         url = f"{_API_ROOT}/repos/{OWNER}/{repository}/releases/latest"
         return url, "release", lambda value: _release(value, repository)
+    if isinstance(query, ReleaseListQuery):
+        repository = _repository(query.repository)
+        per_page = query.per_page
+        if type(per_page) is not int or not 1 <= per_page <= MAX_RELEASE_LIST:
+            raise LiveGitHubError("release list page size is outside its bound")
+        url = f"{_API_ROOT}/repos/{OWNER}/{repository}/releases?per_page={per_page}"
+        return url, "release", lambda value: _release_list(value, repository, per_page)
     if isinstance(query, WorkflowRunQuery):
         repository = _repository(query.repository)
         run_id = _entity_id(query.run_id, "workflow run ID")
@@ -845,6 +867,25 @@ def _release(value: Mapping[str, object], repository: str) -> dict[str, object]:
     }
 
 
+def _release_list(value: Mapping[str, object], repository: str, per_page: int) -> dict[str, object]:
+    # The endpoint returns a bare JSON array. The transport requires an object, and that contract
+    # is worth keeping, so the array is wrapped under "items" before it arrives here (see
+    # _response_object). Each element is validated exactly as a single release is.
+    items = _list(value, "items")
+    if len(items) > per_page:
+        raise LiveGitHubError("GitHub release list exceeds the requested page bound")
+    releases = [_release(_object(item, "release list item"), repository) for item in items]
+    return {
+        "api_version": _API_VERSION,
+        "kind": "release_list",
+        "repository": repository,
+        "per_page": per_page,
+        # Newest first, as GitHub orders them, and prereleases included: that is the point.
+        "releases": releases,
+        "url": f"{_WEB_ROOT}/{OWNER}/{repository}/releases",
+    }
+
+
 def _workflow_run(value: Mapping[str, object], repository: str, run_id: int) -> dict[str, object]:
     api_url = f"{_API_ROOT}/repos/{OWNER}/{repository}/actions/runs/{run_id}"
     web_url = f"{_WEB_ROOT}/{OWNER}/{repository}/actions/runs/{run_id}"
@@ -1023,6 +1064,13 @@ def _response_object(response: object, *, source: str) -> Mapping[str, object]:
         )
     except (UnicodeDecodeError, json.JSONDecodeError, _StrictJsonError) as error:
         raise LiveGitHubError(f"{source} response is not strict JSON") from error
+    if type(value) is list:
+        # A list endpoint (releases) returns a bare array. Wrapping it keeps one response
+        # contract for every normalizer instead of two, and bounds the element count here so an
+        # unexpectedly large page is refused before any element is parsed.
+        if len(value) > MAX_RELEASE_LIST:
+            raise LiveGitHubError(f"{source} response array exceeds its bound")
+        return {"items": value}
     return _object(value, f"{source} response")
 
 
