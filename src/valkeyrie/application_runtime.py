@@ -744,17 +744,7 @@ def _execute_plan(
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
         outcome, claims, citations, message = _accept_output(normalized.response_text, evidence)
     except (ApplicationRuntimeError, BedrockResponseError, DraftingError):
-        if not services.complete_request(
-            request_id=request_id,
-            revision=revision,
-            fence=fence,
-            outcome="error",
-            completed_at=terminal_at,
-        ):
-            return RuntimeResult(
-                "partial", request_id, "Request completion could not be confirmed."
-            )
-        return RuntimeResult(
+        failed = RuntimeResult(
             "error",
             request_id,
             "I couldn’t produce a reliable answer. Please try again.",
@@ -762,6 +752,20 @@ def _execute_plan(
             request_revision=revision + 1,
             request_fence=fence,
         )
+        if not services.complete_request(
+            request_id=request_id,
+            revision=revision,
+            fence=fence,
+            outcome="error",
+            completed_at=terminal_at,
+            # Recorded like a success so a redelivery replays this message instead of hitting
+            # "already terminal", which surfaced to the asker as a lifecycle error.
+            result=_replayable_result(failed),
+        ):
+            return RuntimeResult(
+                "partial", request_id, "Request completion could not be confirmed."
+            )
+        return failed
     if outcome == "abstention":
         # Applied here, at the single point where a parsed model outcome becomes a result,
         # rather than at each return site. The model writes its own reason, so wrapping the
@@ -1048,7 +1052,21 @@ def _evidence(
 ) -> tuple[RuntimeEvidence, ...]:
     if len(values) > _MAX_EVIDENCE:
         raise ApplicationRuntimeError("retrieval returned too many evidence records")
-    result = tuple(_parse_evidence(value, generation_id=generation_id) for value in values)
+    parsed = tuple(_parse_evidence(value, generation_id=generation_id) for value in values)
+    # Two hierarchical parents of one document can carry byte-identical text (a repeated
+    # header, a licence block), and without a Bedrock chunk id their identity is that text, so
+    # they collide by construction. They are the same evidence; keep the first. A duplicated id
+    # between records whose text DIFFERS is still refused below, as it should be.
+    seen: set[str] = set()
+    kept: list[RuntimeEvidence] = []
+    for item in parsed:
+        if item.evidence_id in seen and any(
+            prior.evidence_id == item.evidence_id and prior.text == item.text for prior in kept
+        ):
+            continue
+        seen.add(item.evidence_id)
+        kept.append(item)
+    result = tuple(kept)
     if sum(len(item.text.encode("utf-8")) for item in result) > _MAX_EVIDENCE_BYTES:
         raise ApplicationRuntimeError("retrieval evidence exceeds its byte bound")
     ids = [item.evidence_id for item in result]

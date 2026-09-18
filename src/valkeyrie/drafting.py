@@ -171,9 +171,25 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
         # "I couldn't produce a reliable answer" for a question with a known answer.
         "a completed project-state write",
         re.compile(
-            r"\b(?:i|we)\s+(?:have\s+|just\s+|already\s+)?"
+            # Subject, then any run of auxiliaries and adverbs (have, 've, did, just, already,
+            # successfully, now...), then the action. Review showed "I've merged it", "I
+            # successfully deployed it" and "We did publish the release" all slipping past a
+            # fixed list of intervening words, so the gap is a bounded run of any short words.
+            # The intervening words may not include a negation, a modal, or a recommending verb:
+            # "I cannot merge", "we could merge", "I think it was merged", "we recommend you
+            # merge" are not claims of having acted, and the assistant must be free to say them.
+            r"\b(?:i|we)(?:'ve|'d)?"
+            r"(?:\s+(?!(?:can|cannot|can't|could|couldn't|would|wouldn't|should|shouldn't|may|"
+            r"might|must|will|won't|do|don't|not|never|think|believe|recommend|suggest|hope|"
+            r"cannot)\b)[a-z]{2,12}){0,3}\s+"
             r"(?:merged|pushed|committed|deployed|released|tagged|published|closed|created)\b"
-            r"|\b(?:i|we)\s+(?:have\s+|just\s+)?(?:completed|finished)\s+the\s+"
+            # Emphatic past: "we did publish the release". "did" followed directly by the bare
+            # verb is a claim of having acted; "did not" is excluded by the negation above being
+            # required to sit between them.
+            r"|\b(?:i|we)\s+did\s+(?:just\s+|already\s+|successfully\s+)?"
+            r"(?:merge|push|commit|deploy|release|tag|publish|close|create)\b"
+            r"|\b(?:i|we)(?:'ve)?(?:\s+(?!(?:can|cannot|could|would|should|not|never)\b)"
+            r"[a-z]{2,12}){0,3}\s+(?:completed|finished)\s+the\s+"
             r"(?:deployment|merge|release|rollout|commit|push|publication|tag)\b",
             re.IGNORECASE,
         ),

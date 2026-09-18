@@ -67,7 +67,7 @@ GITHUB_TOKEN_SECRET_ID: Final = "valkeyrie/development/github-read-token"
 KNOWLEDGE_STACK_NAME: Final = "valkeyrie-development-knowledge-plane"
 KNOWLEDGE_BASE_ID: Final = "ONVASJDDNX"
 D01_TEMPLATE_SHA256: Final = (
-    "sha256:3ce442875519a7c79673767287a86c928a211ca9e9ce74959c8aac34c9beffd1"
+    "sha256:75bff0ceecf4324255d997b88c6a5efde4ad77c7b1e724ea8af6fde9614754b0"
 )
 
 
@@ -771,10 +771,33 @@ def _runtime_statements(stack: Stack, artifact: ApplicationArtifact) -> list[dic
             "Resource": kb,
         },
         {
-            "Sid": "ReadAndConditionallyAuditRequests",
+            # Reads: the active pointer and the version pointers, the generation record they
+            # name, structured records under it, and the request's own audit row.
+            "Sid": "ReadCorpusPointersAndOwnRequests",
             "Effect": "Allow",
-            "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
+            "Action": ["dynamodb:GetItem"],
             "Resource": table,
+            "Condition": {
+                "ForAllValues:StringLike": {
+                    "dynamodb:LeadingKeys": [
+                        "active_generation",
+                        "version#*",
+                        "generation#*",
+                        "structured#*",
+                        "request#*",
+                    ]
+                }
+            },
+        },
+        {
+            # Writes: request audit rows only. The same table holds the corpus lifecycle and
+            # protected approvals, and an answering runtime has no reason to move an active
+            # pointer or record an approval; before this split it could have.
+            "Sid": "ConditionallyAuditOwnRequests",
+            "Effect": "Allow",
+            "Action": ["dynamodb:PutItem", "dynamodb:UpdateItem"],
+            "Resource": table,
+            "Condition": {"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["request#*"]}},
         },
         {
             "Sid": "ReadFailClosedRuntimeControls",

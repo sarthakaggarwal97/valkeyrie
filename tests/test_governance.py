@@ -149,5 +149,9 @@ def test_remote_governance_is_explicitly_proposed_not_applied() -> None:
     assert "Reviewed local proposal; no remote setting is created or changed" in normalized
     assert "`application`" in governance
     assert "`corpus`" in governance
-    assert "not configured or used in Phase 0" in normalized
+    # The corpus environment is live and the document must say so; the application environment
+    # is still reserved. The separation invariant is unchanged by either.
+    assert "`corpus`" in governance and "Configured and in use" in normalized
+    assert "`application`" in governance and "not configured or used" in normalized
+    assert "repo:sarthakaggarwal97/valkeyrie:environment:corpus" in normalized
     assert "one workflow or role must never combine both responsibilities" in normalized

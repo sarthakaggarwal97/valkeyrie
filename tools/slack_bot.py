@@ -157,9 +157,15 @@ def _turns_before(
         text = re.sub(r"<@[A-Z0-9]+>", "", message.get("text") or "").strip()
         if not text:
             continue
-        role = (
-            "assistant" if message.get("user") == bot_user_id or message.get("bot_id") else "user"
-        )
+        # Only THIS bot's messages are assistant turns. Another bot in the thread is neither the
+        # asker nor us; treating every bot_id as ours would let it speak as the assistant and
+        # steer how the next follow-up is read.
+        if message.get("user") == bot_user_id:
+            role = "assistant"
+        elif message.get("bot_id"):
+            continue
+        else:
+            role = "user"
         if role == "assistant":
             # Keep the claims, drop the Sources block: links are not conversation.
             text = text.split("\n\n*Sources*", 1)[0].strip()

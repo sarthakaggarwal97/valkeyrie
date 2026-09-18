@@ -404,6 +404,13 @@ def _unusable_reason(content: bytes) -> str | None:
     return None
 
 
+def _blob_object_id(content: bytes) -> str:
+    """The SHA-1 Git assigns a blob: sha1(b"blob <size>\\0" + content)."""
+    return hashlib.sha1(  # noqa: S324 - Git's object identity is defined as SHA-1
+        b"blob " + str(len(content)).encode("ascii") + b"\0" + content, usedforsecurity=False
+    ).hexdigest()
+
+
 def _parse_batch(
     document: bytes,
     expected: tuple[tuple[str, str, int], ...],
@@ -432,12 +439,19 @@ def _parse_batch(
         ):
             raise GitAcquisitionError(f"Git batch content conflicts for {path!r}")
         content = document[start:end]
+        # Git echoes the id it was ASKED for and returns whatever bytes the object store holds
+        # under it. A corrupted or tampered loose object therefore yields substituted content
+        # while every header field still matches, which review reproduced. Recomputing the blob
+        # id from the bytes is the only check that ties content to the locked commit.
+        if _blob_object_id(content) != sha:
+            raise GitAcquisitionError(
+                f"Git object content does not hash to its id for {path!r}; the cache is corrupt"
+            )
         if b"\0" in content:
             raise GitAcquisitionError(f"reviewed path {path!r} contains binary NUL content")
-        try:
-            content.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise GitAcquisitionError(f"reviewed path {path!r} is not UTF-8") from error
+        # UTF-8 is not checked here: content that does not decode is classified by
+        # _unusable_reason at acquisition and skipped with its reason, rather than ending the
+        # build for the whole repository over one file.
         contents.append(content)
         offset = end + 1
     if offset != len(document):

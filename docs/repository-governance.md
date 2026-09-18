@@ -35,12 +35,16 @@ not bypass compatibility or boundary tests.
 
 ## Protected environments
 
-Two distinct future environments are reserved but are **not configured or used in Phase 0**:
+Two distinct environments carry distinct responsibilities:
 
 - `application`: application and prompt deployment only; no corpus publication or activation permission.
+  Reserved; **not configured or used** as of 2026-09-18.
 - `corpus`: corpus publication, ingestion, evaluation, and conditional activation only; no application or
-  prompt deployment permission.
+  prompt deployment permission. **Configured and in use** since 2026-09-18: it holds the OIDC role ARN
+  secret and the five corpus resource variables consumed by `.github/workflows/corpus-refresh.yml`, whose
+  role trusts only `repo:sarthakaggarwal97/valkeyrie:environment:corpus`. Approved by the repository
+  owner when the weekly refresh was unblocked.
 
-Creating either environment, assigning reviewers, adding OIDC trust, or storing secrets is a remote
-mutation requiring its later explicit approval gate. Environment separation is a policy invariant; one
+Creating the `application` environment, assigning reviewers, adding OIDC trust, or storing secrets remains
+a remote mutation requiring its own explicit approval. Environment separation is a policy invariant; one
 workflow or role must never combine both responsibilities.

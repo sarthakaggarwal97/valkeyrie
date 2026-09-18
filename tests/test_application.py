@@ -80,7 +80,7 @@ def test_knowledge_plane_remains_exact_deployed_d01(tmp_path: Path) -> None:
     assert "sha256:" + hashlib.sha256(content).hexdigest() == D01_TEMPLATE_SHA256
     assert (
         D01_TEMPLATE_SHA256
-        == "sha256:3ce442875519a7c79673767287a86c928a211ca9e9ce74959c8aac34c9beffd1"
+        == "sha256:75bff0ceecf4324255d997b88c6a5efde4ad77c7b1e724ea8af6fde9614754b0"
     )
     for role_name in ("valkeyrie-development-application-deployer", APPLICATION_RUNTIME_ROLE_NAME):
         role_ids = [
@@ -259,7 +259,8 @@ def test_service_role_and_existing_role_policies_are_exact(tmp_path: Path) -> No
         "InvokeExactOwnerDirectedOpusComparisonRoute",
         "ReadExactGitHubTokenSecret",
         "RetrieveExactKnowledgeBase",
-        "ReadAndConditionallyAuditRequests",
+        "ReadCorpusPointersAndOwnRequests",
+        "ConditionallyAuditOwnRequests",
         "ReadFailClosedRuntimeControls",
         "WriteExactApplicationTelemetry",
     }
@@ -303,10 +304,21 @@ def test_service_role_and_existing_role_policies_are_exact(tmp_path: Path) -> No
         },
         "Sid": "RetrieveExactKnowledgeBase",
     }
-    assert set(runtime["ReadAndConditionallyAuditRequests"]["Action"]) == {
-        "dynamodb:GetItem",
-        "dynamodb:PutItem",
-        "dynamodb:UpdateItem",
+    # Reads and writes are separate statements so the runtime can never move the active pointer
+    # or record an approval: writes are confined to its own request audit rows.
+    reads = runtime["ReadCorpusPointersAndOwnRequests"]
+    assert reads["Action"] == ["dynamodb:GetItem"]
+    assert reads["Condition"]["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == [
+        "active_generation",
+        "version#*",
+        "generation#*",
+        "structured#*",
+        "request#*",
+    ]
+    writes = runtime["ConditionallyAuditOwnRequests"]
+    assert set(writes["Action"]) == {"dynamodb:PutItem", "dynamodb:UpdateItem"}
+    assert writes["Condition"] == {
+        "ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["request#*"]}
     }
     serialized = json.dumps(runtime)
     for prohibited in (

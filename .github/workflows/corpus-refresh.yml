@@ -71,10 +71,55 @@ jobs:
         with:
           role-to-assume: ${{ secrets.CORPUS_REFRESH_ROLE_ARN }}
           aws-region: us-east-1
+          # The release runs 60 to 90 minutes warm and the default session is one hour, so the
+          # credentials would expire mid-ingestion. Three hours covers a cold run with headroom.
+          role-duration-seconds: 10800
+
+      # One timestamp for the whole run. created_at is excluded from the generation id but
+      # written into the immutable manifest, so the build and the release must use the same
+      # value or the release would refuse its own generation as a metadata mismatch.
+      - name: Fix the run's creation timestamp
+        run: echo "CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
       - name: Resolve every reviewed source to an exact commit
         run: |
           uv run python -m infra.build_corpus --root . lock --output "$RUNNER_TEMP/corpus.lock.json"
+
+      # The generation identity is content-addressed over the inputs, so a build here (about a
+      # minute warm) yields the same id the release will publish. That id is what the evaluation
+      # report must be bound to, and the release refuses activation without such a report.
+      - name: Build the generation to learn its identity
+        id: build
+        run: |
+          uv run python -m infra.build_corpus --root . build \
+            --lock "$RUNNER_TEMP/corpus.lock.json" \
+            --cache ~/.cache/valkeyrie-git \
+            --created-at "$CREATED_AT" \
+            --report "$RUNNER_TEMP/build.json" > "$RUNNER_TEMP/build.out"
+          GENERATION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation_id"])' "$RUNNER_TEMP/build.out")
+          echo "generation=$GENERATION" >> "$GITHUB_OUTPUT"
+        env:
+          CREATED_AT: ${{ env.CREATED_AT }}
+
+      - name: Bind the evaluation report to this generation
+        run: |
+          uv run python -m infra.evaluate_generation --root . \
+            --generation-id "${{ steps.build.outputs.generation }}" \
+            --output "$RUNNER_TEMP/evaluation.json" > /dev/null
+
+      # Activation is a compare-and-swap on the active pointer, so the release must be told what
+      # it expects to find there. Reading it here rather than hard-coding it means a refresh that
+      # races another activation fails closed instead of clobbering it.
+      - name: Read the currently active generation
+        id: active
+        run: |
+          ACTIVE=$(aws dynamodb get-item --table-name "$CORPUS_STATE_TABLE" \
+            --key '{"pk":{"S":"active_generation"}}' \
+            --query 'Item.generation_id.S' --output text)
+          if [ -z "$ACTIVE" ] || [ "$ACTIVE" = "None" ]; then ACTIVE=none; fi
+          echo "generation=$ACTIVE" >> "$GITHUB_OUTPUT"
+        env:
+          CORPUS_STATE_TABLE: ${{ vars.CORPUS_STATE_TABLE }}
 
       - name: Publish, ingest, evaluate, and activate
         run: |
@@ -82,15 +127,19 @@ jobs:
             --root . \
             --lock "$RUNNER_TEMP/corpus.lock.json" \
             --cache ~/.cache/valkeyrie-git \
-            --created-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --created-at "$CREATED_AT" \
             --account-id "$CORPUS_ACCOUNT_ID" \
             --region us-east-1 \
             --bucket "$CORPUS_BUCKET" \
             --state-table "$CORPUS_STATE_TABLE" \
             --knowledge-base-id "$CORPUS_KNOWLEDGE_BASE_ID" \
             --data-source-id "$CORPUS_DATA_SOURCE_ID" \
-            --owner "corpus-refresh-${GITHUB_RUN_ID}"
+            --owner "corpus-refresh-${GITHUB_RUN_ID}" \
+            --evaluation-report "$RUNNER_TEMP/evaluation.json" \
+            --expected-active-generation "${{ steps.active.outputs.generation }}" \
+            --activated-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         env:
+          CREATED_AT: ${{ env.CREATED_AT }}
           CORPUS_ACCOUNT_ID: ${{ vars.CORPUS_ACCOUNT_ID }}
           CORPUS_BUCKET: ${{ vars.CORPUS_BUCKET }}
           CORPUS_STATE_TABLE: ${{ vars.CORPUS_STATE_TABLE }}

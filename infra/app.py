@@ -191,7 +191,9 @@ class KnowledgePlaneStack(Stack):
             role_name=f"{self.namespace}-corpus-publisher",
             description="Protected conditional write-once corpus publication identity",
             assumed_by=github_environment(CORPUS_ENVIRONMENT),
-            max_session_duration=Duration.hours(1),
+            # A refresh runs 60 to 90 minutes warm and longer cold, in one assumed session that
+            # configure-aws-credentials does not renew. One hour expired mid-ingestion.
+            max_session_duration=Duration.hours(3),
         )
         iam.Role(
             self,
@@ -289,8 +291,27 @@ class KnowledgePlaneStack(Stack):
             iam.PolicyStatement(
                 sid="ConditionalGenerationLifecycle",
                 # No DeleteItem: lifecycle rows are the audit trail of what was published.
-                actions=["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
+                # TransactWriteItems is the activation compare-and-swap: a condition check on the
+                # candidate and a put of the active pointer in one transaction. Without it every
+                # refresh would ingest for an hour and then fail at the final write.
+                actions=[
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem",
+                    "dynamodb:TransactWriteItems",
+                ],
                 resources=[state_table.attr_arn],
+                # Scoped to the corpus-owned key families. The same table also holds request
+                # audits and protected approvals, which the publisher has no reason to touch.
+                conditions={
+                    "ForAllValues:StringLike": {
+                        "dynamodb:LeadingKeys": [
+                            "generation#*",
+                            "candidate_generation",
+                            "active_generation",
+                        ]
+                    }
+                },
             )
         )
         publisher.add_to_policy(

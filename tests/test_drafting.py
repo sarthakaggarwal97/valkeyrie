@@ -694,6 +694,12 @@ def test_accepted_output_is_immutable(
         "9.2.0-rc1 was published on 2026-09-16 as a prerelease.",
         "The tag was created by the release workflow.",
         "Issue 4413 was closed as completed.",
+        # A disclaimer, a modal, a negation, or a recommendation is not a claim of having acted,
+        # and the assistant must be free to say each of them.
+        "I cannot merge anything; I can only report what the repository shows.",
+        "I could not find when it was merged.",
+        "We recommend you merge it after review.",
+        "We did not merge it.",
     ],
 )
 def test_reporting_a_fact_about_project_state_is_not_claiming_to_have_written_it(
@@ -722,6 +728,11 @@ def test_reporting_a_fact_about_project_state_is_not_claiming_to_have_written_it
         "We already tagged it.",
         "I have completed the merge.",
         "we finished the deployment",
+        # Review reproduced these slipping past a fixed list of intervening words.
+        "I've merged it.",
+        "I successfully deployed it.",
+        "We did publish the release.",
+        "I'd already pushed the fix.",
     ],
 )
 def test_first_person_action_claims_remain_refused(

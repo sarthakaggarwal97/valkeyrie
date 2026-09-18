@@ -19,6 +19,7 @@ from valkeyrie.application_runtime import (
     StaticRuntimeEvidence,
     _bedrock_retrieval_text,
     _bounded_evidence,
+    _evidence,
     _evidence_value,
     _live_evidence,
     _normalize_dynamodb_mapping,
@@ -2093,3 +2094,49 @@ def test_conversation_is_optional_and_bounded_at_the_event_boundary(
             _event(conversation=bad), FakeServices(), root=ROOT, manifest=manifest
         )
         assert refused["outcome"] == "error", bad
+
+
+def test_identical_parent_chunks_are_one_record_and_differing_collisions_still_refused() -> None:
+    """Byte-identical parents are the same evidence; a real id collision is still an error."""
+    base = {
+        "generation_id": GENERATION,
+        "document_id": "sha256:" + "d" * 64,
+        "repository": "valkey",
+        "path": "README.md",
+        "commit": "c" * 40,
+        "authority": "canonical",
+        "version_scope": "none",
+        "content_digest": "sha256:" + "e" * 64,
+        "content_type": "text/markdown",
+    }
+    same = "Licensed under the BSD 3-clause licence."
+    twins = tuple(
+        {"text": same, "metadata": _runtime_retrieval_metadata(dict(base), same)} for _ in range(2)
+    )
+    assert len(_evidence(twins, GENERATION)) == 1
+
+    # Same forced id, different text: that is corrupted provenance, not a duplicate, so refuse.
+    forged = _runtime_retrieval_metadata(dict(base), same)
+    with pytest.raises(ApplicationRuntimeError, match="duplicated"):
+        _evidence(
+            ({"text": same, "metadata": forged}, {"text": "different", "metadata": forged}),
+            GENERATION,
+        )
+
+
+def test_a_failed_answer_is_replayable_on_redelivery(manifest: dict[str, object]) -> None:
+    """A redelivery after a model failure must return the same error message, not a lifecycle
+    error about the request already being terminal."""
+    services = FakeServices()
+    services.output = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": "answer",
+        "claims": [{"claim_id": "c", "text": "x", "evidence_ids": ["ev_missing"]}],
+    }
+    first = run_runtime_event(_event(), services, root=ROOT, manifest=manifest)
+    assert first["outcome"] == "error"
+    second = run_runtime_event(_event(), services, root=ROOT, manifest=manifest)
+    assert second["outcome"] == "error"
+    assert second["message"] == first["message"]
+    assert len(services.model_calls) == 1

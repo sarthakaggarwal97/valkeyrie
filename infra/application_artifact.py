@@ -354,6 +354,11 @@ def verify_application_artifact(
                     or item.get("sha256") != _sha256(value)
                 ):
                     raise ApplicationArtifactError("application file content was tampered")
+                # The ABI is checked on the ARCHIVED bytes. The build checks what it copies from
+                # its own host, but a verifier on another machine must judge the artifact in
+                # front of it: review showed a self-consistent archive holding a Mach-O extension
+                # (digest and size correct) passing this function and failing at Lambda import.
+                _assert_target_abi(manifest_path, value)
                 observed_paths.add(manifest_path)
                 file_bytes[manifest_path] = value
             if observed_paths != required_paths:

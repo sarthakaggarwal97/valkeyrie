@@ -190,3 +190,19 @@ def test_conversation_is_bounded_and_oversize_history_degrades_to_none() -> None
     plan = route_lookups("what is AOF", converse, (ConversationTurn("user", "x" * 5000),))
     assert plan is not None and plan.corpus_search
     assert seen["prompt"] == "what is AOF"
+
+
+def test_the_aggregate_conversation_byte_bound_is_enforced_not_just_the_per_turn_one() -> None:
+    """Six turns that each pass the per-turn cap can still exceed the whole-history cap."""
+    from valkeyrie.lookup_router import (
+        MAX_CONVERSATION_BYTES,
+        MAX_TURN_BYTES,
+        ConversationTurn,
+        validate_conversation,
+    )
+
+    per_turn = MAX_TURN_BYTES - 10
+    turns = tuple(ConversationTurn("user", "x" * per_turn) for _ in range(6))
+    assert 6 * per_turn > MAX_CONVERSATION_BYTES  # the case this test exists for
+    with pytest.raises(LookupRouterError, match="conversation exceeds its byte bound"):
+        validate_conversation(turns)

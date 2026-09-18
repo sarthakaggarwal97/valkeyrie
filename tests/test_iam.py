@@ -120,7 +120,10 @@ def test_identity_registry_is_exact_separate_and_bounded(tmp_path: Path) -> None
             "RoleName",
         }
         assert role["Description"] == expected_descriptions[role_name]
-        assert role["MaxSessionDuration"] == 3600
+        # The publisher alone runs a 60-to-90-minute unattended refresh in a single assumed
+        # session, so it is the one role allowed a longer window. Everything else stays at an hour.
+        expected_session = 10800 if role_name == "valkeyrie-development-corpus-publisher" else 3600
+        assert role["MaxSessionDuration"] == expected_session
         assert "ManagedPolicyArns" not in role
         assert "PermissionsBoundary" not in role
 
@@ -266,6 +269,7 @@ def test_publisher_holds_exactly_publication_and_refresh_permission(
         "dynamodb:GetItem",
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
+        "dynamodb:TransactWriteItems",
         "bedrock:StartIngestionJob",
         "bedrock:GetIngestionJob",
         "bedrock:Retrieve",
@@ -624,8 +628,16 @@ def test_publisher_refresh_permission_is_scoped_and_cannot_delete(tmp_path: Path
         "dynamodb:GetItem",
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
+        "dynamodb:TransactWriteItems",
     ]
     assert lifecycle["Resource"] == {"Fn::GetAtt": ["StateTable", "Arn"]}
+    # The table also holds request audits and protected approvals; the publisher is confined to
+    # the corpus-owned key families.
+    assert lifecycle["Condition"] == {
+        "ForAllValues:StringLike": {
+            "dynamodb:LeadingKeys": ["generation#*", "candidate_generation", "active_generation"]
+        }
+    }
 
     ingest = statements["IngestExactKnowledgeBase"]
     assert ingest["Action"] == ["bedrock:StartIngestionJob", "bedrock:GetIngestionJob"]
