@@ -684,7 +684,9 @@ def test_varied_safe_bounded_abstention_reasons_pass(reason: str, tmp_path: Path
         "The canonical source is authoritative.",
         "The release can ship now.",
         "See github.com/valkey-io/valkey for details.",
-        "Deployment completed successfully.",
+        # First person: the assistant claiming it acted. A passive report of project state
+        # ("the fix was merged") is a fact the live route exists to deliver, and is accepted.
+        "We deployed it successfully.",
     ],
 )
 def test_abstention_text_screen_still_rejects_prohibited_categories(

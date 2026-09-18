@@ -162,14 +162,19 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
         ),
     ),
     (
+        # This guards against the assistant claiming to have ACTED: "I merged it", "we deployed".
+        # It deliberately does not match the passive voice. "The pull request was merged on
+        # 2026-09-15" is a fact about GitHub reported from a live observation, and reporting that
+        # fact is the live route's whole purpose. The earlier pattern forbade every passive form,
+        # so a correct, evidence-backed answer about a merged pull request or a published release
+        # was rejected as though the assistant had performed the merge itself, and the asker saw
+        # "I couldn't produce a reliable answer" for a question with a known answer.
         "a completed project-state write",
         re.compile(
-            r"\b(?:i|we)\s+(?:have\s+|just\s+)?"
+            r"\b(?:i|we)\s+(?:have\s+|just\s+|already\s+)?"
             r"(?:merged|pushed|committed|deployed|released|tagged|published|closed|created)\b"
-            r"|\b(?:was|were|has\s+been|have\s+been|got)\s+"
-            r"(?:merged|pushed|committed|deployed|released|tagged|published|closed|created)\b"
-            r"|\b(?:deployment|merge|release|rollout|commit|push|publication|tag)\s+"
-            r"(?:completed|finished|succeeded)\b",
+            r"|\b(?:i|we)\s+(?:have\s+|just\s+)?(?:completed|finished)\s+the\s+"
+            r"(?:deployment|merge|release|rollout|commit|push|publication|tag)\b",
             re.IGNORECASE,
         ),
     ),

@@ -537,8 +537,8 @@ def test_prohibited_model_authored_text_fails_closed(
 @pytest.mark.parametrize(
     "text",
     [
-        "Deployment completed successfully.",
-        "The fix was merged.",
+        "We deployed it successfully.",
+        "I merged the fix.",
         "This release can ship now.",
         "It is safe to release.",
         "github.com/valkey-io/valkey",
@@ -684,3 +684,51 @@ def test_accepted_output_is_immutable(
     assert isinstance(accepted, DraftedAnswer)
     with pytest.raises(AttributeError):
         cast(object, accepted).claims = ()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The pull request was merged on 2026-09-15.",
+        "Pull request 3853 is closed and has been merged.",
+        "9.2.0-rc1 was published on 2026-09-16 as a prerelease.",
+        "The tag was created by the release workflow.",
+        "Issue 4413 was closed as completed.",
+    ],
+)
+def test_reporting_a_fact_about_project_state_is_not_claiming_to_have_written_it(
+    text: str,
+    bundle: GenerationBundle,
+    package: EvidencePackage,
+) -> None:
+    """The guard stops the assistant claiming it acted; it must not stop it reporting.
+
+    "I merged it" is a fabricated action and is refused. "It was merged on the 15th" is a fact from
+    a live observation, and reporting it is the live route's purpose. The earlier pattern forbade
+    every passive form, so correct answers about merged pull requests and published releases were
+    rejected and the asker told no reliable answer existed.
+    """
+    value = _answer(_claim("a-claim", [package.records[0].evidence_id], text))
+    accepted = accept_model_output(value, bundle, package)
+    assert accepted is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I merged it.",
+        "We have deployed the fix.",
+        "I just released 9.2.",
+        "We already tagged it.",
+        "I have completed the merge.",
+        "we finished the deployment",
+    ],
+)
+def test_first_person_action_claims_remain_refused(
+    text: str,
+    bundle: GenerationBundle,
+    package: EvidencePackage,
+) -> None:
+    value = _answer(_claim("a-claim", [package.records[0].evidence_id], text))
+    with pytest.raises(DraftingError, match="completed project-state write"):
+        accept_model_output(value, bundle, package)
