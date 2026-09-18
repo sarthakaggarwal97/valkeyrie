@@ -21,9 +21,10 @@ from valkeyrie.generation import (
     GenerationLimits,
     canonical_generation_preimage,
     create_generation_bundle,
+    is_ingestible_document,
     verify_generation_bundle,
 )
-from valkeyrie.normalization import NormalizedDocument, normalize_repository
+from valkeyrie.normalization import ContentType, NormalizedDocument, normalize_repository
 from valkeyrie.retrieval_config import FrozenRetrievalConfiguration, load_retrieval_config
 from valkeyrie.revisions import Authority, ResolvedRevision
 from valkeyrie.sources import load_source_inventory
@@ -915,3 +916,101 @@ def test_generation_module_is_pure_local_and_has_no_network_or_filesystem_writes
         "write_bytes",
     ):
         assert prohibited not in source
+
+
+def test_documents_the_knowledge_base_cannot_parse_are_never_published(
+    retrieval_config: FrozenRetrievalConfiguration,
+) -> None:
+    """A document Bedrock refuses must not reach the corpus, or no corpus can be activated.
+
+    Bedrock classifies content starting with a shebang as an executable and refuses it whatever the
+    key suffix says: its words for all 54 such documents in the published corpus were "Ignored 1
+    files as their file format was not supported". Ingestion then treats any failed document as
+    fatal and marks the candidate non-retryable, so a single unparseable script blocked every
+    corpus refresh, which is what froze the corpus from 2026-09-11.
+
+    Normalization still classifies these files as code, deliberately. The exclusion belongs where
+    the published set and its identity are decided together.
+    """
+    inventory = _inventory()
+    source = _source(inventory, commit=COMMIT)
+    files = (
+        AcquiredFile("README.md", b"Valkey documentation\n"),
+        AcquiredFile("src/server.c", b"int processCommand(void) { return 1; }\n"),
+        AcquiredFile("runtest-cluster", b'#!/bin/sh\nexec ./runtest --cluster "$@"\n'),
+    )
+    acquired = AcquiredRepository(
+        repository="valkey",
+        commit=COMMIT,
+        files=files,
+        total_bytes=sum(len(item.content) for item in files),
+    )
+    documents = normalize_repository(inventory, source, acquired)
+
+    # Normalization keeps it: what the file is has not changed, only whether it can be indexed.
+    assert len(documents) == 3
+    script = next(document for document in documents if document.path == "runtest-cluster")
+    assert not is_ingestible_document(script)
+
+    bundle = create_generation_bundle(
+        SOURCES.read_bytes(), documents, (), retrieval_config, created_at=CREATED_AT
+    )
+
+    manifest = json.loads(bundle.manifest.content)
+    assert len(manifest["documents"]) == 2
+    # Neither the body nor its metadata sidecar is published, so ingestion never sees it.
+    assert script.document_id not in {entry["document_id"] for entry in manifest["documents"]}
+    published = {obj.object_key for obj in bundle.documents}
+    # Other code documents still publish as .txt; it is this document that must be absent.
+    excluded = script.document_id.removeprefix("sha256:")
+    assert not any(excluded in key for key in published)
+    assert len(published) == 2
+
+    # Identity is derived over the published set, so the manifest and the preimage agree.
+    kept = tuple(document for document in documents if is_ingestible_document(document))
+    assert bundle.generation_id == _digest(
+        canonical_generation_preimage(SOURCES.read_bytes(), kept, (), retrieval_config)
+    )
+
+
+def test_only_an_interpreter_path_marks_content_unparseable() -> None:
+    """ "#!" alone is not a shebang, and treating it as one silently drops working documents.
+
+    Measured against the 54 documents Bedrock actually refused: matching the two bytes alone
+    excluded 62, and seven of the extra index correctly because "#!" also opens a Rust inner
+    attribute and a Valkey function library header. Requiring an interpreter path leaves exactly one
+    over-exclusion, a Perl test script that is a genuine shebang Bedrock happened to accept, which
+    is preferable to depending on that inconsistency.
+    """
+
+    def document(content: str, content_type: ContentType = "text/code") -> NormalizedDocument:
+        return NormalizedDocument(
+            source=_source(_inventory(), commit=COMMIT),
+            path="probe",
+            content_type=content_type,
+            content=content,
+            content_digest=_digest(content.encode()),
+            document_id=_digest(content.encode()),
+        )
+
+    # Genuine shebangs: an interpreter path follows, and Bedrock refuses these.
+    for unparseable in (
+        "#!/bin/sh\necho hi\n",
+        "#!/usr/bin/env python3\nprint(1)\n",
+        "#!/usr/bin/perl\nprint 1;\n",
+        "#! /bin/bash\necho hi\n",
+    ):
+        assert not is_ingestible_document(document(unparseable)), unparseable
+
+    # Not shebangs, and every one of these indexes correctly today.
+    for parseable in (
+        "#![allow(non_upper_case_globals)]\npub struct X;\n",
+        "#!js api_version=1.0 name=lib\nfunction f() {}\n",
+        "#include <stdio.h>\n",
+        "# heading\ntext\n",
+        "#!\n",
+    ):
+        assert is_ingestible_document(document(parseable)), parseable
+
+    # A shebang later in the file is ordinary text, not a declaration about the file.
+    assert is_ingestible_document(document("Run this:\n\n#!/bin/sh\n"))

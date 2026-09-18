@@ -257,6 +257,30 @@ def verify_generation_bundle(
     return expected
 
 
+def is_ingestible_document(document: NormalizedDocument) -> bool:
+    """Report whether the knowledge base can parse this document.
+
+    Bedrock classifies content beginning with a shebang as an executable script and refuses it
+    whatever the object key suffix says. Its own words for each of the 54 such documents in the
+    published corpus were "Ignored 1 files as their file format was not supported", and every one
+    of them is a shell or Python script whose first two bytes are these.
+
+    A document the knowledge base refuses cannot be retrieved or cited, so publishing it buys
+    nothing and costs the entire release: ingestion treats any failed document as fatal and marks
+    the candidate non-retryable, which held the corpus frozen from 2026-09-11. Excluding them here,
+    before the preimage is computed, keeps the generation identity, the manifest, and the published
+    objects describing the same set of documents.
+    """
+    first_line = document.content.partition("\n")[0]
+    if not first_line.startswith("#!"):
+        return True
+    # An interpreter path is what makes it a shebang. Requiring one was measured against the 54
+    # documents Bedrock actually refused: matching "#!" alone also excluded seven that index
+    # correctly, because "#!" opens a Rust inner attribute (#![allow(...)]) and a Valkey function
+    # library header (#!js api_version=1.0), neither of which is an executable.
+    return not first_line[2:].lstrip().startswith("/")
+
+
 def _canonical_inputs(
     sources_yaml: bytes,
     documents: tuple[NormalizedDocument, ...],
@@ -271,6 +295,9 @@ def _canonical_inputs(
         raise GenerationError("normalized documents must be an immutable tuple")
     if not isinstance(records, tuple):
         raise GenerationError("structured records must be an immutable tuple")
+    # Applied before the bound and the preimage, so the count that is checked and the identity that
+    # is derived both describe the documents actually published.
+    documents = tuple(document for document in documents if is_ingestible_document(document))
     if not 1 <= len(documents) <= limits.max_documents:
         raise GenerationError("generation document count is outside its bound")
     if len(records) > limits.max_structured_records:
