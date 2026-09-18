@@ -33,10 +33,10 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 FUNCTION = "valkeyrie-development-application"
-# Version 28 is Fable, the model that passed qualification, with a 120s timeout. It carries
+# Version 29 is Fable, the model that passed qualification, with a 120s timeout. It carries
 # the live issue-search fix and the refusals that name a next step, including the model's
 # own abstention reason. Version 8 is Opus, which failed the claim-to-evidence gate at 0.743.
-QUALIFIER = "28"
+QUALIFIER = "29"
 KNOWLEDGE_BASE_ID = "ONVASJDDNX"
 MAX_QUESTION_BYTES = 2048
 # Questions about present project state must route live; everything else answers
