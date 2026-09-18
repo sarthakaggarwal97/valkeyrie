@@ -1969,3 +1969,29 @@ def test_one_failed_live_lookup_does_not_discard_the_others(manifest: dict[str, 
     # The live half failed; the corpus half still produced an answer.
     assert result["outcome"] == "answer"
     assert len(services.retrieve_calls) == 1
+
+
+def test_a_routed_corpus_search_keeps_the_unshipped_feature_supplement(
+    manifest: dict[str, object],
+) -> None:
+    """Routing to the corpus must not lose the safety net the keyword path had.
+
+    The router chooses the primary lookups. The intent-gated supplement remains for a feature the
+    corpus cannot document because it has not shipped. Without it, routing the compression question
+    to the corpus alone regressed it from four grounded claims to an abstention in production.
+    """
+    services = FakeServices()
+    services.router_reply = '{"lookups":[{"kind":"corpus_search"}]}'
+    services.live_observation = _live_observation()
+
+    run_runtime_event(
+        _event(question="How does Valkey replication compression work?"),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+
+    assert len(services.retrieve_calls) == 1
+    # Two supplement searches, one per kind, exactly as the keyword path performs.
+    kinds = [cast(IssueSearchQuery, call).kind for call in services.live_calls]
+    assert kinds == ["pull-request", "issue"]

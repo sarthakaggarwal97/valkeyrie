@@ -906,6 +906,12 @@ def _routed_evidence(
             records.extend(_evidence(retrieved, generation_id))
         except Exception:
             return None
+        # The same intent-gated supplement the keyword path runs. The router chooses the primary
+        # lookups; this remains the safety net for a feature the corpus cannot document because it
+        # has not shipped. Without it, routing to the corpus alone regressed the compression
+        # question from four grounded claims to an abstention.
+        if not plan.live:
+            records.extend(_supplementary_live_evidence(services, question))
     for query in plan.live:
         # Each live lookup fails independently: one unavailable object must not discard the rest.
         try:
