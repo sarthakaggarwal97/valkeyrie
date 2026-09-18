@@ -900,12 +900,33 @@ def test_pull_request_fields_have_strict_types_identity_and_canonical_urls(
         )
 
 
-def test_issue_query_rejects_githubs_pull_request_shape() -> None:
-    value = _issue()
-    value["pull_request"] = {"url": "ignored"}
+def test_an_issue_number_that_names_a_pull_request_is_read_not_refused() -> None:
+    """GitHub shares one number space between issues and pull requests.
 
-    with pytest.raises(LiveGitHubError, match="returned a pull request"):
-        read_live_github(IssueQuery("valkey", 8), fetch=lambda *args: _response(value))
+    Its issues endpoint serves both, so refusing a pull request made "what is the status of issue
+    #3853?" fail outright and report live data as unavailable, when the number does name a real
+    object whose status is known. What it is is stated in the payload so an answer can say pull
+    request rather than calling it an issue, and the canonical URL is the /pull/ one GitHub returns.
+    """
+    value = _issue()
+    value["pull_request"] = {
+        "url": "https://api.github.com/repos/valkey-io/valkey/pulls/8",
+        "merged_at": "2026-09-15T21:15:53Z",
+    }
+    value["html_url"] = "https://github.com/valkey-io/valkey/pull/8"
+
+    observation = read_live_github(IssueQuery("valkey", 8), fetch=lambda *args: _response(value))
+    payload = json.loads(observation.canonical_payload)
+    assert payload["is_pull_request"] is True
+    assert payload["merged_at"] == "2026-09-15T21:15:53Z"
+    assert payload["url"] == "https://github.com/valkey-io/valkey/pull/8"
+
+    # A genuine issue still reports itself as one, with no merge instant.
+    plain = read_live_github(IssueQuery("valkey", 8), fetch=lambda *args: _response(_issue()))
+    plain_payload = json.loads(plain.canonical_payload)
+    assert plain_payload["is_pull_request"] is False
+    assert plain_payload["merged_at"] is None
+    assert plain_payload["url"] == "https://github.com/valkey-io/valkey/issues/8"
 
 
 def test_duplicate_labels_are_rejected_instead_of_ambiguously_normalized() -> None:

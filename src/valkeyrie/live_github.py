@@ -661,10 +661,21 @@ def _pull_request(value: Mapping[str, object], repository: str, number: int) -> 
 
 
 def _issue(value: Mapping[str, object], repository: str, number: int) -> dict[str, object]:
-    if "pull_request" in value:
-        raise LiveGitHubError("issue query returned a pull request")
+    # GitHub shares one number space between issues and pull requests, and its issues endpoint
+    # serves both. Refusing a pull request here meant "what is the status of issue #3853?" failed
+    # outright, reported to the asker as live data being unavailable, when the number does name a
+    # real object whose status is known. What it is is stated in the payload instead of guessed at,
+    # so an answer can say "pull request" rather than calling it an issue.
+    nested = value.get("pull_request")
+    is_pull_request = isinstance(nested, Mapping)
+    merged_at = (
+        _nullable_timestamp(nested, "merged_at")
+        if isinstance(nested, Mapping) and "merged_at" in nested
+        else None
+    )
     api_url = f"{_API_ROOT}/repos/{OWNER}/{repository}/issues/{number}"
-    web_url = f"{_WEB_ROOT}/{OWNER}/{repository}/issues/{number}"
+    leaf = "pull" if is_pull_request else "issues"
+    web_url = f"{_WEB_ROOT}/{OWNER}/{repository}/{leaf}/{number}"
     return {
         "api_version": _API_VERSION,
         "kind": "issue",
@@ -683,6 +694,8 @@ def _issue(value: Mapping[str, object], repository: str, number: int) -> dict[st
         "created_at": _timestamp(value, "created_at"),
         "updated_at": _timestamp(value, "updated_at"),
         "closed_at": _nullable_timestamp(value, "closed_at"),
+        "is_pull_request": is_pull_request,
+        "merged_at": merged_at,
         "api_url": _exact_url(value, "url", api_url),
         "url": _exact_url(value, "html_url", web_url),
     }
