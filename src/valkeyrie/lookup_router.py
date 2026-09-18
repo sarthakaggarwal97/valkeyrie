@@ -50,6 +50,12 @@ _MAX_NUMBER: Final = 10_000_000
 _MAX_LOOKUPS: Final = 4
 _MAX_RESPONSE_BYTES: Final = 4096
 _DEFAULT_REPOSITORY: Final = "valkey"
+# Conversation history bounds. Six turns is three exchanges, which is what a follow-up needs;
+# more would let an old thread crowd out the question being asked now.
+MAX_CONVERSATION_TURNS: Final = 6
+MAX_TURN_BYTES: Final = 2000
+MAX_CONVERSATION_BYTES: Final = 8000
+MAX_RESOLVED_QUESTION_BYTES: Final = 2048
 
 ROUTER_SYSTEM: Final = (
     "You decide which lookups answer a question about the Valkey project. You do not answer the "
@@ -76,7 +82,15 @@ ROUTER_SYSTEM: Final = (
     "- If the question is not about Valkey at all, or is a greeting, reply "
     '{"lookups":[]}.\n'
     "\n"
-    'Reply format exactly: {"lookups":[...]}'
+    "When earlier turns of the conversation are supplied, the question may be a follow-up that "
+    'only makes sense with them ("and what about failover?", "is that merged yet?", '
+    '"how do I configure it"). Rewrite it as one standalone question that names its subject '
+    'explicitly, and return it as "question". Change nothing the asker did not imply; if the '
+    "question already stands alone, return it unchanged. Choose lookups for the standalone "
+    "question, not the fragment.\n"
+    "\n"
+    'Reply format exactly: {"lookups":[...]} or, with conversation, '
+    '{"question":"...","lookups":[...]}'
 )
 
 
@@ -85,33 +99,98 @@ class LookupRouterError(ValueError):
 
 
 @dataclass(frozen=True)
+class ConversationTurn:
+    role: Literal["user", "assistant"]
+    text: str
+
+
+@dataclass(frozen=True)
 class LookupPlan:
-    """The accepted lookups for one question."""
+    """The accepted lookups for one question, and the question they were chosen for.
+
+    ``question`` is the standalone form the model resolved a follow-up into, or None when the
+    question was already standalone. Everything downstream, retrieval, the pinned plan, and the
+    answer turn, uses the resolved question and never sees the history, so grounding is unchanged:
+    the history only decides what the question means, never what may be claimed.
+    """
 
     corpus_search: bool
     live: tuple[LiveGitHubQuery, ...]
+    question: str | None = None
 
 
 Converse = Callable[[str, str], str]
 """(system, question) -> raw model text. Injected so the router owns no transport."""
 
 
-def route_lookups(question: str, converse: Converse) -> LookupPlan | None:
+def route_lookups(
+    question: str,
+    converse: Converse,
+    conversation: Sequence[ConversationTurn] = (),
+) -> LookupPlan | None:
     """Ask the model which lookups the question needs. None means fall back to keywords.
 
-    Returns None rather than raising for every failure, because a routing failure must never
-    remove a capability the keyword path already has.
+    With ``conversation``, the same call also resolves a follow-up into a standalone question,
+    so memory costs no extra model turn. Returns None rather than raising for every failure,
+    because a routing failure must never remove a capability the keyword path already has.
     """
     if not isinstance(question, str) or not question.strip():
         return None
     try:
-        raw = converse(ROUTER_SYSTEM, question)
+        history = validate_conversation(conversation)
+    except LookupRouterError:
+        history = ()
+    try:
+        raw = converse(ROUTER_SYSTEM, _router_prompt(question, history))
     except Exception:
         return None
     try:
-        return parse_lookup_plan(raw)
+        plan = parse_lookup_plan(raw)
     except LookupRouterError:
         return None
+    if not history and plan.question is not None:
+        # Without history there is nothing to resolve; a rewritten question would be the model
+        # changing what was asked, so it is discarded and the original stands.
+        return LookupPlan(plan.corpus_search, plan.live, None)
+    return plan
+
+
+def validate_conversation(conversation: object) -> tuple[ConversationTurn, ...]:
+    """Bound the history: turn count, bytes per turn, bytes in total, and roles."""
+    if not isinstance(conversation, Sequence) or isinstance(conversation, (str, bytes)):
+        raise LookupRouterError("conversation must be a sequence of turns")
+    turns = list(conversation)
+    if len(turns) > MAX_CONVERSATION_TURNS:
+        turns = turns[-MAX_CONVERSATION_TURNS:]
+    total = 0
+    accepted: list[ConversationTurn] = []
+    for turn in turns:
+        if not isinstance(turn, ConversationTurn):
+            raise LookupRouterError("conversation turn has the wrong type")
+        if turn.role not in ("user", "assistant"):
+            raise LookupRouterError("conversation turn role is unsupported")
+        if not isinstance(turn.text, str) or not turn.text.strip():
+            raise LookupRouterError("conversation turn text must be non-blank")
+        size = len(turn.text.encode("utf-8"))
+        if size > MAX_TURN_BYTES:
+            raise LookupRouterError("conversation turn exceeds its byte bound")
+        total += size
+        if total > MAX_CONVERSATION_BYTES:
+            raise LookupRouterError("conversation exceeds its byte bound")
+        accepted.append(turn)
+    return tuple(accepted)
+
+
+def _router_prompt(question: str, history: Sequence[ConversationTurn]) -> str:
+    if not history:
+        return question
+    lines = ["Earlier turns of this conversation, oldest first:"]
+    for turn in history:
+        speaker = "Asker" if turn.role == "user" else "Assistant"
+        lines.append(f"{speaker}: {turn.text}")
+    lines.append("")
+    lines.append(f"Current question: {question}")
+    return "\n".join(lines)
 
 
 def parse_lookup_plan(raw: object) -> LookupPlan:
@@ -131,8 +210,20 @@ def parse_lookup_plan(raw: object) -> LookupPlan:
         value = json.loads(text)
     except json.JSONDecodeError as error:
         raise LookupRouterError("router reply is not JSON") from error
-    if not isinstance(value, Mapping) or set(value) != {"lookups"}:
-        raise LookupRouterError("router reply must be an object with exactly one key, lookups")
+    if not isinstance(value, Mapping) or not {"lookups"} <= set(value) <= {"lookups", "question"}:
+        raise LookupRouterError(
+            "router reply must be an object with lookups and optionally question"
+        )
+    resolved: str | None = None
+    if "question" in value:
+        candidate = value["question"]
+        if not isinstance(candidate, str) or not candidate.strip():
+            raise LookupRouterError("resolved question must be non-blank text")
+        if len(candidate.encode("utf-8")) > MAX_RESOLVED_QUESTION_BYTES:
+            raise LookupRouterError("resolved question exceeds its byte bound")
+        if "\n" in candidate or "\x00" in candidate:
+            raise LookupRouterError("resolved question must be a single line")
+        resolved = candidate.strip()
     lookups = value["lookups"]
     if not isinstance(lookups, Sequence) or isinstance(lookups, str):
         raise LookupRouterError("lookups must be an array")
@@ -166,7 +257,7 @@ def parse_lookup_plan(raw: object) -> LookupPlan:
         elif kind == "releases":
             _only_keys(item, {"kind", "repository"})
             live.append(ReleaseListQuery(repository))
-    return LookupPlan(corpus_search=corpus_search, live=tuple(live))
+    return LookupPlan(corpus_search=corpus_search, live=tuple(live), question=resolved)
 
 
 def _strip_fence(text: str) -> str:

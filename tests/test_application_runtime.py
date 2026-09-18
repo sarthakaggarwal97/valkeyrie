@@ -2028,3 +2028,68 @@ def test_parent_chunks_without_a_bedrock_chunk_id_get_distinct_evidence_ids() ->
         {**base, "x-amz-bedrock-kb-chunk-id": "k1"}, "other"
     )
     assert with_id["evidence_id"] == with_id_other["evidence_id"]
+
+
+def test_a_follow_up_is_answered_as_the_standalone_question_it_resolves_to(
+    manifest: dict[str, object],
+) -> None:
+    """Memory decides what was asked, never what may be claimed.
+
+    "and what about failover?" carries no subject. With the thread's earlier turns the router
+    resolves it to a standalone question, and retrieval, the pinned plan and the answer turn all
+    use that question and never see the history. The audit still keys the request on the fragment
+    the asker typed, so a Slack redelivery of the same mention replays the same answer.
+    """
+    services = FakeServices()
+    services.router_reply = (
+        '{"question":"How does Valkey replication failover work?",'
+        '"lookups":[{"kind":"corpus_search"}]}'
+    )
+    event = _event(
+        question="and what about failover?",
+        conversation=[
+            {"role": "user", "text": "How does Valkey replication work?"},
+            {"role": "assistant", "text": "A replica connects to a primary and streams changes."},
+        ],
+    )
+
+    result = run_runtime_event(dict(event), services, root=ROOT, manifest=manifest)
+
+    assert result["outcome"] == "answer"
+    # The router saw the history; retrieval and the model saw only the resolved question.
+    assert "Asker: How does Valkey replication work?" in services.route_calls[0]
+    assert services.retrieve_calls[0]["question"] == "How does Valkey replication failover work?"
+    assert services.model_calls[0]["question"] == "How does Valkey replication failover work?"
+    plan = cast(dict[str, object], services.requests["req_runtime-1"]["plan"])
+    assert plan["question"] == "How does Valkey replication failover work?"
+
+    # Redelivery of the same mention replays: same request id, same fragment, no second inference.
+    replay = run_runtime_event(dict(event), services, root=ROOT, manifest=manifest)
+    assert replay["claims"] == result["claims"]
+    assert len(services.model_calls) == 1
+
+
+def test_conversation_is_optional_and_bounded_at_the_event_boundary(
+    manifest: dict[str, object],
+) -> None:
+    services = FakeServices()
+    # Absent: exactly today's behaviour, the router prompt is the bare question.
+    services.router_reply = '{"lookups":[{"kind":"corpus_search"}]}'
+    assert (
+        run_runtime_event(_event(), services, root=ROOT, manifest=manifest)["outcome"] == "answer"
+    )
+    assert services.route_calls[0] == _event()["question"]
+
+    # Malformed history is refused at the boundary, not silently accepted.
+    for bad in (
+        "not a list",
+        [{"role": "system", "text": "x"}],
+        [{"role": "user"}],
+        [{"role": "user", "text": "x", "extra": 1}],
+        [{"role": "user", "text": "x" * 3000}],
+        [{"role": "user", "text": "t"}] * 7,
+    ):
+        refused = run_runtime_event(
+            _event(conversation=bad), FakeServices(), root=ROOT, manifest=manifest
+        )
+        assert refused["outcome"] == "error", bad

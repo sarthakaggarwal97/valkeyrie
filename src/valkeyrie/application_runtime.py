@@ -34,7 +34,13 @@ from valkeyrie.live_github import (
     infer_supplementary_search,
     read_live_github,
 )
-from valkeyrie.lookup_router import route_lookups
+from valkeyrie.lookup_router import (
+    MAX_CONVERSATION_BYTES,
+    MAX_CONVERSATION_TURNS,
+    MAX_TURN_BYTES,
+    ConversationTurn,
+    route_lookups,
+)
 from valkeyrie.prompts import load_prompt_package
 from valkeyrie.request_audit import LiveObservation, RequestAuditError, live_observation_value
 from valkeyrie.retrieval import (
@@ -393,8 +399,10 @@ def _answer(
         "completed_at",
         "lease_duration_seconds",
     }
-    if set(event) not in (expected, expected | {"exact_identifier"}):
+    optional = {"exact_identifier", "conversation"}
+    if not expected <= set(event) <= expected | optional:
         raise ApplicationRuntimeError("answer event has an unknown or missing field")
+    conversation = _conversation(event.get("conversation"))
     request_id = cast(str, event["request_id"])
     question = _bounded_text(event["question"], "question", _MAX_QUESTION_BYTES)
     requirement = event["version_requirement"]
@@ -459,10 +467,14 @@ def _answer(
     plan_knowledge_base_id: str | None
     evidence_mode: Literal["static", "live"]
     routed = _routed_evidence(
-        services, question, requested=requested, knowledge_base_id=knowledge_base_id
+        services,
+        question,
+        requested=requested,
+        knowledge_base_id=knowledge_base_id,
+        conversation=conversation,
     )
     if routed is not None:
-        evidence, generation_id, plan_knowledge_base_id, evidence_mode = routed
+        evidence, generation_id, plan_knowledge_base_id, evidence_mode, question = routed
     elif provisional.routes[0] == "live_read":
         try:
             query = infer_live_query(question)
@@ -864,13 +876,39 @@ def _accept_output(
     return "answer", tuple(claims), citations, None
 
 
+def _conversation(value: object) -> tuple[ConversationTurn, ...]:
+    """Accept bounded prior turns, or none. Everything about the history is optional."""
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ApplicationRuntimeError("conversation must be an array of turns")
+    if len(value) > MAX_CONVERSATION_TURNS:
+        raise ApplicationRuntimeError("conversation exceeds its turn bound")
+    turns: list[ConversationTurn] = []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {"role", "text"}:
+            raise ApplicationRuntimeError("conversation turn must have exactly role and text")
+        role = item["role"]
+        if role not in ("user", "assistant"):
+            raise ApplicationRuntimeError("conversation turn role is unsupported")
+        text = _bounded_text(item["text"], "conversation turn", MAX_TURN_BYTES)
+        turns.append(ConversationTurn(cast(Literal["user", "assistant"], role), text))
+    if sum(len(turn.text.encode("utf-8")) for turn in turns) > MAX_CONVERSATION_BYTES:
+        raise ApplicationRuntimeError("conversation exceeds its byte bound")
+    return tuple(turns)
+
+
 def _routed_evidence(
     services: RuntimeServices,
     question: str,
     *,
     requested: str | None,
     knowledge_base_id: str,
-) -> tuple[tuple[RuntimeEvidence, ...], str | None, str | None, Literal["static", "live"]] | None:
+    conversation: tuple[ConversationTurn, ...] = (),
+) -> (
+    tuple[tuple[RuntimeEvidence, ...], str | None, str | None, Literal["static", "live"], str]
+    | None
+):
     """Let the model choose the lookups, then execute exactly those.
 
     Returns None whenever the keyword path should run instead: the router failed, chose nothing,
@@ -882,10 +920,17 @@ def _routed_evidence(
     unchanged by routing.
     """
     plan = route_lookups(
-        question, lambda system, prompt: services.route(system=system, question=prompt)
+        question,
+        lambda system, prompt: services.route(system=system, question=prompt),
+        conversation,
     )
     if plan is None or (not plan.corpus_search and not plan.live):
         return None
+    # A follow-up resolved against the conversation replaces the fragment from here on:
+    # retrieval, the pinned plan, and the answer turn all see the standalone question, and none
+    # of them sees the history. The audit keeps the original under request_digest.
+    if plan.question is not None:
+        question = _bounded_text(plan.question, "resolved question", _MAX_QUESTION_BYTES)
 
     records: list[RuntimeEvidence] = []
     generation_id: str | None = None
@@ -924,8 +969,8 @@ def _routed_evidence(
         return None
     evidence = _bounded_evidence(tuple(records))
     if plan.corpus_search:
-        return evidence, generation_id, knowledge_base_id, "static"
-    return evidence, None, None, "live"
+        return evidence, generation_id, knowledge_base_id, "static", question
+    return evidence, None, None, "live", question
 
 
 def _supplementary_live_evidence(

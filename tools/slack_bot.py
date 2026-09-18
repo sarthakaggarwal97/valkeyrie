@@ -12,8 +12,10 @@ Run it:
     AWS_PROFILE=valkeyrie-personal uv run \
       --with boto3==1.40.21 --with slack-bolt==1.21.2 python tools/slack_bot.py
 
-Slack app needs: Socket Mode enabled, bot scopes `app_mentions:read` and
-`chat:write`, and the `app_mention` event subscribed.
+Slack app needs: Socket Mode enabled, bot scopes `app_mentions:read`, `chat:write`, and
+`channels:history` (plus `groups:history` for private channels) so a follow-up in a thread can be
+read against the turns before it, and the `app_mention` event subscribed. Without the history
+scopes the bot still answers; each question is simply read on its own.
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ log = logging.getLogger("valkeyrie-slack")
 lambda_client = boto3.client("lambda", region_name="us-east-1")
 
 
-def answer_mention(event: dict[str, Any], say: Any) -> None:
+def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
     """Answer one mention in a thread, or explain why it could not be answered."""
     question = re.sub(r"<@[A-Z0-9]+>", "", event.get("text", "")).strip()
     # Keep the conversation in a thread so a busy channel stays readable.
@@ -60,8 +62,9 @@ def answer_mention(event: dict[str, Any], say: Any) -> None:
         say(text=f"That question is over the {MAX_QUESTION_BYTES}-byte limit.", thread_ts=thread)
         return
 
+    conversation = _thread_history(event, client)
     try:
-        result = _ask(question, event)
+        result = _ask(question, event, conversation)
     except Exception:
         # Log the detail, tell the channel only that it failed.
         log.exception("answer failed")
@@ -71,10 +74,12 @@ def answer_mention(event: dict[str, Any], say: Any) -> None:
     say(text=_format(result), thread_ts=thread, unfurl_links=False)
 
 
-def _ask(question: str, event: dict[str, Any]) -> dict[str, Any]:
+def _ask(
+    question: str, event: dict[str, Any], conversation: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     live = any(hint in question.casefold() for hint in LIVE_HINTS)
-    payload = {
+    payload: dict[str, Any] = {
         "action": "answer",
         # Derived from the Slack event identity, never from message text. Slack
         # redelivers an event when an ack is missed, and request_id is the
@@ -90,6 +95,11 @@ def _ask(question: str, event: dict[str, Any]) -> dict[str, Any]:
         "now": now,
         "completed_at": now,
     }
+    if conversation:
+        # Prior turns of this thread, so "and what about failover?" is read against what came
+        # before it. The runtime resolves the follow-up into a standalone question and answers
+        # that from evidence; the history decides what was asked, never what may be claimed.
+        payload["conversation"] = conversation
     response = lambda_client.invoke(
         FunctionName=FUNCTION,
         Qualifier=QUALIFIER,
@@ -105,6 +115,59 @@ def _ask(question: str, event: dict[str, Any]) -> dict[str, Any]:
 def _event_key(event: dict[str, Any]) -> str:
     identity = f"{event.get('team')}/{event.get('channel')}/{event['ts']}"
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+
+
+# Conversation memory. The thread itself is the store: Slack already holds every turn, so the
+# bot reads the ones before this mention rather than keeping a copy anywhere. Bounds mirror the
+# runtime's, which validates them again.
+MAX_HISTORY_TURNS = 6
+MAX_HISTORY_TURN_BYTES = 2000
+_bot_user_id: str | None = None
+_history_unavailable_logged = False
+
+
+def _thread_history(event: dict[str, Any], client: Any) -> list[dict[str, str]]:
+    """Return the turns before this mention in its thread, oldest first, or [] if unavailable."""
+    global _bot_user_id, _history_unavailable_logged
+    thread = event.get("thread_ts")
+    if not thread or thread == event.get("ts"):
+        return []  # A thread root has nothing before it.
+    try:
+        if _bot_user_id is None:
+            _bot_user_id = client.auth_test()["user_id"]
+        replies = client.conversations_replies(
+            channel=event["channel"], ts=thread, limit=MAX_HISTORY_TURNS * 2 + 2
+        )
+    except Exception as error:  # noqa: BLE001 - history is optional; the answer is not.
+        if not _history_unavailable_logged:
+            log.warning("thread history unavailable, answering without it: %s", error)
+            _history_unavailable_logged = True
+        return []
+    return _turns_before(replies.get("messages", []), event.get("ts", ""), _bot_user_id or "")
+
+
+def _turns_before(
+    messages: list[dict[str, Any]], current_ts: str, bot_user_id: str
+) -> list[dict[str, str]]:
+    """Map thread messages to bounded user/assistant turns, excluding the current mention."""
+    turns: list[dict[str, str]] = []
+    for message in messages:
+        if message.get("ts") == current_ts:
+            break
+        text = re.sub(r"<@[A-Z0-9]+>", "", message.get("text") or "").strip()
+        if not text:
+            continue
+        role = (
+            "assistant" if message.get("user") == bot_user_id or message.get("bot_id") else "user"
+        )
+        if role == "assistant":
+            # Keep the claims, drop the Sources block: links are not conversation.
+            text = text.split("\n\n*Sources*", 1)[0].strip()
+        encoded = text.encode("utf-8")
+        if len(encoded) > MAX_HISTORY_TURN_BYTES:
+            text = encoded[:MAX_HISTORY_TURN_BYTES].decode("utf-8", "ignore")
+        turns.append({"role": role, "text": text})
+    return turns[-MAX_HISTORY_TURNS:]
 
 
 def _format(result: dict[str, Any]) -> str:
