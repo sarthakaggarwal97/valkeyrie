@@ -23,6 +23,10 @@ on:
     # Sundays 04:17 UTC. Scheduled runs drift under load, so nothing here may depend
     # on an exact hour; the pipeline is idempotent and safe to start late.
     - cron: "17 4 * * 0"
+  # Manual runs for verification and recovery. The same job, the same OIDC role, the same
+  # environment protections; only who presses start differs. The `corpus` environment's
+  # deployment rules decide who may, so this adds no authority the environment did not grant.
+  workflow_dispatch: {}
 
 permissions:
   contents: read

@@ -2058,7 +2058,8 @@ def test_a_follow_up_is_answered_as_the_standalone_question_it_resolves_to(
 
     assert result["outcome"] == "answer"
     # The router saw the history; retrieval and the model saw only the resolved question.
-    assert "Asker: How does Valkey replication work?" in services.route_calls[0]
+    assert '"current_question": "and what about failover?"' in services.route_calls[0]
+    assert "How does Valkey replication work?" in services.route_calls[0]
     assert services.retrieve_calls[0]["question"] == "How does Valkey replication failover work?"
     assert services.model_calls[0]["question"] == "How does Valkey replication failover work?"
     plan = cast(dict[str, object], services.requests["req_runtime-1"]["plan"])

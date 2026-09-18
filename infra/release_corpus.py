@@ -28,7 +28,12 @@ from valkeyrie.evaluations import (
     load_evaluation_suite,
     verify_evaluation_report,
 )
-from valkeyrie.generation import GenerationBundle, GenerationError, verify_generation_bundle
+from valkeyrie.generation import (
+    GenerationBundle,
+    GenerationError,
+    create_generation_bundle,
+    verify_generation_bundle,
+)
 from valkeyrie.git_acquisition import GitAcquisitionError, build_locked_corpus, load_source_lock
 from valkeyrie.ingestion import (
     BedrockIngestionClient,
@@ -176,6 +181,43 @@ def prepare_release(
     )
 
 
+def _adopt_original_created_at(
+    bundle: GenerationBundle, services: ReleaseServices
+) -> GenerationBundle:
+    """Rebuild the bundle with the created_at of a manifest already published for this generation.
+
+    created_at is deliberately outside the generation identity, so an unchanged corpus rebuilt on
+    a later day has the same id. But it is inside the immutable manifest, so the new manifest bytes
+    differed and publication refused its own generation as a metadata mismatch. The consequence
+    was that a refresh which failed after publishing could never be resumed, and an unchanged
+    weekly corpus could never re-run. A generation's created_at is the instant it was FIRST
+    published; a later run that produces the same generation adopts it, and every object it goes
+    on to write is then byte-identical to what exists, which the write-once store accepts.
+    """
+    key = bundle.manifest.object_key
+    if services.publication_store.head_object(key) is None:
+        return bundle
+    try:
+        manifest = json.loads(services.publication_store.get_object(key))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CorpusReleaseError("published manifest is not readable JSON") from error
+    if not isinstance(manifest, Mapping) or manifest.get("generation_id") != bundle.generation_id:
+        raise CorpusReleaseError("published manifest does not belong to this generation")
+    original = manifest.get("created_at")
+    if not isinstance(original, str):
+        raise CorpusReleaseError("published manifest carries no creation timestamp")
+    if original == bundle.created_at:
+        return bundle
+    return create_generation_bundle(
+        bundle.sources_yaml,
+        bundle.document_templates,
+        bundle.structured_record_templates,
+        bundle.retrieval_config,
+        created_at=original,
+        structured_acquisitions=bundle.structured_acquisitions,
+    )
+
+
 def execute_release(
     prepared: PreparedRelease,
     services: ReleaseServices,
@@ -194,7 +236,7 @@ def execute_release(
         poll_interval_seconds=poll_interval_seconds,
         max_polls=max_polls,
     )
-    bundle = verify_generation_bundle(prepared.bundle)
+    bundle = verify_generation_bundle(_adopt_original_created_at(prepared.bundle, services))
     publication = publish_generation(services.publication_store, bundle)
 
     sealed = GenerationAvailability(

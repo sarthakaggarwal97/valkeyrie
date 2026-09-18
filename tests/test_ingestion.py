@@ -13,6 +13,7 @@ from tests.test_generation import _bundle
 from tests.test_publication import MemoryPublicationStore
 from valkeyrie.generation import GenerationBundle
 from valkeyrie.ingestion import (
+    MAX_CANDIDATE_ATTEMPTS,
     CandidateBusyError,
     CandidateCoordinator,
     CandidateState,
@@ -371,24 +372,58 @@ def test_terminal_or_malformed_results_fail_candidate(
     assert candidate.state.failure is not None
 
 
-def test_failed_generation_is_explicitly_non_retryable(bundle: GenerationBundle) -> None:
-    publication = _sealed(bundle)
-    candidate = MemoryCandidateStore(
+def _failed_candidate(bundle: GenerationBundle, attempt: int) -> MemoryCandidateStore:
+    return MemoryCandidateStore(
         CandidateState(
             bundle.generation_id,
             CandidateStatus.FAILED,
             revision=6,
             fence=2,
-            attempt=1,
+            attempt=attempt,
             owner="failed-worker",
             lease_expires_at=0,
             ingestion_job_id=JOB_ID,
-            failure="Bedrock ingestion ended with FAILED",
+            failure="Bedrock ingestion reported 1 failed documents",
         )
     )
+
+
+def test_a_failed_generation_may_be_retried_a_bounded_number_of_times(
+    bundle: GenerationBundle,
+) -> None:
+    """The same inputs yield the same generation id every week, so a permanent failure mark on a
+    generation blocked an unchanged corpus for good after one transient Bedrock result. A retry
+    starts a fresh job under the next attempt; the bound stops a deterministic failure from being
+    retried indefinitely."""
+    publication = _sealed(bundle)
+    candidate = _failed_candidate(bundle, attempt=1)
+    bedrock = FakeBedrock([_poll("COMPLETE", scanned=3)])
+
+    result = run_ingestion(
+        publication,
+        candidate,
+        bedrock,
+        bundle,
+        knowledge_base_id=KB_ID,
+        data_source_id=DATA_SOURCE_ID,
+        owner="retry-worker",
+        now_epoch=lambda: NOW,
+        sleep=lambda _: None,
+    )
+
+    assert result.generation_id == bundle.generation_id
+    assert len(bedrock.start_calls) == 1  # a fresh job, not the failed one's id
+    final = candidate.state
+    assert final is not None and final.status is CandidateStatus.INGESTED
+    assert final.attempt == 2
+
+
+def test_a_failed_generation_at_the_attempt_bound_is_not_retried(bundle: GenerationBundle) -> None:
+    publication = _sealed(bundle)
+    candidate = _failed_candidate(bundle, attempt=MAX_CANDIDATE_ATTEMPTS)
     bedrock = FakeBedrock([])
 
-    with pytest.raises(IngestionError, match="explicitly non-retryable"):
+    with pytest.raises(IngestionError, match="exhausted its 3 attempts"):
         run_ingestion(
             publication,
             candidate,

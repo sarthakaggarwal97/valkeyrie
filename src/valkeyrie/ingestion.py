@@ -34,6 +34,11 @@ class CandidateStatus(StrEnum):
     FAILED = "FAILED"
 
 
+# How many times one generation may be ingested after failing before the corpus must change.
+# Three covers a transient service result without letting a deterministic failure spin weekly.
+MAX_CANDIDATE_ATTEMPTS: Final = 3
+
+
 @dataclass(frozen=True)
 class CandidateState:
     """One strongly consistent serialized-candidate item."""
@@ -129,7 +134,20 @@ class CandidateCoordinator:
                 if same_generation and current.status is CandidateStatus.INGESTED:
                     return _lease(current, already_ingested=True)
                 if same_generation and current.status is CandidateStatus.FAILED:
-                    raise IngestionError("failed candidate generation is explicitly non-retryable")
+                    # A failed candidate may be retried a bounded number of times. Without this an
+                    # unchanged weekly corpus was blocked for good by one transient Bedrock result,
+                    # since the same inputs yield the same generation id every week. The bound
+                    # keeps a deterministic failure from being retried indefinitely: after it, the
+                    # corpus must change (or the document set be corrected) before this generation
+                    # can be attempted again.
+                    if current.attempt >= MAX_CANDIDATE_ATTEMPTS:
+                        raise IngestionError(
+                            f"failed candidate generation exhausted its {MAX_CANDIDATE_ATTEMPTS} "
+                            "attempts and is not retryable"
+                        )
+                    retry_attempt: int | None = current.attempt + 1
+                else:
+                    retry_attempt = None
                 if current.status is CandidateStatus.INGESTING:
                     if not same_generation:
                         raise CandidateBusyError(
@@ -143,6 +161,10 @@ class CandidateCoordinator:
                         )
                     attempt = current.attempt
                     job_id = current.ingestion_job_id
+                elif retry_attempt is not None:
+                    # Same generation, previously failed: a fresh job under the next attempt.
+                    attempt = retry_attempt
+                    job_id = None
                 else:
                     attempt = 1
                     job_id = None
