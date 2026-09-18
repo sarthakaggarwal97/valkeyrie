@@ -885,25 +885,38 @@ def _supplementary_live_evidence(
 
 
 def _bounded_evidence(values: tuple[RuntimeEvidence, ...]) -> tuple[RuntimeEvidence, ...]:
-    """Re-apply the record and byte bounds to a combined static-plus-live package.
+    """Fit a combined static-plus-live package inside the evidence bounds.
 
-    _evidence bounds only the static tuple, so appending live supplements could carry the
-    package past both limits: the model would receive more evidence than the bound admits.
-    Live records are dropped rather than the request failing, because a supplement is an
-    optional addition to an answer the static evidence can already support.
+    _evidence bounds only the static tuple, so appending live supplements could carry the package
+    past both limits and hand the model more evidence than the bound admits.
+
+    Live records DISPLACE the weakest static ones rather than being dropped. Retrieval returns
+    exactly _MAX_EVIDENCE results for every question measured, so a rule that dropped the overflow
+    would discard the supplement on every question, silently: that is a real regression this
+    function shipped with. Static results arrive ranked, best first, so the last of them are the
+    ones worth giving up. The supplement is the only evidence about work that has not shipped, and
+    the corpus cannot contain it at all.
     """
-    if len(values) <= _MAX_EVIDENCE and (
-        sum(len(item.text.encode("utf-8")) for item in values) <= _MAX_EVIDENCE_BYTES
-    ):
-        return values
-    kept: list[RuntimeEvidence] = []
-    total = 0
-    for item in values:
-        size = len(item.text.encode("utf-8"))
-        if len(kept) + 1 > _MAX_EVIDENCE or total + size > _MAX_EVIDENCE_BYTES:
-            continue
-        kept.append(item)
-        total += size
+    live = tuple(item for item in values if isinstance(item, LiveRuntimeEvidence))
+    static = tuple(item for item in values if not isinstance(item, LiveRuntimeEvidence))
+    # Live is capped at half the package so a supplement can never crowd out the corpus.
+    kept_live = live[: _MAX_EVIDENCE // 2]
+    kept: list[RuntimeEvidence] = list(static[: _MAX_EVIDENCE - len(kept_live)])
+    kept.extend(kept_live)
+    total = sum(len(item.text.encode("utf-8")) for item in kept)
+    while total > _MAX_EVIDENCE_BYTES and len(kept) > 1:
+        # Drop the lowest-ranked static record first, then live, so the byte bound is met without
+        # preferring bulk over relevance.
+        index = max(
+            (
+                position
+                for position, item in enumerate(kept)
+                if not isinstance(item, LiveRuntimeEvidence)
+            ),
+            default=len(kept) - 1,
+        )
+        total -= len(kept[index].text.encode("utf-8"))
+        del kept[index]
     return tuple(kept)
 
 

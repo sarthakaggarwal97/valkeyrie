@@ -1665,13 +1665,13 @@ def test_github_token_is_read_once_and_every_failure_degrades_to_anonymous(
     assert unused.calls == 0
 
 
-def test_live_supplements_cannot_carry_evidence_past_its_bounds() -> None:
-    """A supplement is an addition to the package, not an exemption from its limits.
+def test_live_supplements_displace_static_evidence_rather_than_being_dropped() -> None:
+    """The package must stay inside its bounds without discarding the supplement.
 
-    Static evidence is bounded when it is parsed, so appending live records could previously
-    hand the model more evidence than the bound admits: ten static records plus one per search
-    kind is twelve. The supplement is dropped rather than the request failing, because the
-    static evidence can already support an answer.
+    Retrieval returns exactly _MAX_EVIDENCE results for every question measured, so a rule that
+    dropped the overflow discarded the supplement on EVERY question, and the compression answer
+    silently regressed to an abstention in production. Static results arrive ranked, so the last of
+    them are the ones worth giving up: the supplement is the only evidence about unshipped work.
     """
 
     def static(evidence_id: str, size: int) -> StaticRuntimeEvidence:
@@ -1688,21 +1688,36 @@ def test_live_supplements_cannot_carry_evidence_past_its_bounds() -> None:
             "https://github.com/valkey-io/valkey/blob/c/src/x.c",
         )
 
+    def live(evidence_id: str, size: int) -> LiveRuntimeEvidence:
+        return LiveRuntimeEvidence(
+            evidence_id,
+            "l" * size,
+            "obs_" + evidence_id,
+            "2026-01-01T00:00:00Z",
+            "issue",
+            "dg",
+            "https://github.com/valkey-io/valkey/pull/1",
+            "https://github.com/valkey-io/valkey/pull/1",
+        )
+
     full = tuple(static(f"ev_{index:02d}", 100) for index in range(_MAX_EVIDENCE))
-    live = LiveRuntimeEvidence(
-        "ev_live", "l" * 100, "obs_1", "2026-01-01T00:00:00Z", "issue", "dg", "u", "u"
-    )
-
     assert _bounded_evidence(full) == full
-    over_count = _bounded_evidence((*full, live))
-    assert len(over_count) == _MAX_EVIDENCE
-    assert live not in over_count
 
-    heavy = (static("ev_big", _MAX_EVIDENCE_BYTES),)
-    over_bytes = _bounded_evidence((*heavy, live))
-    assert over_bytes == heavy
-    total = sum(len(item.text.encode("utf-8")) for item in over_bytes)
-    assert total <= _MAX_EVIDENCE_BYTES
+    supplemented = _bounded_evidence((*full, live("a", 100), live("b", 100)))
+    assert len(supplemented) == _MAX_EVIDENCE
+    # Both supplements survive; the two lowest-ranked static records are what gave way.
+    assert sum(isinstance(item, LiveRuntimeEvidence) for item in supplemented) == 2
+    assert full[0] in supplemented and full[-1] not in supplemented
+
+    # A supplement can never take more than half the package.
+    crowded = _bounded_evidence((*full, *(live(str(index), 100) for index in range(9))))
+    assert sum(isinstance(item, LiveRuntimeEvidence) for item in crowded) == _MAX_EVIDENCE // 2
+    assert len(crowded) == _MAX_EVIDENCE
+
+    # The byte bound holds too, and is met by shedding static bulk rather than the supplement.
+    heavy = _bounded_evidence((static("ev_big", _MAX_EVIDENCE_BYTES), live("c", 100)))
+    assert sum(len(item.text.encode("utf-8")) for item in heavy) <= _MAX_EVIDENCE_BYTES
+    assert any(isinstance(item, LiveRuntimeEvidence) for item in heavy)
 
 
 def test_completion_time_comes_from_the_runtime_clock_when_one_is_supplied(
