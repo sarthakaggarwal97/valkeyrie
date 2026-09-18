@@ -189,7 +189,8 @@ class KnowledgePlaneStack(Stack):
             vector_collection,
             vector_index,
         )
-        self._create_data_source(config, corpus_bucket, knowledge_base)
+        data_source = self._create_data_source(config, corpus_bucket, knowledge_base)
+        self._grant_corpus_refresh_execution(publisher, state_table, knowledge_base, data_source)
         self._create_observability(config, corpus_bucket, state_table, vector_collection)
         self._create_disabled_controls()
 
@@ -241,6 +242,54 @@ class KnowledgePlaneStack(Stack):
         bucket.cfn_options.deletion_policy = CfnDeletionPolicy.RETAIN
         bucket.cfn_options.update_replace_policy = CfnDeletionPolicy.RETAIN
         return bucket
+
+    def _grant_corpus_refresh_execution(
+        self,
+        publisher: iam.Role,
+        state_table: dynamodb.CfnTable,
+        knowledge_base: bedrock.CfnKnowledgeBase,
+        data_source: bedrock.CfnDataSource,
+    ) -> None:
+        """Grant the publisher what a refresh needs beyond writing objects.
+
+        Publication was the only granted step, so a scheduled refresh could write generation
+        objects and then fail on its first lifecycle write. The remaining steps are the ones the
+        release performs: conditional lifecycle transitions on the state table, starting and
+        polling one ingestion job, and the generation-filtered retrieval smoke that activation
+        runs before it swaps the active pointer.
+
+        No delete anywhere: a generation is write-once, and activation moves a pointer rather than
+        removing what it replaces, so the previous corpus stays retrievable for rollback.
+        """
+        publisher.add_to_policy(
+            iam.PolicyStatement(
+                sid="ConditionalGenerationLifecycle",
+                # No DeleteItem: lifecycle rows are the audit trail of what was published.
+                actions=["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
+                resources=[state_table.attr_arn],
+            )
+        )
+        publisher.add_to_policy(
+            iam.PolicyStatement(
+                sid="IngestExactKnowledgeBase",
+                actions=["bedrock:StartIngestionJob", "bedrock:GetIngestionJob"],
+                # Scoped by resource only. A bedrock:DataSourceId condition was tried first and
+                # simulate-principal-policy returned implicitDeny for both actions: the key does not
+                # apply to them, so the condition could never be satisfied and the grant would have
+                # denied every ingestion while looking correct in review. This knowledge base has
+                # exactly one data source, which the stack also owns, so the ARN is the boundary.
+                resources=[knowledge_base.attr_knowledge_base_arn],
+            )
+        )
+        publisher.add_to_policy(
+            iam.PolicyStatement(
+                sid="SmokeTestCandidateRetrieval",
+                # Activation refuses to swap the pointer until a live retrieval against the
+                # candidate generation returns evidence, so this read is part of the gate.
+                actions=["bedrock:Retrieve"],
+                resources=[knowledge_base.attr_knowledge_base_arn],
+            )
+        )
 
     def _grant_write_once_generation_publication(
         self,

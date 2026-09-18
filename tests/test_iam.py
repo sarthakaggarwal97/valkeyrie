@@ -180,19 +180,41 @@ def test_application_deployer_and_runtime_remain_permission_empty_in_d01(
         logical_id, _ = roles[role_name]
         assert _policy_for_role(template, logical_id) is None
     serialized = json.dumps(template, sort_keys=True)
+    # Escalation stays prohibited outright: these are how a foundation identity would acquire the
+    # ability to deploy application code or assume another role, which no foundation role may do.
     for prohibited in (
         "cloudformation:CreateStack",
         "cloudformation:UpdateStack",
         "lambda:UpdateFunctionCode",
-        "bedrock:Retrieve",
-        "dynamodb:GetItem",
-        "dynamodb:PutItem",
         "iam:PassRole",
     ):
         assert prohibited not in serialized
 
+    # Data-plane permissions are a different question. Governance gives the corpus identity
+    # permission to "ingest, evaluate, and activate a corpus", so these must exist somewhere; what
+    # matters is that ONLY the publisher holds them, and only on the exact corpus resources. A
+    # blanket string check could not express that, and asserting their absence contradicted the
+    # documented capability, which is why the grant went unwired and every scheduled refresh
+    # failed on its first lifecycle write.
+    publisher_logical_id, _ = _roles(template)["valkeyrie-development-corpus-publisher"]
+    resources = cast(dict[str, Any], template["Resources"])
+    for resource_name, resource in resources.items():
+        if resource["Type"] != "AWS::IAM::Policy":
+            continue
+        holders = {
+            role.get("Ref")
+            for role in resource["Properties"].get("Roles", [])
+            if isinstance(role, dict)
+        }
+        actions = json.dumps(resource["Properties"]["PolicyDocument"], sort_keys=True)
+        for scoped in ("bedrock:Retrieve", "dynamodb:GetItem", "dynamodb:PutItem"):
+            if scoped in actions:
+                assert holders == {publisher_logical_id}, (
+                    f"{resource_name} grants {scoped} to something other than the publisher"
+                )
 
-def test_publisher_may_only_conditionally_create_read_and_list_generation_objects(
+
+def test_publisher_holds_exactly_publication_and_refresh_permission(
     tmp_path: Path,
 ) -> None:
     template = _template(tmp_path / "assembly")
@@ -201,10 +223,15 @@ def test_publisher_may_only_conditionally_create_read_and_list_generation_object
     assert match is not None
     _, policy = match
     statements = {statement["Sid"]: statement for statement in _statements(policy)}
+    # Publication plus exactly the steps a refresh performs. Publication alone was granted, so a
+    # scheduled refresh wrote generation objects and then failed on its first lifecycle write.
     assert set(statements) == {
         "ConditionalGenerationCreate",
         "ReadGenerationObjects",
         "ListGenerationObjects",
+        "ConditionalGenerationLifecycle",
+        "IngestExactKnowledgeBase",
+        "SmokeTestCandidateRetrieval",
     }
     create = statements["ConditionalGenerationCreate"]
     assert create["Effect"] == "Allow"
@@ -226,8 +253,23 @@ def test_publisher_may_only_conditionally_create_read_and_list_generation_object
             ]
         }
     }
-    actions = {statement["Action"] for statement in statements.values()}
-    assert actions == {"s3:PutObject", "s3:GetObject", "s3:ListBucket"}
+    # Action is a string for single-action statements and a list otherwise, so flatten before
+    # comparing. The set is the complete permission surface of the corpus identity.
+    actions: set[str] = set()
+    for statement in statements.values():
+        value = statement["Action"]
+        actions.update([value] if isinstance(value, str) else value)
+    assert actions == {
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "bedrock:StartIngestionJob",
+        "bedrock:GetIngestionJob",
+        "bedrock:Retrieve",
+    }
     serialized = json.dumps(policy, sort_keys=True)
     for prohibited in (
         "DeleteObject",
@@ -237,9 +279,21 @@ def test_publisher_may_only_conditionally_create_read_and_list_generation_object
         "ListBucketMultipartUploads",
         "PutObjectAcl",
         "PutObjectTagging",
-        "bedrock:",
+        # Bare service prefixes previously stood in for "no data-plane permission at all", which
+        # contradicted the governance statement that this identity ingests, evaluates, and
+        # activates. The specific dangerous actions are named instead, so the assertion still fails
+        # if the role gains the ability to reconfigure or destroy the corpus rather than refresh it.
+        "bedrock:DeleteKnowledgeBase",
+        "bedrock:UpdateKnowledgeBase",
+        "bedrock:DeleteDataSource",
+        "bedrock:UpdateDataSource",
+        "bedrock:CreateDataSource",
+        "bedrock:InvokeModel",
+        "dynamodb:DeleteItem",
+        "dynamodb:DeleteTable",
+        "dynamodb:UpdateTable",
+        "dynamodb:Scan",
         "aoss:",
-        "dynamodb:",
         "ssm:",
         "iam:PassRole",
     ):
@@ -521,10 +575,13 @@ def test_template_creates_no_provider_credential_project_write_or_unbounded_poli
         "workflow_dispatch",
         "pull_request_target",
         "ssm:PutParameter",
-        "dynamodb:UpdateItem",
-        "dynamodb:PutItem",
     ):
         assert prohibited not in serialized
+    # dynamodb:PutItem and dynamodb:UpdateItem were on this list, which contradicted the governance
+    # statement that the corpus identity may ingest, evaluate, and activate. That contradiction is
+    # why the grant was never wired and every scheduled refresh failed on its first lifecycle
+    # write. They are asserted scoped to the publisher and to the state table instead, by
+    # test_publisher_refresh_permission_is_scoped_and_cannot_delete.
     assert "Outputs" not in template
 
 
@@ -546,3 +603,44 @@ def test_all_trust_actions_are_bounded_and_no_role_can_assume_another(tmp_path: 
         if isinstance(statement["Principal"], dict)
     ]
     assert all(principal is None for principal in aws_principals)
+
+
+def test_publisher_refresh_permission_is_scoped_and_cannot_delete(tmp_path: Path) -> None:
+    """A refresh may transition and read corpus state, never remove it.
+
+    A generation is write-once and activation moves a pointer rather than removing what it
+    replaces, which is what keeps the previous corpus retrievable for rollback. So no delete
+    belongs anywhere in this role, and each grant names one resource rather than a wildcard.
+    """
+    template = _template(tmp_path / "assembly")
+    publisher_logical_id, _ = _roles(template)["valkeyrie-development-corpus-publisher"]
+    match = _policy_for_role(template, publisher_logical_id)
+    assert match is not None
+    _, policy = match
+    statements = {statement["Sid"]: statement for statement in _statements(policy)}
+
+    lifecycle = statements["ConditionalGenerationLifecycle"]
+    assert lifecycle["Action"] == [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+    ]
+    assert lifecycle["Resource"] == {"Fn::GetAtt": ["StateTable", "Arn"]}
+
+    ingest = statements["IngestExactKnowledgeBase"]
+    assert ingest["Action"] == ["bedrock:StartIngestionJob", "bedrock:GetIngestionJob"]
+    # Deliberately unconditioned: a bedrock:DataSourceId condition made both actions
+    # implicitDeny under simulate-principal-policy, because the key does not apply to them. The
+    # knowledge base ARN is the boundary instead.
+    assert "Condition" not in ingest
+    assert ingest["Resource"] == {"Fn::GetAtt": ["KnowledgeBase", "KnowledgeBaseArn"]}
+
+    smoke = statements["SmokeTestCandidateRetrieval"]
+    assert smoke["Action"] == "bedrock:Retrieve"
+
+    serialized = json.dumps(policy, sort_keys=True)
+    for destructive in ("dynamodb:DeleteItem", "s3:DeleteObject", "bedrock:DeleteKnowledgeBase"):
+        assert destructive not in serialized
+    assert '"*"' not in json.dumps(
+        [statement.get("Resource") for statement in _statements(policy)], sort_keys=True
+    ).replace('/*"', '/x"')
