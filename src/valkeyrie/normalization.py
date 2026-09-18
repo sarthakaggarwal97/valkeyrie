@@ -458,7 +458,12 @@ def _content_type(path: str) -> ContentType:
         return "text/plain"
     if not suffix:
         return "text/code"
-    raise NormalizationError(f"document path {path!r} has an unsupported content type")
+    # An unrecognised suffix is treated as plain text rather than ending the build. Refusing it
+    # protected nothing: the file is text the moment it decoded as UTF-8, which acquisition has
+    # already established, and the extensionless case above has always defaulted the same way.
+    # Aborting instead meant one .cmake, .patch or .diff appearing upstream would stop every
+    # corpus update, which is indistinguishable from the refresh never running.
+    return "text/plain"
 
 
 def _validate_bounded_text(value: object, field: str, maximum_bytes: int) -> None:

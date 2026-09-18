@@ -370,11 +370,20 @@ def test_rejects_repeated_utf8_bom_after_single_leading_normalization() -> None:
 
 
 @pytest.mark.parametrize("path", ["README.bin", "runtest.bin"])
-def test_rejects_unsupported_content_types(path: str) -> None:
+def test_unrecognised_suffixes_are_read_as_plain_text_not_refused(path: str) -> None:
+    """An unrecognised suffix must not end the build for every repository.
+
+    Refusing it protected nothing: the content is text the moment it decoded as UTF-8, which
+    acquisition establishes before normalization sees it, and an extensionless path has always
+    defaulted the same way. Aborting meant one .cmake or .patch appearing upstream would stop every
+    corpus update, which from the outside is indistinguishable from the refresh never running.
+    """
     inventory = _inventory()
     resolved = _resolved(inventory)
-    with pytest.raises(NormalizationError, match="unsupported content type"):
-        normalize_repository(inventory, resolved, _acquired([(path, b"content\n")]))
+    documents = normalize_repository(inventory, resolved, _acquired([(path, b"content\n")]))
+    assert len(documents) == 1
+    assert documents[0].content_type == "text/plain"
+    assert documents[0].path == path
 
 
 def test_normalizes_reviewed_extensionless_www_entrypoint() -> None:

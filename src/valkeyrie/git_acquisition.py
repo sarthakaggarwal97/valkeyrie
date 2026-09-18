@@ -207,15 +207,25 @@ class GitObjectAcquirer:
             maximum_output_bytes=self._limits.max_total_bytes + len(selected) * 96,
         )
         contents = _parse_batch(batch_output, selected, self._limits)
-        files = tuple(
-            AcquiredFile(path, content)
-            for (path, _, _), content in zip(selected, contents, strict=True)
-        )
+        usable: list[AcquiredFile] = []
+        skipped: list[tuple[str, str]] = []
+        for (path, _, _), content in zip(selected, contents, strict=True):
+            reason = _unusable_reason(content)
+            if reason is None:
+                usable.append(AcquiredFile(path, content))
+            else:
+                skipped.append((path, reason))
+        if not usable:
+            raise GitAcquisitionError(
+                f"reviewed source {resolved.repository!r} has no usable file content"
+            )
+        files = tuple(usable)
         return AcquiredRepository(
             resolved.repository,
             resolved.commit,
             files,
             sum(len(item.content) for item in files),
+            tuple(skipped),
         )
 
     def _repository_path(self, repository: str) -> Path:
@@ -374,6 +384,24 @@ def _selected_tree(
     if tuple(path for path, _, _ in selected) != tuple(sorted(path for path, _, _ in selected)):
         raise GitAcquisitionError("Git tree did not return lexical path order")
     return tuple(selected)
+
+
+def _unusable_reason(content: bytes) -> str | None:
+    """Return why this content cannot become a document, or None when it can.
+
+    Policy decides which paths are corpus material; this decides whether the bytes at an included
+    path can be turned into one. Both conditions previously raised, which ended the entire build
+    for every repository over a single file, and a scheduled refresh that dies is indistinguishable
+    from one that never ran.
+    """
+    stripped = content.removeprefix(b"\xef\xbb\xbf")
+    if not stripped:
+        return "empty"
+    try:
+        stripped.decode("utf-8")
+    except UnicodeDecodeError:
+        return "not valid UTF-8"
+    return None
 
 
 def _parse_batch(

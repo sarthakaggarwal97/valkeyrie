@@ -63,6 +63,10 @@ class AcquiredRepository:
     commit: str
     files: tuple[AcquiredFile, ...]
     total_bytes: int
+    # Paths that policy included but that cannot become documents, each with the reason. Carried
+    # rather than discarded so a build can report what it left out: a file silently missing from
+    # the corpus is indistinguishable from one that was never there.
+    skipped: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)

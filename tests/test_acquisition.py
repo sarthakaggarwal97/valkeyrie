@@ -16,6 +16,7 @@ from valkeyrie.acquisition import (
     AcquisitionLimits,
     acquire_source,
 )
+from valkeyrie.git_acquisition import _unusable_reason
 from valkeyrie.github import HttpResponse
 from valkeyrie.revisions import Authority, ResolvedRevision
 from valkeyrie.sources import load_source_inventory
@@ -848,3 +849,21 @@ def test_accepts_reviewed_ldap_packaging_metadata() -> None:
         fetch=StubFetcher(_responses_for_files(source, files, repository="valkey-ldap")),
     )
     assert [(item.path, item.content) for item in result.files] == files
+
+
+def test_content_that_cannot_become_a_document_is_skipped_with_a_reason() -> None:
+    """One unusable file must not end the acquisition for an entire repository.
+
+    Policy decides which paths are corpus material; this decides whether the bytes at an included
+    path can be turned into a document. Both conditions used to raise, so a single binary or empty
+    file stopped every corpus update, and a scheduled refresh that dies is indistinguishable from
+    one that never ran. The reason is carried so the build can name what it left out.
+    """
+    assert _unusable_reason(b"plain text\n") is None
+    # A BOM alone is empty content once the BOM is stripped, as normalization strips it too.
+    assert _unusable_reason(b"\xef\xbb\xbf") == "empty"
+    assert _unusable_reason(b"") == "empty"
+    assert _unusable_reason(b"\x89PNG\r\n\x1a\n\x00\x00") == "not valid UTF-8"
+    # Valid UTF-8 that merely looks unusual is usable: the test is decodability, not familiarity.
+    assert _unusable_reason("café ☕\n".encode()) is None
+    assert _unusable_reason(b"\xef\xbb\xbfwith a byte order mark\n") is None

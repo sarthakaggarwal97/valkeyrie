@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol, cast
@@ -135,6 +136,8 @@ def build_corpus(
                 _validate_records(resolved, built_records)
                 records.extend(built_records)
                 structured_acquisitions.append(acquired)
+            # After either mode: both acquire files, so both can leave content out.
+            _report_skipped(acquired)
         except CorpusBuildError:
             raise
         except Exception as error:
@@ -192,6 +195,23 @@ def _select_sources(
         scope = "all reviewed sources" if profile is None else f"profile {profile!r}"
         raise CorpusBuildError(f"corpus scope selects no reviewed sources: {scope}")
     return tuple(sorted(reviewed, key=lambda entry: cast(str, entry["name"])))
+
+
+def _report_skipped(acquired: object) -> None:
+    """Name every path an acquisition left out, on stderr.
+
+    A file that policy included but that cannot become a document is skipped rather than ending the
+    build. That is only safe if it is stated: silently missing content is indistinguishable from
+    content that was never there, and this runs unattended once a week. stderr because the build
+    writes its canonical report to stdout.
+    """
+    if not isinstance(acquired, AcquiredRepository) or not acquired.skipped:
+        return
+    for path, reason in acquired.skipped:
+        print(
+            f"skipped {acquired.repository}/{path}: {reason}",
+            file=sys.stderr,
+        )
 
 
 def _validate_acquisition(
