@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 from aws_cdk import (
     App,
@@ -31,7 +31,7 @@ from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_sns as sns
 from aws_cdk import aws_ssm as ssm
 
-from valkeyrie.retrieval_config import load_retrieval_config
+from valkeyrie.retrieval_config import ChunkingConfiguration, load_retrieval_config
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTDIR = Path("cdk.out")
@@ -44,6 +44,30 @@ CORPUS_ENVIRONMENT: Final = "corpus"
 INFRASTRUCTURE_OWNER: Final = "sarthakaggarwal97"
 DEPLOYMENT_PRINCIPAL_NAME: Final = "sarthagg"
 CORPUS_DATA_SOURCE_PREFIX: Final = "kb-documents/"
+
+
+@dataclass(frozen=True)
+class RetiringDataSource:
+    """A data source kept alive during a chunking migration, with vector deletion armed."""
+
+    logical_id: str
+    name: str
+    chunking: ChunkingConfiguration
+
+
+def _data_source_logical_id(candidate_id: str) -> str:
+    # "CorpusDataSource" was the pre-migration logical ID for titan-v2-1024-fixed-300-20 and is
+    # kept for it so the deployed resource is recognised rather than replaced.
+    if candidate_id == "titan-v2-1024-fixed-300-20":
+        return "CorpusDataSource"
+    return "CorpusDataSource" + "".join(part.capitalize() for part in candidate_id.split("-"))
+
+
+# Empty since the hierarchical migration completed on 2026-09-18: the fixed-300 source ingested
+# nothing new, was flipped to DELETE in Phase A, and was removed in Phase B so its vectors went
+# with it. During the overlap the runtime rejected some answers because two chunkings of one
+# document share an evidence identity, so a future migration should keep the drain short.
+RETIRING_DATA_SOURCES: Final[tuple[RetiringDataSource, ...]] = ()
 GENERATION_PREFIXES: Final = (
     "kb-documents/generations/*",
     "control/generations/*",
@@ -681,14 +705,87 @@ class KnowledgePlaneStack(Stack):
         bucket: s3.CfnBucket,
         knowledge_base: bedrock.CfnKnowledgeBase,
     ) -> bedrock.CfnDataSource:
-        selected = load_retrieval_config(ROOT / "retrieval-config.yaml", project_root=ROOT).selected
+        """Create the selected data source, and keep any retiring one alive until it is drained.
+
+        Bedrock cannot change chunking on an existing data source, so a chunking migration is
+        additive: the new source is created beside the old, ingests the active generation, and
+        only then is the old one retired. The logical ID is derived from the candidate so a new
+        candidate is a new resource rather than an in-place update CloudFormation would have to
+        replace, which would delete the old source before the new one held any vectors.
+
+        RETIRING_DATA_SOURCES lists old sources still present during the drain. Each is flipped
+        to a DELETE data policy so that removing it from this list, on the next deploy, removes
+        its vectors too; a RETAIN policy would leave the old chunking retrievable for the active
+        generation forever, silently mixing two chunkings in every answer.
+        """
+        frozen = load_retrieval_config(ROOT / "retrieval-config.yaml", project_root=ROOT)
+        selected = frozen.selected
+        data_source = self._data_source(
+            config,
+            bucket,
+            knowledge_base,
+            logical_id=_data_source_logical_id(frozen.selected_candidate),
+            name=f"{self.namespace}-corpus-{frozen.selected_candidate}",
+            chunking=selected.chunking,
+            deletion_policy="RETAIN",
+        )
+        for retiring in RETIRING_DATA_SOURCES:
+            self._data_source(
+                config,
+                bucket,
+                knowledge_base,
+                logical_id=retiring.logical_id,
+                name=retiring.name,
+                chunking=retiring.chunking,
+                deletion_policy="DELETE",
+            )
+        return data_source
+
+    def _data_source(
+        self,
+        config: FoundationConfig,
+        bucket: s3.CfnBucket,
+        knowledge_base: bedrock.CfnKnowledgeBase,
+        *,
+        logical_id: str,
+        name: str,
+        chunking: ChunkingConfiguration,
+        deletion_policy: str,
+    ) -> bedrock.CfnDataSource:
+        if chunking.strategy == "HIERARCHICAL":
+            chunking_property = bedrock.CfnDataSource.ChunkingConfigurationProperty(
+                chunking_strategy="HIERARCHICAL",
+                hierarchical_chunking_configuration=(
+                    bedrock.CfnDataSource.HierarchicalChunkingConfigurationProperty(
+                        level_configurations=[
+                            bedrock.CfnDataSource.HierarchicalChunkingLevelConfigurationProperty(
+                                max_tokens=cast(int, chunking.parent_max_tokens)
+                            ),
+                            bedrock.CfnDataSource.HierarchicalChunkingLevelConfigurationProperty(
+                                max_tokens=chunking.max_tokens
+                            ),
+                        ],
+                        overlap_tokens=cast(int, chunking.overlap_tokens),
+                    )
+                ),
+            )
+        else:
+            chunking_property = bedrock.CfnDataSource.ChunkingConfigurationProperty(
+                chunking_strategy="FIXED_SIZE",
+                fixed_size_chunking_configuration=(
+                    bedrock.CfnDataSource.FixedSizeChunkingConfigurationProperty(
+                        max_tokens=chunking.max_tokens,
+                        overlap_percentage=cast(int, chunking.overlap_percentage),
+                    )
+                ),
+            )
         data_source = bedrock.CfnDataSource(
             self,
-            "CorpusDataSource",
-            name=f"{self.namespace}-corpus",
+            logical_id,
+            name=name,
             description="Fixed S3 data source; control/ is intentionally not ingestible",
             knowledge_base_id=knowledge_base.attr_knowledge_base_id,
-            data_deletion_policy="RETAIN",
+            data_deletion_policy=deletion_policy,
             data_source_configuration=bedrock.CfnDataSource.DataSourceConfigurationProperty(
                 type="S3",
                 s3_configuration=bedrock.CfnDataSource.S3DataSourceConfigurationProperty(
@@ -699,15 +796,7 @@ class KnowledgePlaneStack(Stack):
             ),
             vector_ingestion_configuration=(
                 bedrock.CfnDataSource.VectorIngestionConfigurationProperty(
-                    chunking_configuration=bedrock.CfnDataSource.ChunkingConfigurationProperty(
-                        chunking_strategy=selected.chunking.strategy,
-                        fixed_size_chunking_configuration=(
-                            bedrock.CfnDataSource.FixedSizeChunkingConfigurationProperty(
-                                max_tokens=selected.chunking.max_tokens,
-                                overlap_percentage=selected.chunking.overlap_percentage,
-                            )
-                        ),
-                    )
+                    chunking_configuration=chunking_property
                 )
             ),
         )

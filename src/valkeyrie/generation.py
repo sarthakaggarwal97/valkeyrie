@@ -24,6 +24,7 @@ from valkeyrie.normalization import (
     canonical_metadata_identity_bytes,
 )
 from valkeyrie.retrieval_config import (
+    ChunkingConfiguration,
     FrozenRetrievalConfiguration,
     RetrievalConfigError,
     validate_frozen_retrieval_configuration,
@@ -500,6 +501,21 @@ def _validate_structured_provenance(
     return tuple(indexed[key] for key in sorted(indexed))
 
 
+def _chunking_template(chunking: ChunkingConfiguration) -> dict[str, object]:
+    if chunking.strategy == "HIERARCHICAL":
+        return {
+            "strategy": chunking.strategy,
+            "max_tokens": chunking.max_tokens,
+            "parent_max_tokens": chunking.parent_max_tokens,
+            "overlap_tokens": chunking.overlap_tokens,
+        }
+    return {
+        "strategy": chunking.strategy,
+        "max_tokens": chunking.max_tokens,
+        "overlap_percentage": chunking.overlap_percentage,
+    }
+
+
 def _retrieval_template(config: object) -> dict[str, object]:
     try:
         validated = validate_frozen_retrieval_configuration(
@@ -514,11 +530,11 @@ def _retrieval_template(config: object) -> dict[str, object]:
                 "dimensions": selected.embedding.dimensions,
                 "output_normalization": selected.embedding.output_normalization,
             },
-            "chunking": {
-                "strategy": selected.chunking.strategy,
-                "max_tokens": selected.chunking.max_tokens,
-                "overlap_percentage": selected.chunking.overlap_percentage,
-            },
+            # Every field the strategy uses is in the preimage, so two hierarchical
+            # configurations that differ only in parent size or overlap yield different
+            # generation identities. Serializing the fixed-size fields alone would have hashed
+            # every hierarchical variant identically.
+            "chunking": _chunking_template(selected.chunking),
             "index": {
                 "dimensions": selected.index.dimensions,
                 "engine": selected.index.engine,

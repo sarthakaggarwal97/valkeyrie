@@ -1687,7 +1687,7 @@ def _normalize_dynamodb_value(value: object) -> object:
     return value
 
 
-def _runtime_retrieval_metadata(metadata: object) -> Mapping[str, object]:
+def _runtime_retrieval_metadata(metadata: object, text: str = "") -> Mapping[str, object]:
     if not isinstance(metadata, Mapping):
         raise ApplicationRuntimeError("Bedrock retrieval metadata is malformed")
     # Every field here comes from the metadata sidecar this project publishes, so it is
@@ -1728,10 +1728,16 @@ def _runtime_retrieval_metadata(metadata: object) -> Mapping[str, object]:
     ):
         raise ApplicationRuntimeError("Bedrock retrieval path is unsafe")
     commit = cast(str, metadata["commit"])
-    # The chunk id distinguishes several chunks of one document. Bedrock omits it when a
-    # document yields a single chunk, in which case the document id already identifies the
-    # chunk uniquely, so a fixed marker keeps evidence ids stable and distinct.
-    chunk = metadata.get("x-amz-bedrock-kb-chunk-id") or "single-chunk"
+    # The chunk id distinguishes several chunks of one document. Bedrock omits it for a
+    # single-chunk document, and ALSO for every parent chunk under hierarchical chunking, where
+    # one document routinely yields several parents. A fixed marker therefore collided: two
+    # parents of the same document produced one evidence id and the whole request was rejected
+    # as "retrieval evidence IDs are duplicated". When Bedrock gives no id, the chunk's own text
+    # is what distinguishes it, so its digest stands in. A single-chunk document still gets one
+    # stable id, since its text is stable.
+    chunk = metadata.get("x-amz-bedrock-kb-chunk-id") or (
+        "text-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+    )
     identity = json.dumps(
         [metadata["generation_id"], metadata["document_id"], chunk],
         separators=(",", ":"),
@@ -1898,7 +1904,7 @@ class AwsRuntimeServices:
         return tuple(
             {
                 "text": result.text,
-                "metadata": _runtime_retrieval_metadata(result.metadata),
+                "metadata": _runtime_retrieval_metadata(result.metadata, result.text),
             }
             for result in results
         )

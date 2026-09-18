@@ -395,13 +395,17 @@ def test_single_bedrock_knowledge_base_and_data_source_use_frozen_configuration(
     assert "control/" not in json.dumps(ds_properties["DataSourceConfiguration"])
     assert ds_properties["VectorIngestionConfiguration"] == {
         "ChunkingConfiguration": {
-            "ChunkingStrategy": "FIXED_SIZE",
-            "FixedSizeChunkingConfiguration": {
-                "MaxTokens": 300,
-                "OverlapPercentage": 20,
+            "ChunkingStrategy": "HIERARCHICAL",
+            "HierarchicalChunkingConfiguration": {
+                # Parent first: it is what the answer stage receives; the child is what matches.
+                "LevelConfigurations": [{"MaxTokens": 1500}, {"MaxTokens": 300}],
+                "OverlapTokens": 60,
             },
         }
     }
+    # The retiring list is empty once a migration completes, so exactly one data source exists
+    # and it retains its vectors on deletion, as production data must.
+    assert ds_properties["DataDeletionPolicy"] == "RETAIN"
 
 
 def test_observability_topic_uses_exact_cmk_and_constrained_service_publishers(

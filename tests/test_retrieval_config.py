@@ -25,9 +25,12 @@ from valkeyrie.sources import load_yaml_mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "retrieval-config.yaml"
-REVISION = "sha256:b0db86c993c9147ff0078a78c55163b8a6ba462e400ce4fad9ab4b3263d48223"
+REVISION = "sha256:ef296ebe2c7e71e410201c54d154e1b57812efc8c71efad90d8ef200e82fae62"
 FIXTURE_REVISION = "sha256:94713f4d1c98d2049d04c93a514c1db6f13e282e48ecf61e9dba55117e70d805"
-SELECTED = "titan-v2-1024-fixed-300-20"
+# The selected candidate is the approved-migration target; the arithmetic's own pick is
+# DETERMINISTIC, recorded in the migration block as from_candidate.
+SELECTED = "titan-v2-1024-hier-1500-300-60"
+DETERMINISTIC = "titan-v2-1024-fixed-300-20"
 
 
 def _document() -> dict[str, object]:
@@ -104,9 +107,12 @@ def test_loads_exact_frozen_selected_configuration_and_local_qualification() -> 
         embedding = _configuration(candidate)["embedding"]
         assert set(embedding) == {"model_id", "dimensions", "output_normalization"}
         assert embedding["output_normalization"] == "model_defined"
-    assert artifact.selected.chunking.strategy == "FIXED_SIZE"
+    assert artifact.selected.chunking.strategy == "HIERARCHICAL"
     assert artifact.selected.chunking.max_tokens == 300
-    assert artifact.selected.chunking.overlap_percentage == 20
+    assert artifact.selected.chunking.parent_max_tokens == 1500
+    assert artifact.selected.chunking.overlap_tokens == 60
+    assert artifact.selected.chunking.max_tokens == 300
+    assert artifact.selected.chunking.overlap_percentage is None
     assert artifact.selected.index.dimensions == 1024
     assert artifact.selected.index.engine == "faiss"
     assert artifact.selected.index.algorithm == "hnsw"
@@ -125,21 +131,24 @@ def test_loads_exact_frozen_selected_configuration_and_local_qualification() -> 
     assert [candidate.candidate_id for candidate in artifact.candidates] == [
         "titan-v2-1024-fixed-300-20",
         "titan-v2-1024-fixed-512-20",
-        "titan-v2-512-fixed-256-15",
+        "titan-v2-1024-hier-1500-300-60",
     ]
-    assert scores[SELECTED].qualifies is True
-    assert scores[SELECTED].overall_recall_at_5 == 1.0
-    assert scores[SELECTED].overall_ndcg_at_10 == 1.0
-    assert scores[SELECTED].p95_latency_seconds == 0.56
-    assert scores[SELECTED].failed_gates == ()
+    # Both migration candidates qualify. Their retrieval scores tie because retrieval hit@5 was
+    # measured identical on the live corpus; hierarchical carries the measured p95 latency, which
+    # is why fixed-300 stays the arithmetic's pick and hierarchical is the approved override.
+    for candidate_id in (SELECTED, DETERMINISTIC):
+        assert scores[candidate_id].qualifies is True
+        assert scores[candidate_id].overall_recall_at_5 == 1.0
+        assert scores[candidate_id].overall_ndcg_at_10 == 1.0
+        assert scores[candidate_id].failed_gates == ()
+    assert scores[DETERMINISTIC].p95_latency_seconds == 0.56
+    assert scores[SELECTED].p95_latency_seconds == 0.62
+    assert scores[SELECTED].p95_latency_seconds > scores[DETERMINISTIC].p95_latency_seconds
     assert scores["titan-v2-1024-fixed-512-20"].failed_gates == (
         "normalized_discounted_cumulative_gain_at_10",
     )
-    assert scores["titan-v2-512-fixed-256-15"].failed_gates == (
-        "canonical_expected_evidence_recall_at_5",
-        "family_recall_at_5.modules",
-    )
-    assert sum(candidate.score.qualifies for candidate in artifact.candidates) == 1
+    assert sum(candidate.score.qualifies for candidate in artifact.candidates) == 2
+    assert select_candidate([c.score for c in artifact.candidates]) == DETERMINISTIC
 
     document = _document()
     qualification = cast(dict[str, object], document["qualification"])
@@ -341,7 +350,9 @@ def test_unknown_and_missing_fields_fail_closed(tmp_path: Path, owner: str, muta
         target["unexpected"] = True
     else:
         target.pop(next(iter(target)))
-    with pytest.raises(RetrievalConfigError, match="unknown or missing"):
+    # Chunking's first key is its strategy, and the strategy is read before the field set is
+    # checked, so removing it fails closed on the strategy message. Either way it fails closed.
+    with pytest.raises(RetrievalConfigError, match="unknown or missing|strategy must be"):
         _load(tmp_path, document)
 
 
@@ -458,7 +469,9 @@ def test_every_approved_hard_gate_blocks_the_selected_candidate(
 ) -> None:
     document = _document()
     _measurement(_candidate(document), fixture_id)[field] = value
-    with pytest.raises(RetrievalConfigError, match="exactly one qualifying"):
+    with pytest.raises(
+        RetrievalConfigError, match="exactly one qualifying|both migration candidates must pass"
+    ):
         _load(tmp_path, document)
 
 
@@ -469,7 +482,9 @@ def test_overall_family_ndcg_and_p95_quality_gates_are_derived_from_observations
     _measurement(_candidate(document), "retrieval-module-public-command")["ranked_evidence_ids"] = [
         "synthetic-module-json-set"
     ]
-    with pytest.raises(RetrievalConfigError, match="exactly one qualifying"):
+    with pytest.raises(
+        RetrievalConfigError, match="exactly one qualifying|both migration candidates must pass"
+    ):
         _load(tmp_path, document)
 
     document = _document()
@@ -481,14 +496,18 @@ def test_overall_family_ndcg_and_p95_quality_gates_are_derived_from_observations
                 "synthetic-low-rank-b",
                 *ranked,
             ]
-    with pytest.raises(RetrievalConfigError, match="exactly one qualifying"):
+    with pytest.raises(
+        RetrievalConfigError, match="exactly one qualifying|both migration candidates must pass"
+    ):
         _load(tmp_path, document)
 
     document = _document()
     _measurement(_candidate(document), "retrieval-automation-interface")[
         "measured_latency_seconds"
     ] = 2.01
-    with pytest.raises(RetrievalConfigError, match="exactly one qualifying"):
+    with pytest.raises(
+        RetrievalConfigError, match="exactly one qualifying|both migration candidates must pass"
+    ):
         _load(tmp_path, document)
 
 
@@ -506,18 +525,18 @@ def test_latency_threshold_is_inclusive_at_exact_boundary() -> None:
 
 def test_exactly_one_candidate_must_qualify_and_selection_must_match(tmp_path: Path) -> None:
     document = _document()
-    compact = _candidate(document, "titan-v2-512-fixed-256-15")
-    _measurement(compact, "retrieval-module-public-command")["ranked_evidence_ids"] = [
-        "synthetic-module-json-set",
-        "synthetic-module-public-doc",
-    ]
-    with pytest.raises(RetrievalConfigError, match="exactly one qualifying"):
+    # Make the third candidate qualify too: a migration admits exactly the two it names.
+    wide = _candidate(document, "titan-v2-1024-fixed-512-20")
+    for measurement in _measurements(wide):
+        ids = cast(list[str], measurement["ranked_evidence_ids"])
+        measurement["ranked_evidence_ids"] = [i for i in ids if "distractor" not in i]
+    with pytest.raises(RetrievalConfigError, match="exactly the two candidates it names"):
         _load(tmp_path, document)
 
     document = _document()
     selection = cast(dict[str, object], document["selection"])
     selection["selected_candidate"] = "titan-v2-1024-fixed-512-20"
-    with pytest.raises(RetrievalConfigError, match="does not match"):
+    with pytest.raises(RetrievalConfigError, match="must be the migration to_candidate"):
         _load(tmp_path, document)
 
 
@@ -577,9 +596,85 @@ def test_configuration_runtime_types_bounds_and_cross_field_compatibility(
     tmp_path: Path, section: str, field: str, value: object, error: str
 ) -> None:
     document = _document()
-    _configuration(_candidate(document))[section][field] = value
+    target = DETERMINISTIC if section == "chunking" else SELECTED
+    _configuration(_candidate(document, target))[section][field] = value
     with pytest.raises(RetrievalConfigError, match=error):
         _load(tmp_path, document)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("max_tokens", 19, "integer"),
+        ("parent_max_tokens", 300, "parent chunk must exceed"),
+        ("parent_max_tokens", 8193, "integer"),
+        ("overlap_tokens", 300, "overlap must be smaller"),
+        ("overlap_tokens", -1, "integer"),
+    ],
+)
+def test_hierarchical_chunking_bounds_and_relations(
+    tmp_path: Path, field: str, value: object, error: str
+) -> None:
+    document = _document()
+    _configuration(_candidate(document))["chunking"][field] = value
+    with pytest.raises(RetrievalConfigError, match=error):
+        _load(tmp_path, document)
+
+
+def test_hierarchical_candidate_rejects_fixed_size_fields_and_vice_versa(tmp_path: Path) -> None:
+    document = _document()
+    _configuration(_candidate(document))["chunking"]["overlap_percentage"] = 20
+    with pytest.raises(RetrievalConfigError, match="unknown or missing"):
+        _load(tmp_path, document)
+    document = _document()
+    _configuration(_candidate(document, DETERMINISTIC))["chunking"]["parent_max_tokens"] = 1500
+    with pytest.raises(RetrievalConfigError, match="unknown or missing"):
+        _load(tmp_path, document)
+
+
+def test_approved_migration_is_the_only_way_to_select_against_the_arithmetic(
+    tmp_path: Path,
+) -> None:
+    """A migration records the deterministic pick and the override, and both must qualify.
+
+    The quality order measures retrieval; it cannot see what the model does with what was
+    retrieved, which is what this migration was made for (14/18 vs 12/18 answered). The block is
+    therefore an audited override, not a way to make the arithmetic come out differently.
+    """
+    document = _document()
+    migration = cast(dict[str, object], document["migration"])
+    assert migration["from_candidate"] == DETERMINISTIC
+    assert migration["to_candidate"] == SELECTED
+    assert cast(dict[str, int], migration["measurements"])["answered_hierarchical"] == 14
+
+    # Without the block, two qualifying candidates are one too many for the arithmetic alone.
+    document = _document()
+    del document["migration"]
+    with pytest.raises(RetrievalConfigError, match="exactly one qualifying"):
+        _load(tmp_path, document)
+
+    # The block cannot misstate the arithmetic.
+    document = _document()
+    cast(dict[str, object], document["migration"])["from_candidate"] = "titan-v2-1024-fixed-512-20"
+    with pytest.raises(RetrievalConfigError, match="must be the deterministic"):
+        _load(tmp_path, document)
+
+    # A label is not a basis.
+    document = _document()
+    cast(dict[str, object], document["migration"])["basis"] = "approved"
+    with pytest.raises(RetrievalConfigError, match="state the evidence"):
+        _load(tmp_path, document)
+
+    # And a bare date, digest, and non-empty measurements are required.
+    for field, value, error in (
+        ("approved_on", "yesterday", "calendar date"),
+        ("measured_on_corpus_generation", "rev7", "must be a digest"),
+        ("measurements", {}, "must not be empty"),
+    ):
+        document = _document()
+        cast(dict[str, object], document["migration"])[field] = value
+        with pytest.raises(RetrievalConfigError, match=error):
+            _load(tmp_path, document)
 
 
 def test_candidate_limit_rejects_boolean_and_out_of_bounds(tmp_path: Path) -> None:

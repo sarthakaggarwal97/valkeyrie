@@ -1995,3 +1995,36 @@ def test_a_routed_corpus_search_keeps_the_unshipped_feature_supplement(
     # Two supplement searches, one per kind, exactly as the keyword path performs.
     kinds = [cast(IssueSearchQuery, call).kind for call in services.live_calls]
     assert kinds == ["pull-request", "issue"]
+
+
+def test_parent_chunks_without_a_bedrock_chunk_id_get_distinct_evidence_ids() -> None:
+    """Hierarchical chunking returns several parents per document, none carrying a chunk id.
+
+    The fixed "single-chunk" marker assumed an absent id meant a one-chunk document, so two
+    parents of the same document produced one evidence id and every corpus question was
+    rejected as duplicated evidence the moment hierarchical chunking went live. When Bedrock
+    gives no id, the chunk's text is what distinguishes it.
+    """
+    base = {
+        "generation_id": GENERATION,
+        "document_id": "sha256:" + "d" * 64,
+        "repository": "valkey",
+        "path": "topics/cluster-failover.md",
+        "commit": "c" * 40,
+        "authority": "canonical",
+        "version_scope": "none",
+        "content_digest": "sha256:" + "e" * 64,
+        "content_type": "text/markdown",
+    }
+    first = _runtime_retrieval_metadata(dict(base), "The FAILOVER command starts a coordinated ...")
+    second = _runtime_retrieval_metadata(dict(base), "Manual failover is a special kind of ...")
+    assert first["evidence_id"] != second["evidence_id"]
+    # Deterministic: the same parent yields the same id on every request, so replay still works.
+    again = _runtime_retrieval_metadata(dict(base), "The FAILOVER command starts a coordinated ...")
+    assert again["evidence_id"] == first["evidence_id"]
+    # An explicit chunk id still takes precedence and is unaffected by text.
+    with_id = _runtime_retrieval_metadata({**base, "x-amz-bedrock-kb-chunk-id": "k1"}, "anything")
+    with_id_other = _runtime_retrieval_metadata(
+        {**base, "x-amz-bedrock-kb-chunk-id": "k1"}, "other"
+    )
+    assert with_id["evidence_id"] == with_id_other["evidence_id"]

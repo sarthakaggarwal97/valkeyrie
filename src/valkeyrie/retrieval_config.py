@@ -48,11 +48,18 @@ class EmbeddingConfiguration:
 
 @dataclass(frozen=True)
 class ChunkingConfiguration:
-    """Bedrock fixed-size chunking settings."""
+    """Bedrock chunking settings.
+
+    FIXED_SIZE uses max_tokens and overlap_percentage. HIERARCHICAL embeds child chunks of
+    max_tokens and returns their parent of parent_max_tokens, overlapping by overlap_tokens; a
+    parent carries the context an answer needs while the child is what the query matches.
+    """
 
     strategy: str
     max_tokens: int
-    overlap_percentage: int
+    overlap_percentage: int | None = None
+    parent_max_tokens: int | None = None
+    overlap_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -127,11 +134,12 @@ _MAX_CANDIDATES = 8
 _MAX_LATENCY_SECONDS = 60.0
 _ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
-_FROZEN_BETA_REVISION = "sha256:b0db86c993c9147ff0078a78c55163b8a6ba462e400ce4fad9ab4b3263d48223"
+_FROZEN_BETA_REVISION = "sha256:ef296ebe2c7e71e410201c54d154e1b57812efc8c71efad90d8ef200e82fae62"
 _FROZEN_RUNTIME_CONFIGURATION_DIGEST = (
-    "sha256:94059e09803aa505a6e77460fcee45cba9675436d0c2272afd6253497139ebf2"
+    "sha256:f42ce74ba90d5a6cb4f2291f3346b03144188dc277a10f61710540b30b4c5e6e"
 )
 _TOP_FIELDS = {
+    "migration",
     "api_version",
     "kind",
     "status",
@@ -140,6 +148,17 @@ _TOP_FIELDS = {
     "freeze",
     "revision",
     "candidates",
+}
+# Present only when a separately approved full-index migration overrides the deterministic
+# selection. Its absence means the arithmetic alone chose the candidate.
+_MIGRATION_FIELDS = {
+    "approved_by",
+    "approved_on",
+    "from_candidate",
+    "to_candidate",
+    "basis",
+    "measured_on_corpus_generation",
+    "measurements",
 }
 _CONFIGURATION_FIELDS = {"embedding", "chunking", "index", "retrieval"}
 _MEASUREMENT_FIELDS = {
@@ -182,7 +201,12 @@ def validate_retrieval_config(
     document: Mapping[str, object], suite: EvaluationSuite
 ) -> FrozenRetrievalConfiguration:
     """Validate one already-loaded artifact against the approved local suite."""
-    _exact_fields(document, _TOP_FIELDS, "retrieval configuration")
+    # migration is the one optional top-level key: absent means the arithmetic alone selected.
+    _exact_fields(
+        document,
+        _TOP_FIELDS if "migration" in document else _TOP_FIELDS - {"migration"},
+        "retrieval configuration",
+    )
     if (
         document.get("api_version"),
         document.get("kind"),
@@ -296,15 +320,36 @@ def validate_retrieval_config(
         raise RetrievalConfigError("candidate configurations must be unique")
 
     qualifying = [candidate for candidate in candidates if candidate.score.qualifies]
-    if len(qualifying) != 1:
-        raise RetrievalConfigError(
-            "reviewed artifact must contain exactly one qualifying candidate"
-        )
     expected_selection = select_candidate([candidate.score for candidate in candidates])
-    if selected_candidate != expected_selection:
-        raise RetrievalConfigError(
-            "selected_candidate does not match deterministic quality-first selection"
-        )
+    migration = _migration(document.get("migration"), {c.candidate_id for c in candidates})
+    if migration is None:
+        if len(qualifying) != 1:
+            raise RetrievalConfigError(
+                "reviewed artifact must contain exactly one qualifying candidate"
+            )
+        if selected_candidate != expected_selection:
+            raise RetrievalConfigError(
+                "selected_candidate does not match deterministic quality-first selection"
+            )
+    else:
+        # An approved migration is the one sanctioned way to select against the arithmetic,
+        # and it must be honest about it: the arithmetic's own pick is recorded as
+        # from_candidate, the override as to_candidate, and both must qualify on every gate.
+        # The quality order here measures retrieval; it cannot see the metric a migration is
+        # usually made for, which is what the model does with what was retrieved.
+        if migration["from_candidate"] != expected_selection:
+            raise RetrievalConfigError(
+                "migration from_candidate must be the deterministic quality-first selection"
+            )
+        if selected_candidate != migration["to_candidate"]:
+            raise RetrievalConfigError("selected_candidate must be the migration to_candidate")
+        qualifying_ids = {candidate.candidate_id for candidate in qualifying}
+        if not {migration["from_candidate"], migration["to_candidate"]} <= qualifying_ids:
+            raise RetrievalConfigError("both migration candidates must pass every retrieval gate")
+        if len(qualifying) != 2:
+            raise RetrievalConfigError(
+                "a migration admits exactly the two candidates it names as qualifying"
+            )
 
     computed_revision = compute_config_revision(document)
     if declared_revision != computed_revision:
@@ -357,6 +402,13 @@ def _runtime_configuration_digest(config: FrozenRetrievalConfiguration) -> str:
 
     def chunking(value: ChunkingConfiguration) -> dict[str, object]:
         require_type(value, ChunkingConfiguration, "chunking configuration")
+        if value.strategy == "HIERARCHICAL":
+            return {
+                "strategy": value.strategy,
+                "max_tokens": value.max_tokens,
+                "parent_max_tokens": value.parent_max_tokens,
+                "overlap_tokens": value.overlap_tokens,
+            }
         return {
             "strategy": value.strategy,
             "max_tokens": value.max_tokens,
@@ -436,6 +488,47 @@ def _runtime_configuration_digest(config: FrozenRetrievalConfiguration) -> str:
     except (TypeError, ValueError, UnicodeEncodeError) as error:
         raise RetrievalConfigError("runtime retrieval configuration is not canonical") from error
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _migration(value: object, candidate_ids: set[str]) -> Mapping[str, object] | None:
+    """Parse the approved-migration block, or return None when the artifact carries none."""
+    if value is None:
+        return None
+    migration = _mapping(value, "migration")
+    _exact_fields(migration, _MIGRATION_FIELDS, "migration")
+    approved_by = _text(migration.get("approved_by"), "migration approved_by")
+    approved_on = _text(migration.get("approved_on"), "migration approved_on")
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", approved_on):
+        raise RetrievalConfigError("migration approved_on must be a calendar date")
+    source = _identifier(migration.get("from_candidate"), "migration from_candidate")
+    target = _identifier(migration.get("to_candidate"), "migration to_candidate")
+    if source == target:
+        raise RetrievalConfigError("migration must name two different candidates")
+    if not {source, target} <= candidate_ids:
+        raise RetrievalConfigError("migration must name declared candidates")
+    basis = _text(migration.get("basis"), "migration basis")
+    if len(basis) < 40:
+        raise RetrievalConfigError("migration basis must state the evidence, not a label")
+    generation = _text(
+        migration.get("measured_on_corpus_generation"), "migration measured_on_corpus_generation"
+    )
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", generation):
+        raise RetrievalConfigError("migration measured_on_corpus_generation must be a digest")
+    measurements = _mapping(migration.get("measurements"), "migration measurements")
+    if not measurements:
+        raise RetrievalConfigError("migration measurements must not be empty")
+    for key, measurement in measurements.items():
+        _text(key, "migration measurement name")
+        _number(measurement, f"migration measurement {key}", 0, 10_000)
+    return {
+        "approved_by": approved_by,
+        "approved_on": approved_on,
+        "from_candidate": source,
+        "to_candidate": target,
+        "basis": basis,
+        "measured_on_corpus_generation": generation,
+        "measurements": dict(measurements),
+    }
 
 
 def select_candidate(scores: Sequence[CandidateScore]) -> str:
@@ -599,15 +692,32 @@ def _configuration(raw: object, candidate_id: str) -> CandidateConfiguration:
         )
 
     chunking = _mapping(value.get("chunking"), f"{candidate_id} chunking")
-    _exact_fields(
-        chunking,
-        {"strategy", "max_tokens", "overlap_percentage"},
-        "chunking",
-    )
-    if chunking.get("strategy") != "FIXED_SIZE":
-        raise RetrievalConfigError("chunking strategy must be FIXED_SIZE")
-    max_tokens = _integer(chunking.get("max_tokens"), "chunking max_tokens", 20, 8192)
-    overlap = _integer(chunking.get("overlap_percentage"), "chunking overlap_percentage", 0, 99)
+    strategy = chunking.get("strategy")
+    if strategy == "FIXED_SIZE":
+        _exact_fields(chunking, {"strategy", "max_tokens", "overlap_percentage"}, "chunking")
+        max_tokens = _integer(chunking.get("max_tokens"), "chunking max_tokens", 20, 8192)
+        overlap = _integer(chunking.get("overlap_percentage"), "chunking overlap_percentage", 0, 99)
+        parsed_chunking = ChunkingConfiguration("FIXED_SIZE", max_tokens, overlap)
+    elif strategy == "HIERARCHICAL":
+        _exact_fields(
+            chunking,
+            {"strategy", "max_tokens", "parent_max_tokens", "overlap_tokens"},
+            "chunking",
+        )
+        max_tokens = _integer(chunking.get("max_tokens"), "chunking max_tokens", 20, 8192)
+        parent = _integer(chunking.get("parent_max_tokens"), "chunking parent_max_tokens", 20, 8192)
+        if parent <= max_tokens:
+            raise RetrievalConfigError("hierarchical parent chunk must exceed the child chunk")
+        overlap_tokens = _integer(
+            chunking.get("overlap_tokens"), "chunking overlap_tokens", 0, 4096
+        )
+        if overlap_tokens >= max_tokens:
+            raise RetrievalConfigError("hierarchical overlap must be smaller than the child chunk")
+        parsed_chunking = ChunkingConfiguration(
+            "HIERARCHICAL", max_tokens, None, parent, overlap_tokens
+        )
+    else:
+        raise RetrievalConfigError("chunking strategy must be FIXED_SIZE or HIERARCHICAL")
 
     index = _mapping(value.get("index"), f"{candidate_id} index")
     _exact_fields(
@@ -669,7 +779,7 @@ def _configuration(raw: object, candidate_id: str) -> CandidateConfiguration:
 
     return CandidateConfiguration(
         embedding=EmbeddingConfiguration(model_id, dimensions, output_normalization),
-        chunking=ChunkingConfiguration("FIXED_SIZE", max_tokens, overlap),
+        chunking=parsed_chunking,
         index=IndexConfiguration(
             index_dimensions,
             cast(str, index["engine"]),

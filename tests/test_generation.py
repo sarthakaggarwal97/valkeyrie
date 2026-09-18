@@ -238,16 +238,19 @@ def test_generation_preimage_is_complete_deterministic_and_generation_free(
     )
     assert value["retrieval_configuration"] == {
         "config_revision": retrieval_config.config_revision,
-        "selected_candidate": "titan-v2-1024-fixed-300-20",
+        "selected_candidate": "titan-v2-1024-hier-1500-300-60",
         "embedding": {
             "model_id": "amazon.titan-embed-text-v2:0",
             "dimensions": 1024,
             "output_normalization": "model_defined",
         },
+        # Every field the strategy uses is in the preimage: two hierarchical configurations
+        # differing only in parent size or overlap must yield different generation identities.
         "chunking": {
-            "strategy": "FIXED_SIZE",
+            "strategy": "HIERARCHICAL",
             "max_tokens": 300,
-            "overlap_percentage": 20,
+            "parent_max_tokens": 1500,
+            "overlap_tokens": 60,
         },
         "index": {
             "dimensions": 1024,
