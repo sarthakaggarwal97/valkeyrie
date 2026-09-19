@@ -109,21 +109,31 @@ class FakeGit:
         if arguments[-3:] == ("remote", "get-url", "origin"):
             return b"https://github.com/valkey-io/valkey.git\n"
         if "ls-tree" in arguments:
+            # Unsized listing: sizes come from batch-check after the prefetch. Asking ls-tree
+            # for sizes on a partial clone resolves every blob individually (measured 557s).
+            assert "-l" not in arguments
             rows = []
             for path in sorted(self.contents):
-                content = self.contents[path]
                 rows.append(
-                    b"100644 blob "
-                    + self.shas[path].encode()
-                    + b" "
-                    + str(len(content)).encode()
-                    + b"\t"
-                    + path.encode()
-                    + b"\0"
+                    b"100644 blob " + self.shas[path].encode() + b"\t" + path.encode() + b"\0"
                 )
-            rows.append(b"100644 blob " + b"0" * 40 + b" 4\tasset.png\0")
-            rows.append(b"160000 commit " + b"1" * 40 + b" -\tvendor/dependency\0")
+            rows.append(b"100644 blob " + b"0" * 40 + b"\tasset.png\0")
+            rows.append(b"160000 commit " + b"1" * 40 + b"\tvendor/dependency\0")
             return b"".join(rows)
+        if "fetch" in arguments and "origin" in arguments and arguments[-1] != "origin":
+            # The one-pack prefetch of exactly the selected blobs, with noop negotiation.
+            selected = arguments[arguments.index("origin") + 1 :]
+            assert set(selected) == {self.shas[path] for path in sorted(self.contents)}
+            assert "fetch.negotiationAlgorithm=noop" in arguments
+            return b""
+        if arguments[-2:] == ("cat-file", "--batch-check"):
+            assert input_bytes == b"".join(
+                self.shas[path].encode() + b"\n" for path in sorted(self.contents)
+            )
+            return b"".join(
+                f"{self.shas[path]} blob {len(self.contents[path])}\n".encode()
+                for path in sorted(self.contents)
+            )
         if arguments[-2:] == ("cat-file", "--batch"):
             assert input_bytes == b"".join(
                 self.shas[path].encode() + b"\n" for path in sorted(self.contents)

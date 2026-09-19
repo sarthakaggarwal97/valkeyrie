@@ -193,12 +193,43 @@ class GitObjectAcquirer:
             raise GitAcquisitionError("locked revision source policy is stale")
         repository_path = self._repository_path(resolved.repository)
         self._prepare_repository(repository_path, resolved)
+        # Listed WITHOUT -l. On a partial clone, asking ls-tree for sizes makes Git resolve each
+        # blob individually: measured 557s for valkey cold, and still 9 minutes with every blob
+        # already local. That single flag was the whole cold-cache cost, and most of the warm one.
         tree = self._run(
             repository_path,
-            ("ls-tree", "-r", "-z", "-l", resolved.commit),
+            ("ls-tree", "-r", "-z", resolved.commit),
             maximum_output_bytes=_MAX_TREE_BYTES,
         )
-        selected = _selected_tree(source_inventory, resolved.repository, tree, self._limits)
+        chosen = _selected_paths(source_inventory, resolved.repository, tree, self._limits)
+        # One pack for every selected blob. Measured 1.6s for all of valkey's; on a warm cache Git
+        # has nothing to fetch. Object ids are validated tree entries, never user input, and the
+        # remote is the one the clone was made from.
+        # negotiationAlgorithm=noop: we name exact object ids, so there is no history delta to
+        # negotiate. With the default algorithm Git walks from the requested blobs as though they
+        # were tips and refuses the pack as incomplete ("did not send all necessary objects").
+        self._run(
+            repository_path,
+            (
+                "-c",
+                "fetch.negotiationAlgorithm=noop",
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "origin",
+                *(sha for _, sha in chosen),
+            ),
+            maximum_output_bytes=_MAX_TREE_BYTES,
+        )
+        # Exact sizes from the now-local objects, applying the same per-file and total bounds the
+        # sized listing used to enforce, before any content is read.
+        check_output = self._run(
+            repository_path,
+            ("cat-file", "--batch-check"),
+            input_bytes=b"".join(f"{sha}\n".encode("ascii") for _, sha in chosen),
+            maximum_output_bytes=_MAX_TREE_BYTES,
+        )
+        selected = _sized_selection(chosen, check_output, self._limits)
         batch_input = b"".join(f"{sha}\n".encode("ascii") for _, sha, _ in selected)
         batch_output = self._run(
             repository_path,
@@ -339,20 +370,20 @@ def _run_git(
     return result.stdout
 
 
-def _selected_tree(
+def _selected_paths(
     source_inventory: Mapping[str, object],
     repository: str,
     document: bytes,
     limits: AcquisitionLimits,
-) -> tuple[tuple[str, str, int], ...]:
-    selected: list[tuple[str, str, int]] = []
-    total_bytes = 0
+) -> tuple[tuple[str, str], ...]:
+    """Parse an unsized ls-tree listing into the (path, blob id) pairs policy includes."""
+    selected: list[tuple[str, str]] = []
     for raw in document.split(b"\0"):
         if not raw:
             continue
         try:
             metadata, encoded_path = raw.split(b"\t", 1)
-            mode, kind, encoded_sha, encoded_size = metadata.split(b" ", 3)
+            mode, kind, encoded_sha = metadata.split(b" ", 2)
             path = encoded_path.decode("utf-8")
         except (ValueError, UnicodeError) as error:
             raise GitAcquisitionError("Git tree entry is malformed") from error
@@ -363,7 +394,6 @@ def _selected_tree(
             continue
         try:
             sha = encoded_sha.decode("ascii")
-            size = int(encoded_size)
             decoded_mode = mode.decode("ascii")
         except (ValueError, UnicodeError) as error:
             raise GitAcquisitionError(
@@ -371,18 +401,47 @@ def _selected_tree(
             ) from error
         if decoded_mode not in _REGULAR_MODES or kind != b"blob":
             raise GitAcquisitionError(f"reviewed path {path!r} is not a regular Git blob")
-        if _SHA.fullmatch(sha) is None or not 0 <= size <= limits.max_file_bytes:
+        if _SHA.fullmatch(sha) is None:
+            raise GitAcquisitionError(f"reviewed path {path!r} has invalid Git metadata")
+        selected.append((path, sha))
+        if len(selected) > limits.max_files:
+            raise GitAcquisitionError("Git acquisition exceeded its file-count bound")
+    if not selected:
+        raise GitAcquisitionError(f"reviewed source {repository!r} selected no files")
+    if tuple(path for path, _ in selected) != tuple(sorted(path for path, _ in selected)):
+        raise GitAcquisitionError("Git tree did not return lexical path order")
+    return tuple(selected)
+
+
+def _sized_selection(
+    chosen: tuple[tuple[str, str], ...],
+    check_output: bytes,
+    limits: AcquisitionLimits,
+) -> tuple[tuple[str, str, int], ...]:
+    """Attach exact sizes from cat-file --batch-check and enforce the byte bounds.
+
+    One line per requested id, in request order: "<sha> blob <size>". A missing object prints
+    "<sha> missing", which is refused: the prefetch should have made every selected blob local.
+    """
+    lines = check_output.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    if len(lines) != len(chosen):
+        raise GitAcquisitionError("Git batch-check returned the wrong number of entries")
+    selected: list[tuple[str, str, int]] = []
+    total_bytes = 0
+    for (path, expected_sha), line in zip(chosen, lines, strict=True):
+        try:
+            sha, kind, encoded_size = line.decode("ascii").split(" ")
+            size = int(encoded_size)
+        except (ValueError, UnicodeError) as error:
+            raise GitAcquisitionError(f"reviewed path {path!r} has invalid Git metadata") from error
+        if sha != expected_sha or kind != "blob" or not 0 <= size <= limits.max_file_bytes:
             raise GitAcquisitionError(f"reviewed path {path!r} has invalid Git metadata")
         total_bytes += size
         if total_bytes > limits.max_total_bytes:
             raise GitAcquisitionError("Git acquisition exceeded its total-byte bound")
         selected.append((path, sha, size))
-        if len(selected) > limits.max_files:
-            raise GitAcquisitionError("Git acquisition exceeded its file-count bound")
-    if not selected:
-        raise GitAcquisitionError(f"reviewed source {repository!r} selected no files")
-    if tuple(path for path, _, _ in selected) != tuple(sorted(path for path, _, _ in selected)):
-        raise GitAcquisitionError("Git tree did not return lexical path order")
     return tuple(selected)
 
 
