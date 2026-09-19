@@ -80,7 +80,7 @@ def test_knowledge_plane_remains_exact_deployed_d01(tmp_path: Path) -> None:
     assert "sha256:" + hashlib.sha256(content).hexdigest() == D01_TEMPLATE_SHA256
     assert (
         D01_TEMPLATE_SHA256
-        == "sha256:c8ac5f1e0f5854c61dbdf5ae827ecd73f1b24863a46e136e36635ecc6c09f420"
+        == "sha256:079e00bf1c1d28d5ce28ca309f8acc2efa99c5247621674228d2039960387791"
     )
     for role_name in ("valkeyrie-development-application-deployer", APPLICATION_RUNTIME_ROLE_NAME):
         role_ids = [

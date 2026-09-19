@@ -278,6 +278,7 @@ def test_publisher_holds_exactly_publication_and_refresh_permission(
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
         "dynamodb:TransactWriteItems",
+        "dynamodb:ConditionCheckItem",
         "bedrock:StartIngestionJob",
         "bedrock:GetIngestionJob",
         "bedrock:Retrieve",
@@ -637,6 +638,7 @@ def test_publisher_refresh_permission_is_scoped_and_cannot_delete(tmp_path: Path
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
         "dynamodb:TransactWriteItems",
+        "dynamodb:ConditionCheckItem",
     ]
     assert lifecycle["Resource"] == {"Fn::GetAtt": ["StateTable", "Arn"]}
     # The table also holds request audits and protected approvals; the publisher is confined to

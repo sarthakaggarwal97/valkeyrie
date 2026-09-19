@@ -314,6 +314,10 @@ class KnowledgePlaneStack(Stack):
                     "dynamodb:PutItem",
                     "dynamodb:UpdateItem",
                     "dynamodb:TransactWriteItems",
+                    # The CAS transaction's ConditionCheck element on the candidate row is
+                    # authorized as its own action; the fourth manual refresh reached activation
+                    # and was denied exactly here after every earlier step had passed.
+                    "dynamodb:ConditionCheckItem",
                 ],
                 resources=[state_table.attr_arn],
                 # Scoped to the corpus-owned key families. The same table also holds request
