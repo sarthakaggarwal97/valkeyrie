@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping
+import sys
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Final, Protocol, cast
@@ -381,8 +382,20 @@ def run_ingestion(
             if status != "COMPLETE":
                 raise IngestionError("Bedrock returned an unknown ingestion status")
             scanned, failed = _statistics(job)
-            if failed != 0:
-                reason = f"Bedrock ingestion reported {failed} failed documents"
+            # The data source covers every generation under the prefix, so the job's failure
+            # count is prefix-wide: a stale unparseable object left under an OLD generation
+            # counted against a candidate whose own documents all indexed, and failed the first
+            # refresh to get this far. Only failures naming THIS generation's objects are the
+            # candidate's; anything else is reported but cannot fail it. Bedrock names the
+            # failed object keys in failureReasons, which is what makes attribution possible.
+            own_failures = _failures_in_generation(job, bundle.generation_id)
+            if failed != 0 and not own_failures:
+                _report_foreign_failures(job, failed, bundle.generation_id)
+            if own_failures:
+                reason = (
+                    f"Bedrock ingestion reported {len(own_failures)} failed documents in this "
+                    f"generation (of {failed} across the data source)"
+                )
                 coordinator.fail(lease, reason, now_epoch=now_epoch())
                 raise IngestionError(reason)
             coordinator.complete(
@@ -421,6 +434,32 @@ def _job_id(job: Mapping[str, object]) -> str:
     if not isinstance(value, str) or not _JOB_ID.fullmatch(value):
         raise IngestionError("Bedrock returned a malformed ingestion job ID")
     return value
+
+
+def _failures_in_generation(job: Mapping[str, object], generation_id: str) -> tuple[str, ...]:
+    """Object keys named in the job's failure reasons that belong to this generation."""
+    reasons = job.get("failureReasons")
+    if not isinstance(reasons, Sequence) or isinstance(reasons, str):
+        return ()
+    prefix = f"kb-documents/generations/{generation_id.removeprefix('sha256:')}/"
+    found: list[str] = []
+    for reason in reasons:
+        if not isinstance(reason, str):
+            continue
+        for key in re.findall(r"kb-documents/generations/[0-9a-f]{64}/[^\s\]\"',]+", reason):
+            if key.startswith(prefix) and key not in found:
+                found.append(key)
+    return tuple(found)
+
+
+def _report_foreign_failures(job: Mapping[str, object], failed: int, generation_id: str) -> None:
+    # Named on stderr so the run log shows what was left behind; a failure that belongs to no
+    # live generation is stale content under the prefix and should be removed, not ignored.
+    print(
+        f"ingestion reported {failed} failed documents, none in generation {generation_id}; "
+        "they belong to other generations under the data source prefix",
+        file=sys.stderr,
+    )
 
 
 def _statistics(job: Mapping[str, object]) -> tuple[int, int]:

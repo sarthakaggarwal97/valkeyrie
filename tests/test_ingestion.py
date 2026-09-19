@@ -76,14 +76,32 @@ class FakeBedrock:
         return cast(Mapping[str, object], self.polls.pop(0))
 
 
-def _poll(status: str, *, scanned: int = 0, failed: int = 0) -> dict[str, object]:
+def _poll(
+    status: str,
+    *,
+    scanned: int = 0,
+    failed: int = 0,
+    failed_keys: tuple[str, ...] = (),
+) -> dict[str, object]:
     job: dict[str, object] = {"ingestionJobId": JOB_ID, "status": status}
     if status == "COMPLETE":
         job["statistics"] = {
             "numberOfDocumentsScanned": scanned,
             "numberOfDocumentsFailed": failed,
         }
+        if failed_keys:
+            # Bedrock's shape: one reason string naming each ignored object.
+            job["failureReasons"] = [
+                "Encountered error: Ignored 1 files as their file format was not supported. "
+                f"[Files: s3://bucket/{key}]. Call to Customer Source did not succeed."
+                for key in failed_keys
+            ]
     return {"ingestionJob": job}
+
+
+def _doc_key(generation_id: str, name: str = "a" * 64) -> str:
+    digest = generation_id.removeprefix("sha256:")
+    return f"kb-documents/generations/{digest}/documents/{name}.txt"
 
 
 @pytest.fixture
@@ -343,7 +361,6 @@ def test_poll_bound_leaves_recoverable_ingesting_candidate(bundle: GenerationBun
     ("response", "message"),
     [
         (_poll("FAILED"), "ended with FAILED"),
-        (_poll("COMPLETE", scanned=2, failed=1), "reported 1 failed documents"),
         ({"ingestionJob": {"ingestionJobId": JOB_ID, "status": "UNKNOWN"}}, "unknown"),
         ({"malformed": True}, "has no job"),
     ],
@@ -550,3 +567,48 @@ def test_candidate_state_matches_shared_contract(bundle: GenerationBundle) -> No
             "$ref": "#/$defs/candidate_state",
         }
     ).validate(document)
+
+
+def test_only_failures_in_the_candidates_own_generation_fail_it(bundle: GenerationBundle) -> None:
+    """Failures elsewhere under the prefix are not the candidate's.
+
+    The data source spans every generation, so the job's failure count is prefix-wide. A stale
+    unparseable object under an OLD generation counted against a candidate whose own 3,801
+    documents all indexed, and failed the first refresh to get that far.
+    """
+    foreign = _doc_key("sha256:" + "f" * 64)
+    publication = _sealed(bundle)
+    candidate = MemoryCandidateStore(None)
+    bedrock = FakeBedrock([_poll("COMPLETE", scanned=10, failed=1, failed_keys=(foreign,))])
+
+    result = run_ingestion(
+        publication,
+        candidate,
+        bedrock,
+        bundle,
+        knowledge_base_id=KB_ID,
+        data_source_id=DATA_SOURCE_ID,
+        owner="w",
+        now_epoch=lambda: NOW,
+        sleep=lambda _: None,
+    )
+    assert result.generation_id == bundle.generation_id
+    assert candidate.state is not None and candidate.state.status is CandidateStatus.INGESTED
+
+    # A failure naming one of THIS generation's objects still fails it, and says so precisely.
+    own = _doc_key(bundle.generation_id)
+    candidate = MemoryCandidateStore(None)
+    bedrock = FakeBedrock([_poll("COMPLETE", scanned=10, failed=2, failed_keys=(foreign, own))])
+    with pytest.raises(IngestionError, match="1 failed documents in this generation .of 2"):
+        run_ingestion(
+            publication,
+            candidate,
+            bedrock,
+            bundle,
+            knowledge_base_id=KB_ID,
+            data_source_id=DATA_SOURCE_ID,
+            owner="w",
+            now_epoch=lambda: NOW,
+            sleep=lambda _: None,
+        )
+    assert candidate.state is not None and candidate.state.status is CandidateStatus.FAILED

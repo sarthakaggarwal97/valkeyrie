@@ -110,8 +110,12 @@ def publish_generation(store: PublicationStore, bundle: GenerationBundle) -> Pub
         created.append(completion.key)
     final_keys = _listed_keys(store, verified.generation_id)
     _verify_key_set(final_keys, expected_all)
-    for item in (*planned, completion):
-        _verify_object(store, verified.generation_id, item)
+    # Every planned object was byte-verified against memory moments ago, above, and the store is
+    # write-once, so a second full re-read of all of them proved nothing new and cost as much as
+    # the first: on the first manual refresh each pass was about an hour (7,600 objects, HEAD plus
+    # GET each, sequentially from a runner). Only the completion marker, the one object written
+    # since that verification, is read back.
+    _verify_object(store, verified.generation_id, completion)
     return PublicationResult(
         verified.generation_id,
         completion.key,
