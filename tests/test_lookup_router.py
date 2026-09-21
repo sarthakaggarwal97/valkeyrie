@@ -64,7 +64,9 @@ def test_empty_lookups_is_a_valid_no_op_plan() -> None:
     [
         # A capability outside the catalog is refused, never coerced to a near match.
         ('{"lookups":[{"kind":"shell","cmd":"id"}]}', "not in the catalog"),
-        ('{"lookups":[{"kind":"project_board","repository":"valkey"}]}', "not in the catalog"),
+        # A board takes a number, never a repository: the extra key is refused.
+        ('{"lookups":[{"kind":"project_board","repository":"valkey"}]}', "unsupported keys"),
+        ('{"lookups":[{"kind":"project_board","number":41,"owner":"x"}]}', "unsupported keys"),
         # A repository outside the organization's naming, or a traversal, is refused.
         ('{"lookups":[{"kind":"issue","repository":"../../etc","number":1}]}', "malformed"),
         ('{"lookups":[{"kind":"issue","repository":"valkey-io/valkey","number":1}]}', "malformed"),
@@ -252,3 +254,15 @@ def test_a_poisoned_prior_turn_cannot_replace_the_question() -> None:
 
     plan = route_lookups("is it released yet?", faithful, poisoned[:1])
     assert plan is not None and plan.question == "Has pull request #3853 been released yet?"
+
+
+def test_project_boards_are_a_catalog_entry_with_known_numbers() -> None:
+    from valkeyrie.live_github import ProjectQuery
+    from valkeyrie.lookup_router import KNOWN_BOARDS
+
+    plan = parse_lookup_plan('{"lookups":[{"kind":"project_board","number":41}]}')
+    assert plan.live == (ProjectQuery(41),)
+    # The prompt names every known board so the model can map a release to a number.
+    for title, number in KNOWN_BOARDS.items():
+        assert f"{title} is #{number}" in ROUTER_SYSTEM
+    assert KNOWN_BOARDS["Valkey 9.1"] == 41 and KNOWN_BOARDS["Valkey 9.2"] == 51

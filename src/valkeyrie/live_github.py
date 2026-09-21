@@ -531,9 +531,16 @@ def normalize_project_response(value: object, *, number: int) -> dict[str, objec
         raise LiveGitHubError("GitHub Projects returned a non-public project")
 
     items_value = _object(project.get("items"), "project items")
-    total_count = _bounded_count(items_value, "totalCount")
+    # totalCount is the board's size, not ours to bound: real release boards hold 150 to 300
+    # items against a page of 100, and refusing them meant no release board could be read at
+    # all. The PAGE stays bounded; the payload says when it is a partial view so an answer can
+    # say "the first 100 of 268 items" rather than presenting a page as the whole board.
+    total_count = _positive_or_zero_integer(items_value, "totalCount")
     nodes = _list(items_value, "nodes")
-    if total_count != len(nodes):
+    if len(nodes) > MAX_COLLECTION_ITEMS:
+        raise LiveGitHubError("GitHub project items exceed the requested page bound")
+    partial = total_count > len(nodes)
+    if not partial and total_count != len(nodes):
         raise LiveGitHubError("GitHub Projects result is incomplete")
     items = [_project_item(item) for item in nodes]
     return {
@@ -548,6 +555,9 @@ def normalize_project_response(value: object, *, number: int) -> dict[str, objec
         "url": expected_url,
         "total_count": total_count,
         "items": items,
+        "items_shown": len(items),
+        "items_total": total_count,
+        "partial": partial,
     }
 
 
@@ -1173,6 +1183,13 @@ def _matching_integer(value: Mapping[str, object], key: str, expected: int) -> i
     if result != expected:
         raise LiveGitHubError(f"GitHub field {key} conflicts with the query")
     return result
+
+
+def _positive_or_zero_integer(value: Mapping[str, object], key: str) -> int:
+    count = value.get(key)
+    if type(count) is not int or count < 0 or count > 1_000_000:
+        raise LiveGitHubError(f"GitHub field {key} must be a bounded non-negative integer")
+    return count
 
 
 def _bounded_count(value: Mapping[str, object], key: str) -> int:

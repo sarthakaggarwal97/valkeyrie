@@ -30,6 +30,7 @@ from typing import Final, Literal
 from valkeyrie.live_github import (
     IssueQuery,
     LiveGitHubQuery,
+    ProjectQuery,
     PullRequestQuery,
     ReleaseListQuery,
 )
@@ -37,11 +38,20 @@ from valkeyrie.live_github import (
 ROUTER_PROMPT_REVISION: Final = "lookup-router/1"
 
 # The closed catalog. Adding an entry here is the ONLY way the model gains a capability.
-LookupKind = Literal["corpus_search", "pull_request", "issue", "releases"]
-# project_board is deliberately absent: the runtime holds no GitHub Projects credential, so that
-# lookup can only fail closed, and offering it would turn roadmap questions into confident
-# abstentions instead of a corpus answer. Add it when a credential exists.
-_KINDS: Final[frozenset[str]] = frozenset({"corpus_search", "pull_request", "issue", "releases"})
+LookupKind = Literal["corpus_search", "pull_request", "issue", "releases", "project_board"]
+_KINDS: Final[frozenset[str]] = frozenset(
+    {"corpus_search", "pull_request", "issue", "releases", "project_board"}
+)
+# valkey-io project boards the router may name. Board numbers are not guessable from a release
+# name, so the catalog carries the mapping; anything else needs the asker to give a number.
+# Enumerated from the Projects API on 2026-09-21 with the read:project token.
+KNOWN_BOARDS: Final[Mapping[str, int]] = {
+    "Valkey 9.2": 51,
+    "Valkey 9.1": 41,
+    "Valkey 9.0": 18,
+    "Valkey-GLIDE 2.6": 81,
+    "Valkey Admin 2026 Roadmap": 91,
+}
 
 # Same bounds the live query types enforce; a mismatch here would let the model shape a request
 # the transport then refuses, which would fail closed but waste the call.
@@ -71,6 +81,12 @@ ROUTER_SYSTEM: Final = (
     '- {"kind":"releases","repository":"valkey"}: the most recent releases INCLUDING release '
     "candidates and other prereleases. Use for anything about what has shipped, what the latest "
     "or newest version is, whether an rc or a version exists.\n"
+    '- {"kind":"project_board","number":N}: a valkey-io project board, the planning view for a '
+    "release or a workstream. Use for what is planned, in progress, or remaining for a release, "
+    "or what is on a board. Known boards: "
+    + ", ".join(f"{title} is #{number}" for title, number in KNOWN_BOARDS.items())
+    + ". Use only these numbers or one the asker gives; a release with no board here has none "
+    "you can read.\n"
     "\n"
     "Rules:\n"
     "- Choose every lookup that would help; a question about a feature that may be unreleased "
@@ -279,7 +295,7 @@ def parse_lookup_plan(raw: object) -> LookupPlan:
             _only_keys(item, {"kind"})
             corpus_search = True
             continue
-        repository = _repository(item)
+        repository = _repository(item) if kind != "project_board" else _DEFAULT_REPOSITORY
         if kind == "pull_request":
             _only_keys(item, {"kind", "repository", "number"})
             live.append(PullRequestQuery(repository, _number(item)))
@@ -289,6 +305,9 @@ def parse_lookup_plan(raw: object) -> LookupPlan:
         elif kind == "releases":
             _only_keys(item, {"kind", "repository"})
             live.append(ReleaseListQuery(repository))
+        elif kind == "project_board":
+            _only_keys(item, {"kind", "number"})
+            live.append(ProjectQuery(_number(item)))
     return LookupPlan(corpus_search=corpus_search, live=tuple(live), question=resolved)
 
 

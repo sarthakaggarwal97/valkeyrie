@@ -1040,9 +1040,11 @@ def test_projects_transport_failure_is_not_retried() -> None:
             "canonical URL",
         ),
         (
+            # More nodes than the board claims to hold is a contradiction. (Fewer is a partial
+            # page now, which real release boards produce and which is reported, not refused.)
             lambda value: cast(dict[str, Any], value["data"])["organization"]["projectV2"][
                 "items"
-            ].update({"totalCount": 4}),
+            ].update({"totalCount": 0}),
             "incomplete",
         ),
         (
@@ -1075,12 +1077,26 @@ def test_project_normalizer_rejects_partial_conflicting_or_unsupported_data(
         normalize_project_response(value, number=14)
 
 
-def test_project_item_count_has_the_same_exact_collection_bound() -> None:
+def test_a_board_larger_than_one_page_is_a_partial_view_not_a_refusal() -> None:
+    """Real release boards hold 150 to 300 items against a page of 100.
+
+    The old whole-board bound refused every one of them, so no release board could be read at all.
+    The page stays bounded; the payload states how much of the board it shows.
+    """
     value = _project()
     project = cast(dict[str, Any], value["data"])["organization"]["projectV2"]
-    project["items"]["totalCount"] = MAX_COLLECTION_ITEMS + 1
+    shown = len(project["items"]["nodes"])
+    project["items"]["totalCount"] = 268
 
-    with pytest.raises(LiveGitHubError, match="collection bound"):
+    payload = normalize_project_response(value, number=14)
+    assert payload["items_shown"] == shown
+    assert payload["items_total"] == 268
+    assert payload["partial"] is True
+
+    # More nodes than the page can hold is a response that cannot be trusted.
+    project["items"]["nodes"] = project["items"]["nodes"] * (MAX_COLLECTION_ITEMS + 1)
+    project["items"]["totalCount"] = len(project["items"]["nodes"])
+    with pytest.raises(LiveGitHubError, match="exceed the requested page bound"):
         normalize_project_response(value, number=14)
 
 

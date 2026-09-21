@@ -50,8 +50,10 @@ class FakeConnection:
         self.requests: list[tuple[str, str, dict[str, str]]] = []
         self.closed = False
 
-    def request(self, method: str, target: str, headers: dict[str, str]) -> None:
-        self.requests.append((method, target, headers))
+    def request(
+        self, method: str, target: str, body: object = None, headers: dict[str, str] | None = None
+    ) -> None:
+        self.requests.append((method, target, headers or {}))
 
     def getresponse(self) -> FakeResponse:
         return self.response
@@ -173,8 +175,14 @@ def test_token_authenticates_api_requests_only_and_is_optional() -> None:
         def __init__(self, host: str, timeout: float) -> None:
             self.sock = None
 
-        def request(self, method: str, target: str, headers: dict[str, str]) -> None:
-            captured.append(dict(headers))
+        def request(
+            self,
+            method: str,
+            target: str,
+            body: object = None,
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            captured.append(dict(headers or {}))
 
         def getresponse(self) -> object:
             class _Response:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 import math
 import re
 from collections.abc import Callable, Mapping
@@ -41,6 +42,8 @@ def fetch_public_github(
     *,
     elapsed_clock: Callable[[], float] = monotonic,
     token: str | None = None,
+    method: str = "GET",
+    body_bytes: bytes | None = None,
 ) -> HttpResponse:
     """Issue one bounded GET without redirects or arbitrary origins.
 
@@ -79,6 +82,14 @@ def fetch_public_github(
         ),
         "User-Agent": "valkeyrie-read/0.1",
     }
+    if method not in {"GET", "POST"} or (method == "GET") != (body_bytes is None):
+        raise GitHubReadError("GitHub read method and body are inconsistent")
+    if body_bytes is not None:
+        # A POST is only ever a GraphQL query, and only to api.github.com; it is bounded in size
+        # like everything else here, and it still reads, so it is still sent read-only.
+        if not api_request or parsed.path != "/graphql" or len(body_bytes) > 64 * 1024:
+            raise GitHubReadError("GitHub POST is only permitted for a bounded GraphQL query")
+        headers["Content-Type"] = "application/json"
     if api_request:
         headers["X-GitHub-Api-Version"] = "2022-11-28"
         if token:
@@ -94,7 +105,7 @@ def fetch_public_github(
 
     connection = http.client.HTTPSConnection(parsed.netloc, timeout=remaining_time())
     try:
-        connection.request("GET", target, headers=headers)
+        connection.request(method, target, body=body_bytes, headers=headers)
         if connection.sock is not None:
             connection.sock.settimeout(remaining_time())
         response = connection.getresponse()
@@ -121,3 +132,30 @@ def fetch_public_github(
         raise GitHubReadError(f"public GitHub read failed: {error}") from error
     finally:
         connection.close()
+
+
+def fetch_github_graphql(
+    query: str,
+    variables: Mapping[str, object],
+    timeout_seconds: float,
+    max_bytes: int,
+    *,
+    token: str,
+) -> HttpResponse:
+    """Execute one GraphQL query. Satisfies live_github.ProjectsGraphQLFetcher.
+
+    Projects (v2) are only reachable through GraphQL and only with a token carrying read:project,
+    so this is the one place the runtime speaks GraphQL. The same transport, byte and time bounds
+    apply as for every REST read; the token is the same read-only token.
+    """
+    if not isinstance(query, str) or not query.strip():
+        raise GitHubReadError("GraphQL query must be non-blank text")
+    body = json.dumps({"query": query, "variables": dict(variables)}, separators=(",", ":"))
+    return fetch_public_github(
+        "https://api.github.com/graphql",
+        timeout_seconds,
+        max_bytes,
+        token=token,
+        method="POST",
+        body_bytes=body.encode("utf-8"),
+    )

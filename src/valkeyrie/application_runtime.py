@@ -26,7 +26,7 @@ from valkeyrie.bedrock_response import (
     normalize_bedrock_response,
 )
 from valkeyrie.drafting import DraftingError, _screened_model_text
-from valkeyrie.github import fetch_public_github
+from valkeyrie.github import fetch_github_graphql, fetch_public_github
 from valkeyrie.live_github import (
     LiveGitHubError,
     LiveGitHubQuery,
@@ -1901,6 +1901,9 @@ class AwsRuntimeServices:
         return read_live_github(
             query,
             fetch=partial(fetch_public_github, token=token),
+            # Same token: it carries read:project, so boards read through GraphQL with it. When
+            # the token is absent (anonymous path above) Projects fail closed, as before.
+            projects_fetch=partial(fetch_github_graphql, token=token),
         )
 
     def _github_token(self) -> str | None:
