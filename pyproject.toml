@@ -7,7 +7,7 @@ requires-python = ">=3.11,<3.12"
 license = "BSD-3-Clause"
 authors = [{ name = "Sarthak Aggarwal" }]
 dependencies = [
-    "aws-cdk-lib==2.265.0",
+    "aws-cdk-lib==2.270.0",
     "jsonschema==4.26.0",
     "pathspec==1.1.1",
     "PyYAML==6.0.3",
