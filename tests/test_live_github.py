@@ -374,6 +374,10 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
     payload = _decoded(observation)
     assert payload == {
         "api_version": "valkeyrie.io/live-github/1",
+        "finding": (
+            'The search found 2 issues in valkey-io/valkey whose title or body contains "release" '
+            'and "status".'
+        ),
         "items": [
             {
                 "api_url": "https://api.github.com/repos/valkey-io/valkey/issues/8",
@@ -1390,6 +1394,19 @@ def test_a_question_naming_two_repositories_is_searched_in_both() -> None:
     )
     assert "q=repo%3Avalkey-io%2Fvalkey+repo%3Avalkey-io%2Fvalkey-glide+is%3Aissue" in seen[0]
     assert "org%3A" not in seen[0]
+    # An empty result states its finding in words, derived only from the query's own fields:
+    # a zero read as a gap made the model abstain when the absence WAS the answer.
+    empty = json.loads(
+        read_live_github(
+            IssueSearchQuery(("streaming", "compression"), repository="valkey-glide"),
+            fetch=fetch,
+        ).canonical_payload
+    )
+    assert empty["finding"] == (
+        "The search completed and found no issues in valkey-io/valkey-glide whose title or body "
+        'contains "streaming" and "compression". This establishes that no such issues existed '
+        "there at observation time."
+    )
 
     # An item from a repository outside the scope is still refused.
     def leaking(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
@@ -1413,3 +1430,36 @@ def test_a_question_naming_two_repositories_is_searched_in_both() -> None:
             ),
             fetch=leaking,
         )
+
+
+def test_a_release_list_keeps_short_notes_for_the_newest_releases_only() -> None:
+    """Eight releases with whole notes was 56 KB of a 64 KB evidence budget and starved every
+    other record. The newest three keep their opening 3 KB (the headline features); the older
+    ones matter as tags and dates, so their notes are dropped and the item says so."""
+    from valkeyrie.live_github import MAX_RELEASE_LIST_BODY_BYTES, RELEASE_LIST_BODIES
+
+    items = []
+    for index in range(6):
+        release = _release()
+        release.update(
+            {
+                "id": 100 + index,
+                "tag_name": f"9.{index}.0",
+                "body": ("n" * (MAX_RELEASE_LIST_BODY_BYTES + 500)) if index != 1 else "short",
+            }
+        )
+        release["url"] = f"https://api.github.com/repos/valkey-io/valkey/releases/{100 + index}"
+        release["html_url"] = f"https://github.com/valkey-io/valkey/releases/tag/9.{index}.0"
+        items.append(release)
+    payload = json.loads(
+        read_live_github(
+            ReleaseListQuery("valkey", 8), fetch=lambda *a: _response(items)
+        ).canonical_payload
+    )
+    releases = payload["releases"]
+    assert len(releases[0]["body"].encode("utf-8")) == MAX_RELEASE_LIST_BODY_BYTES
+    assert releases[0]["body_truncated"] is True
+    assert releases[1]["body"] == "short" and "body_truncated" not in releases[1]
+    for release in releases[RELEASE_LIST_BODIES:]:
+        assert release["body"] is None and release["body_truncated"] is True
+    assert len(json.dumps(payload).encode("utf-8")) < 16 * 1024

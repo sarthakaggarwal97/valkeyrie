@@ -202,6 +202,9 @@ _MAX_QUESTION_BYTES: Final = 8 * 1024
 _UNSET: Final = object()
 _MAX_EVIDENCE: Final = 10
 _MAX_EVIDENCE_BYTES: Final = 64 * 1024
+# The most of the byte budget live records may take together, leaving the corpus at least the
+# rest: about four chunks, enough to say what a thing is while GitHub says where it stands.
+_MAX_LIVE_EVIDENCE_BYTES: Final = 40 * 1024
 _RELEASE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 _RELEASE_ARTIFACT: Final = re.compile(
     r"^valkey-(?P<release>[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?)\.tar\.gz$"
@@ -1105,7 +1108,17 @@ def _bounded_evidence(values: tuple[RuntimeEvidence, ...]) -> tuple[RuntimeEvide
     live = tuple(item for item in values if isinstance(item, LiveRuntimeEvidence))
     static = tuple(item for item in values if not isinstance(item, LiveRuntimeEvidence))
     # Live is capped at half the package so a supplement can never crowd out the corpus.
-    kept_live = live[: _MAX_EVIDENCE // 2]
+    kept_live = list(live[: _MAX_EVIDENCE // 2])
+    # Live records have a byte share as well as a count. A router may put a board (18 KB) beside
+    # a release list (27 KB); under the displacement rule alone that left two corpus chunks, and
+    # a question about what a feature IS lost the records that say so. Measured: the same
+    # question answered twice and abstained once, on the routing draw. The largest live record
+    # goes first, since it is the most expensive and, board or list, the least specific.
+    while (
+        sum(len(item.text.encode("utf-8")) for item in kept_live) > _MAX_LIVE_EVIDENCE_BYTES
+        and len(kept_live) > 1
+    ):
+        del kept_live[max(range(len(kept_live)), key=lambda i: len(kept_live[i].text))]
     kept: list[RuntimeEvidence] = list(static[: _MAX_EVIDENCE - len(kept_live)])
     kept.extend(kept_live)
     total = sum(len(item.text.encode("utf-8")) for item in kept)

@@ -1734,6 +1734,21 @@ def test_live_supplements_displace_static_evidence_rather_than_being_dropped() -
     assert sum(len(item.text.encode("utf-8")) for item in heavy) <= _MAX_EVIDENCE_BYTES
     assert any(isinstance(item, LiveRuntimeEvidence) for item in heavy)
 
+    # Live records also have a byte share. A board beside a release list took 45 KB and left two
+    # corpus chunks; the same question then answered or abstained on the routing draw. The
+    # largest live record gives way first, and the corpus keeps the rest of the budget.
+    from valkeyrie.application_runtime import _MAX_LIVE_EVIDENCE_BYTES
+
+    corpus = tuple(static(f"ev_{index:02d}", 5_000) for index in range(_MAX_EVIDENCE))
+    mixed = _bounded_evidence(
+        (*corpus, live("board", 18_000), live("releases", 27_000), live("search", 6_000))
+    )
+    kept_live = [item for item in mixed if isinstance(item, LiveRuntimeEvidence)]
+    assert sum(len(item.text.encode("utf-8")) for item in kept_live) <= _MAX_LIVE_EVIDENCE_BYTES
+    assert [item.evidence_id for item in kept_live] == ["board", "search"]
+    assert sum(not isinstance(item, LiveRuntimeEvidence) for item in mixed) >= 4
+    assert sum(len(item.text.encode("utf-8")) for item in mixed) <= _MAX_EVIDENCE_BYTES
+
 
 def test_completion_time_comes_from_the_runtime_clock_when_one_is_supplied(
     manifest: dict[str, object],

@@ -173,6 +173,7 @@ MAX_SEARCH_TERM_BYTES: Final = 64
 MAX_SEARCH_BODY_BYTES: Final = 16 * 1024
 # Per-release notes bound inside a release LIST; a single release keeps its full notes.
 MAX_RELEASE_LIST_BODY_BYTES: Final = 3 * 1024
+RELEASE_LIST_BODIES: Final = 3
 MAX_SEARCH_PER_PAGE: Final = 20
 # Supplementary searches carry whole issue bodies, so they take a smaller page than
 # a routed search: twenty bodies exceed MAX_RESPONSE_BYTES.
@@ -801,7 +802,7 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         return (
             url,
             "issue",
-            lambda value: _issue_search(value, terms, scope or None, per_page),
+            lambda value: _issue_search(value, terms, scope or None, per_page, query.kind),
         )
     if isinstance(query, LatestReleaseQuery):
         repository = _repository(query.repository)
@@ -952,6 +953,7 @@ def _issue_search(
     terms: tuple[str, ...],
     repositories: tuple[str, ...] | None,
     per_page: int,
+    kind: str = "issue",
 ) -> dict[str, object]:
     incomplete = _boolean(value, "incomplete_results")
     items = _list(value, "items")
@@ -980,7 +982,30 @@ def _issue_search(
         "per_page": per_page,
         "total_count": total_count,
         "items": normalized,
+        # The result in words. An empty list read as a gap rather than a finding: on a question
+        # about a client library's support for a server feature, the search that showed the
+        # library has nothing on it was the answer, and the model abstained for want of it two
+        # times in five. Every word here is derived from fields above; nothing is added.
+        "finding": _search_finding(kind, terms, repositories, total_count),
     }
+
+
+def _search_finding(
+    kind: str, terms: tuple[str, ...], repositories: tuple[str, ...] | None, total_count: int
+) -> str:
+    what = "pull requests" if kind == "pull-request" else "issues"
+    where = (
+        " or ".join(f"{OWNER}/{r}" for r in repositories)
+        if repositories
+        else f"the {OWNER} organization"
+    )
+    words = " and ".join(f'"{term}"' for term in terms)
+    if total_count == 0:
+        return (
+            f"The search completed and found no {what} in {where} whose title or body contains "
+            f"{words}. This establishes that no such {what} existed there at observation time."
+        )
+    return f"The search found {total_count} {what} in {where} whose title or body contains {words}."
 
 
 def _search_body(value: Mapping[str, object]) -> tuple[str | None, bool]:
@@ -1105,13 +1130,20 @@ def _release_list(value: Mapping[str, object], repository: str, per_page: int) -
     # Whole, the list was 56 KB of the 64 KB evidence budget and starved every other record;
     # measured, that turned a mixed plan into an abstention. The notes' opening section (the
     # headline features) is what a "what shipped" question needs, so each body is cut there.
-    for release in releases:
+    # Only the newest few keep notes at all: the older ones matter as tags and dates (is this
+    # version out, does it contain that commit), which the notes add nothing to.
+    for position, release in enumerate(releases):
         body = release.get("body")
-        if isinstance(body, str):
-            encoded = body.encode("utf-8")
-            if len(encoded) > MAX_RELEASE_LIST_BODY_BYTES:
-                release["body"] = encoded[:MAX_RELEASE_LIST_BODY_BYTES].decode("utf-8", "ignore")
-                release["body_truncated"] = True
+        if not isinstance(body, str):
+            continue
+        if position >= RELEASE_LIST_BODIES:
+            release["body"] = None
+            release["body_truncated"] = True
+            continue
+        encoded = body.encode("utf-8")
+        if len(encoded) > MAX_RELEASE_LIST_BODY_BYTES:
+            release["body"] = encoded[:MAX_RELEASE_LIST_BODY_BYTES].decode("utf-8", "ignore")
+            release["body_truncated"] = True
     return {
         "api_version": _API_VERSION,
         "kind": "release_list",
