@@ -31,7 +31,7 @@ FUNCTION = "valkeyrie-development-application"
 # timeout so the densest questions are not cut off. The corpus is resolved at runtime
 # from the active pointer, so this serves the complete generation. Version 8 is Opus,
 # which failed the claim-to-evidence gate at 0.743 against a required 1.0.
-QUALIFIER = "35"
+QUALIFIER = "36"
 KNOWLEDGE_BASE_ID = "ONVASJDDNX"
 REGION = "us-east-1"
 ADDRESS = ("127.0.0.1", 8765)
