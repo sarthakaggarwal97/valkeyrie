@@ -135,6 +135,18 @@ _REVIEWED_AUTHORITIES: Final[Mapping[str, str]] = MappingProxyType(
         "valkey-skills": "secondary",
     }
 )
+# Content and marketing wording. "Content" alone is ambiguous (it can mean stored data), so it
+# counts only alongside something that makes it editorial.
+_CONTENT: Final = re.compile(
+    r"\b(?:blog|blogs|blogging|blogpost|social\s+media|twitter|linkedin|mastodon|newsletter"
+    r"|announcement|announcements|press|marketing|brand|branding|logo|planet|podcast"
+    r"|website\s+content|content\s+(?:policy|calendar|guidelines|strategy|review))\b"
+    r"|\bcontent\b(?=[^.]*\b(?:blog|social|media|marketing|website|post|posts|publish)\b)"
+    r"|\b(?:blog|social|marketing|website|publish\w*)\b(?=[^.]*\bcontent\b)",
+    re.IGNORECASE,
+)
+
+
 _REPOSITORY_NAMES: Final = tuple(_REVIEWED_AUTHORITIES)
 _FEATURE_ALIASES: Final = (
     (
@@ -163,6 +175,14 @@ _FEATURE_ALIASES: Final = (
     (
         re.compile(r"\b(?:event|events|conference|meetup)\b", re.IGNORECASE),
         ("events calendar",),
+    ),
+    (
+        # The project's own content work: blog posts, the website, social media, the Planet feed
+        # that aggregates community writing, and brand assets. Asked as "how does the project
+        # handle content", every one of these scoped to valkey and valkey-doc, the two most
+        # technical repositories, which is why the bot read "content" as stored data.
+        _CONTENT,
+        ("blog", "post", "social media", "announcement", "planet", "brand", "logo"),
     ),
     (
         re.compile(
@@ -210,6 +230,10 @@ _CATEGORY_SCOPES: Final = (
     (
         re.compile(r"\b(?:event|events|conference|meetup)\b", re.IGNORECASE),
         ("valkey-io.github.io", "community"),
+    ),
+    (
+        _CONTENT,
+        ("valkey-io.github.io", "planet", "one-time-for-planet", "community", "assets"),
     ),
     (
         re.compile(

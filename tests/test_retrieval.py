@@ -745,3 +745,29 @@ def test_the_core_repository_is_included_when_named_alongside_another() -> None:
             "compare valkey-glide and valkey-py reconnect handling"
         ).repositories
     ) == {"valkey-glide", "valkey-py"}
+
+
+def test_content_and_marketing_questions_do_not_scope_to_the_code_repositories() -> None:
+    """A real thread asked how the project handles content, meaning social media and blogs, and the
+    bot read it as stored data: every content question scoped to valkey and valkey-doc, the two most
+    technical repositories, though the corpus carries the website, Planet and the assets repo."""
+    from valkeyrie.retrieval import derive_retrieval_intent
+
+    for question in (
+        "Content for social media and blogs",
+        "how do I write a blog post for valkey.io?",
+        "what is the social media policy?",
+        "who reviews blog content?",
+        "is there a content calendar?",
+    ):
+        scope = set(derive_retrieval_intent(question).repositories)
+        assert "valkey-io.github.io" in scope, question
+        assert "planet" in scope, question
+        assert "valkey" not in scope, question
+    # "content" about stored data stays technical: the word alone does not make it editorial.
+    for technical in (
+        "how does valkey handle content in a list?",
+        "how does replication work",
+        "what is the content of an RDB file?",
+    ):
+        assert "valkey" in derive_retrieval_intent(technical).repositories, technical

@@ -195,11 +195,16 @@ def _turns_before(
 ) -> list[dict[str, str]]:
     """Map thread messages to bounded user/assistant turns, excluding the current mention.
 
-    Only the asker's own turns and this bot's replies are kept. A thread is a room: another
-    person's message is not context for this person's follow-up, and taking it as one let a
-    third party supply the subject that "is it released?" resolves against.
+    The asker's own turns, this bot's replies, and the message that OPENED the thread are kept.
+    Another person's mid-thread message is not context for this person's follow-up, and taking it
+    as one let a third party supply the subject that "is it released?" resolves against. The
+    opening message is different: it is what the thread is about, and dropping it broke a real
+    conversation where one person asked "how does the project handle content?", the bot asked
+    which kind, and a SECOND person answered "content for social media and blogs" to a bot that
+    could no longer see the question.
     """
     turns: list[dict[str, str]] = []
+    root_ts = messages[0].get("ts") if messages else None
     for message in messages:
         if message.get("ts") == current_ts:
             break
@@ -213,7 +218,7 @@ def _turns_before(
             role = "assistant"
         elif message.get("bot_id"):
             continue
-        elif asker and message.get("user") != asker:
+        elif asker and message.get("user") != asker and message.get("ts") != root_ts:
             continue
         else:
             role = "user"
