@@ -1306,7 +1306,7 @@ def test_live_issue_search_uses_typed_query_and_api_citation(
     services = FakeServices()
     source_url = (
         "https://api.github.com/search/issues?"
-        "q=org%3Avalkey-io+replication+compression+status&sort=updated&order=desc&per_page=20"
+        "q=org%3Avalkey-io+replication+compression+status&per_page=20"
     )
     services.live_observation = _live_observation(
         kind="issue_search", object_type="issue", source_url=source_url, url=None

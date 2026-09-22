@@ -366,7 +366,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
         # GitHub requires an explicit kind on authenticated search/issues requests and
         # returns 422 without one.
         "q=repo%3Avalkey-io%2Fvalkey+is%3Aissue+release+status"
-        "&sort=updated&order=desc&per_page=20"
+        "&per_page=20"
     )
     assert calls == [(expected_url, REQUEST_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES)]
     assert observation.source_url == expected_url
@@ -419,12 +419,11 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
             },
         ],
         "kind": "issue_search",
-        "order": "desc",
         "owner": OWNER,
         "per_page": 20,
         "repositories": ["valkey"],
         "repository": "valkey",
-        "sort": "updated",
+        "sort": "best-match",
         "terms": ["release", "status"],
         "total_count": 2,
     }
@@ -449,7 +448,7 @@ def test_issue_search_can_use_only_the_fixed_org_scope() -> None:
 
     assert calls == [
         "https://api.github.com/search/issues?"
-        "q=org%3Avalkey-io+is%3Aissue+release+timeline&sort=updated&order=desc&per_page=2"
+        "q=org%3Avalkey-io+is%3Aissue+release+timeline&per_page=2"
     ]
     payload = _decoded(observation)
     assert payload["repository"] is None

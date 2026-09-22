@@ -93,7 +93,10 @@ def test_hostile_or_malformed_replies_are_refused(raw: str, reason: str) -> None
 
 
 def test_too_many_lookups_and_oversized_replies_are_refused() -> None:
-    many = json.dumps({"lookups": [{"kind": "issue", "number": n} for n in range(1, 6)]})
+    # Six is the cap: five live records is what the evidence budget admits beside the corpus.
+    six = json.dumps({"lookups": [{"kind": "issue", "number": n} for n in range(1, 7)]})
+    assert len(parse_lookup_plan(six).live) == 6
+    many = json.dumps({"lookups": [{"kind": "issue", "number": n} for n in range(1, 8)]})
     with pytest.raises(LookupRouterError, match="too many"):
         parse_lookup_plan(many)
     with pytest.raises(LookupRouterError, match="byte bound"):
@@ -266,3 +269,55 @@ def test_project_boards_are_a_catalog_entry_with_known_numbers() -> None:
     for title, number in KNOWN_BOARDS.items():
         assert f"{title} is #{number}" in ROUTER_SYSTEM
     assert KNOWN_BOARDS["Valkey 9.1"] == 41 and KNOWN_BOARDS["Valkey 9.2"] == 51
+
+
+def test_the_router_may_choose_a_bounded_search() -> None:
+    """A search is the one lookup where the model composes free text that reaches GitHub, so
+    its shape is bounded here and re-normalized by the transport. A phrase given as one term is
+    split into words (the same thing to GitHub); a search left under two words is dropped on
+    its own, not with the whole plan; anything that is not a plain word is refused."""
+    from valkeyrie.live_github import IssueSearchQuery
+
+    plan = parse_lookup_plan(
+        '{"lookups":[{"kind":"corpus_search"},'
+        '{"kind":"search","terms":["CLUSTER SLOTS","stale"],"repositories":["valkey"],'
+        '"scope":"issue"},'
+        '{"kind":"search","terms":["streaming","compression"],'
+        '"repositories":["valkey-glide","valkey"],"scope":"pull-request"},'
+        '{"kind":"search","terms":["flash"],"repositories":["valkey"],"scope":"issue"}]}'
+    )
+    assert plan.corpus_search is True
+    assert plan.live == (
+        IssueSearchQuery(
+            ("cluster", "slots", "stale"), repository="valkey", per_page=5, kind="issue"
+        ),
+        IssueSearchQuery(
+            ("streaming", "compression"),
+            repository="valkey-glide",
+            repositories=("valkey",),
+            per_page=5,
+            kind="pull-request",
+        ),
+    )
+    # A plan whose only lookup was too thin to run falls back to the keyword path rather than
+    # reading as "nothing to look up".
+    with pytest.raises(LookupRouterError, match="no lookup survived"):
+        parse_lookup_plan('{"lookups":[{"kind":"search","terms":["flash"]}]}')
+    for bad in (
+        '{"lookups":[{"kind":"search","terms":["repo:evil","x"]}]}',
+        '{"lookups":[{"kind":"search","terms":["a","b"],"repositories":["../other"]}]}',
+        '{"lookups":[{"kind":"search","terms":["a","b"],"repositories":[]}]}',
+        '{"lookups":[{"kind":"search","terms":["a","b"],"scope":"commit"}]}',
+        '{"lookups":[{"kind":"search","terms":["a","b"],"per_page":100}]}',
+        '{"lookups":[{"kind":"search","terms":"a b"}]}',
+        '{"lookups":[{"kind":"search","terms":["1","2","3","4","5","6","7","8","9"]}]}',
+    ):
+        with pytest.raises(LookupRouterError):
+            parse_lookup_plan(bad)
+    # Same terms and scope twice is one search; the same terms in the other scope is another.
+    plan = parse_lookup_plan(
+        '{"lookups":[{"kind":"search","terms":["vector","set"],"scope":"issue"},'
+        '{"kind":"search","terms":["vector","set"],"scope":"issue"},'
+        '{"kind":"search","terms":["vector","set"],"scope":"pull-request"}]}'
+    )
+    assert [q.kind for q in plan.live] == ["issue", "pull-request"]  # type: ignore[union-attr]

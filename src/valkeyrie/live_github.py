@@ -171,12 +171,17 @@ MAX_SEARCH_TERMS: Final = 8
 MAX_RELEASE_LIST: Final = 20
 MAX_SEARCH_TERM_BYTES: Final = 64
 MAX_SEARCH_BODY_BYTES: Final = 16 * 1024
+# Per-release notes bound inside a release LIST; a single release keeps its full notes.
+MAX_RELEASE_LIST_BODY_BYTES: Final = 3 * 1024
 MAX_SEARCH_PER_PAGE: Final = 20
 # Supplementary searches carry whole issue bodies, so they take a smaller page than
 # a routed search: twenty bodies exceed MAX_RESPONSE_BYTES.
 SUPPLEMENT_PER_PAGE: Final = 5
-SEARCH_SORT: Final = "updated"
-SEARCH_ORDER: Final = "desc"
+# Best match, GitHub's default when no sort is sent. Ordering by recency ranked any issue that
+# mentioned both words anywhere in a long body above the one titled with them: "vector set"
+# returned a radix tree proposal and an SSCAN bug first, and the vector sets datatype issue not
+# at all in five. Best match puts the titled item first; recency is a bad proxy for relevance.
+SEARCH_SORT: Final = "best-match"
 PROJECTS_GRAPHQL_QUERY: Final = """\
 query ValkeyrieProject($owner: String!, $number: Int!, $itemCount: Int!, $after: String) {
   organization(login: $owner) {
@@ -784,11 +789,11 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         qualifiers = [f"repo:{OWNER}/{r}" for r in scope] or [f"org:{OWNER}"]
         if query.kind not in {"issue", "pull-request"}:
             raise LiveGitHubError("issue search kind must be issue or pull-request")
+        # No sort parameter: GitHub has no value that names best match, it is what you get by
+        # not asking for a sort. The payload records the ordering by name so a reader knows.
         encoded_query = urlencode(
             {
                 "q": " ".join((*qualifiers, f"is:{query.kind}", *terms)),
-                "sort": SEARCH_SORT,
-                "order": SEARCH_ORDER,
                 "per_page": str(per_page),
             }
         )
@@ -972,7 +977,6 @@ def _issue_search(
         "repositories": list(repositories) if repositories else None,
         "terms": list(terms),
         "sort": SEARCH_SORT,
-        "order": SEARCH_ORDER,
         "per_page": per_page,
         "total_count": total_count,
         "items": normalized,
@@ -1097,6 +1101,17 @@ def _release_list(value: Mapping[str, object], repository: str, per_page: int) -
     if len(items) > per_page:
         raise LiveGitHubError("GitHub release list exceeds the requested page bound")
     releases = [_release(_object(item, "release list item"), repository) for item in items]
+    # A release list carries eight releases, and a release's notes run to 22 KB for a major rc.
+    # Whole, the list was 56 KB of the 64 KB evidence budget and starved every other record;
+    # measured, that turned a mixed plan into an abstention. The notes' opening section (the
+    # headline features) is what a "what shipped" question needs, so each body is cut there.
+    for release in releases:
+        body = release.get("body")
+        if isinstance(body, str):
+            encoded = body.encode("utf-8")
+            if len(encoded) > MAX_RELEASE_LIST_BODY_BYTES:
+                release["body"] = encoded[:MAX_RELEASE_LIST_BODY_BYTES].decode("utf-8", "ignore")
+                release["body_truncated"] = True
     return {
         "api_version": _API_VERSION,
         "kind": "release_list",

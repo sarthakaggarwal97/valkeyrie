@@ -28,7 +28,12 @@ from dataclasses import dataclass
 from typing import Final, Literal
 
 from valkeyrie.live_github import (
+    MAX_SEARCH_REPOSITORIES,
+    MAX_SEARCH_TERMS,
+    MIN_SEARCH_TERMS,
+    SUPPLEMENT_PER_PAGE,
     IssueQuery,
+    IssueSearchQuery,
     LiveGitHubQuery,
     ProjectQuery,
     PullRequestQuery,
@@ -38,9 +43,11 @@ from valkeyrie.live_github import (
 ROUTER_PROMPT_REVISION: Final = "lookup-router/1"
 
 # The closed catalog. Adding an entry here is the ONLY way the model gains a capability.
-LookupKind = Literal["corpus_search", "pull_request", "issue", "releases", "project_board"]
+LookupKind = Literal[
+    "corpus_search", "pull_request", "issue", "releases", "project_board", "search"
+]
 _KINDS: Final[frozenset[str]] = frozenset(
-    {"corpus_search", "pull_request", "issue", "releases", "project_board"}
+    {"corpus_search", "pull_request", "issue", "releases", "project_board", "search"}
 )
 # valkey-io project boards the router may name. Board numbers are not guessable from a release
 # name, so the catalog carries the mapping; anything else needs the asker to give a number.
@@ -56,8 +63,13 @@ KNOWN_BOARDS: Final[Mapping[str, int]] = {
 # Same bounds the live query types enforce; a mismatch here would let the model shape a request
 # the transport then refuses, which would fail closed but waste the call.
 _REPOSITORY: Final = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+# A search term is one plain word: letters, digits, hyphens. No qualifier syntax can pass.
+_SEARCH_TERM: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{1,39}$")
 _MAX_NUMBER: Final = 10_000_000
-_MAX_LOOKUPS: Final = 4
+# Five live records is what the evidence budget admits beside the corpus (half of ten), and a
+# search is naturally two lookups (issues and pull requests), so a topic plus a release check
+# plus the corpus needs six.
+_MAX_LOOKUPS: Final = 6
 _MAX_RESPONSE_BYTES: Final = 4096
 _DEFAULT_REPOSITORY: Final = "valkey"
 # Conversation history bounds. Six turns is three exchanges, which is what a follow-up needs;
@@ -87,10 +99,18 @@ ROUTER_SYSTEM: Final = (
     + ", ".join(f"{title} is #{number}" for title, number in KNOWN_BOARDS.items())
     + ". Use only these numbers or one the asker gives; a release with no board here has none "
     "you can read.\n"
+    '- {"kind":"search","terms":["t1","t2"],"repositories":["valkey"],"scope":"pull-request"}: '
+    "search open and closed pull requests (scope pull-request) or issues (scope issue) by "
+    "words in their title or body, 2 to 8 terms, all of which must match, in 1 to 4 "
+    "repositories. Use for whether anyone is working on something, what is proposed or planned "
+    "for a topic, whether a bug is known, the status of a feature that has no number. Each term "
+    "is one word; a two-word name is two terms. Prefer two or three specific terms: every term "
+    "must appear, so more terms find less, and one term alone is too broad and is discarded. "
+    "Use the vocabulary the project uses, not the asker's paraphrase.\n"
     "\n"
     "Rules:\n"
-    "- Choose every lookup that would help; a question about a feature that may be unreleased "
-    "wants both corpus_search and the relevant live lookup.\n"
+    "- Choose every lookup that would help, up to six in total; a question about a feature that "
+    "may be unreleased wants both corpus_search and the relevant live lookup.\n"
     "- A bare number like #3853 could be an issue or a pull request; GitHub shares one number "
     'space, so choose "issue" for it unless the asker says pull request or PR.\n'
     '- Repository names are within the valkey-io organization; default to "valkey". Use another '
@@ -308,7 +328,73 @@ def parse_lookup_plan(raw: object) -> LookupPlan:
         elif kind == "project_board":
             _only_keys(item, {"kind", "number"})
             live.append(ProjectQuery(_number(item)))
+        elif kind == "search":
+            _only_keys(item, {"kind", "terms", "repositories", "scope"})
+            search = _search(item)
+            if search is not None:
+                live.append(search)
+    if not corpus_search and not live and lookups:
+        # Every lookup was a search too thin to run. Falling back to the keyword path is
+        # better than reporting the question as out of scope, which an empty plan would mean.
+        raise LookupRouterError("no lookup survived validation")
     return LookupPlan(corpus_search=corpus_search, live=tuple(live), question=resolved)
+
+
+def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
+    """A model-chosen search, bounded here and normalized again by the live layer.
+
+    The terms are the one place the model composes free text that reaches GitHub. They are
+    bounded in count and shape here and re-validated by the transport's own normalizer, which
+    rejects anything that is not a plain word; a query cannot carry qualifiers or operators.
+
+    Two model habits are absorbed rather than refused. A phrase given as one term ("CLUSTER
+    SLOTS") is split into its words, which means the same thing to GitHub, since every term
+    must match. A search left with fewer than two words is returned as None and dropped on its
+    own: the fault is in this one composition, and the other lookups were validated
+    independently, so discarding the whole plan for it would lose capability for nothing.
+    """
+    terms = item.get("terms")
+    if not isinstance(terms, Sequence) or isinstance(terms, str):
+        raise LookupRouterError("search terms must be an array")
+    if not 1 <= len(terms) <= MAX_SEARCH_TERMS:
+        raise LookupRouterError("search terms count is out of bounds")
+    normalized: list[str] = []
+    for term in terms:
+        if not isinstance(term, str):
+            raise LookupRouterError("search term is malformed")
+        for word in term.split():
+            if _SEARCH_TERM.fullmatch(word) is None:
+                raise LookupRouterError("search term is malformed")
+            folded = word.casefold()
+            if folded not in normalized:
+                normalized.append(folded)
+    if len(normalized) > MAX_SEARCH_TERMS:
+        raise LookupRouterError("search terms count is out of bounds")
+    if len(normalized) < MIN_SEARCH_TERMS:
+        return None
+    repositories_value = item.get("repositories", [_DEFAULT_REPOSITORY])
+    if not isinstance(repositories_value, Sequence) or isinstance(repositories_value, str):
+        raise LookupRouterError("search repositories must be an array")
+    if not 1 <= len(repositories_value) <= MAX_SEARCH_REPOSITORIES:
+        raise LookupRouterError("search repositories count is out of bounds")
+    repositories: list[str] = []
+    for repository in repositories_value:
+        checked = _repository({"repository": repository})
+        if checked not in repositories:
+            repositories.append(checked)
+    scope = item.get("scope", "pull-request")
+    if not isinstance(scope, str) or scope not in {"pull-request", "issue"}:
+        raise LookupRouterError("search scope must be pull-request or issue")
+    # Same page as the supplement. A search carries whole issue bodies, and the model often
+    # chooses two to four searches; at twenty items each they overran the evidence budget so
+    # far that only one survived it. Five recent items per search lets them all be evidence.
+    return IssueSearchQuery(
+        terms=tuple(normalized),
+        repository=repositories[0],
+        repositories=tuple(repositories[1:]),
+        per_page=SUPPLEMENT_PER_PAGE,
+        kind=scope,
+    )
 
 
 def _strip_fence(text: str) -> str:
@@ -323,6 +409,10 @@ def _strip_fence(text: str) -> str:
 
 
 def _identity(kind: str, item: Mapping[str, object]) -> tuple[object, ...]:
+    if kind == "search":
+        terms = item.get("terms")
+        frozen = tuple(terms) if isinstance(terms, list) else terms
+        return (kind, frozen, item.get("scope"))
     return (kind, item.get("repository"), item.get("number"))
 
 

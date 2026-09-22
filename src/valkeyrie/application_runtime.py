@@ -2259,7 +2259,9 @@ class AwsRuntimeServices:
                 modelId=self._model_id,
                 system=[{"text": system}],
                 messages=[{"role": "user", "content": [{"text": question}]}],
-                inferenceConfig={"maxTokens": 300},
+                # A six-lookup plan with the model's reasoning block runs to about 300 tokens;
+                # a cap it can hit truncates the JSON and loses the whole plan.
+                inferenceConfig={"maxTokens": 800},
             )
         )
         blocks = response.get("output", {}).get("message", {}).get("content", [])
