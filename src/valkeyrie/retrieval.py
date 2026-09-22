@@ -165,7 +165,14 @@ _FEATURE_ALIASES: Final = (
         ("events calendar",),
     ),
     (
-        re.compile(r"\b(?:workstream|working group|community meeting)\b", re.IGNORECASE),
+        re.compile(
+            r"\b(?:workstream|working group"
+            # Meeting minutes and notes live in valkey-io/community, including the TSC's.
+            r"|(?:community|tsc|technical steering committee|governance)\s+"
+            r"(?:meeting|meetings|minutes|notes|agenda)"
+            r"|meeting\s+(?:minutes|notes|agenda))\b",
+            re.IGNORECASE,
+        ),
         ("working groups", "meeting notes", "roadmap", "progress"),
     ),
     (
@@ -183,7 +190,13 @@ _CATEGORY_SCOPES: Final = (
         ("valkey-doc", "valkey-skills"),
     ),
     (
-        re.compile(r"\b(?:technical steering committee|tsc)\b", re.IGNORECASE),
+        # The TSC itself is documented in the core repository, but its MEETINGS are minuted in
+        # valkey-io/community, so that wording is left to the meeting scope below.
+        re.compile(
+            r"\b(?:technical steering committee|tsc)\b"
+            r"(?!\s+(?:meeting|meetings|minutes|notes|agenda))",
+            re.IGNORECASE,
+        ),
         ("valkey",),
     ),
     (
@@ -199,7 +212,14 @@ _CATEGORY_SCOPES: Final = (
         ("valkey-io.github.io", "community"),
     ),
     (
-        re.compile(r"\b(?:workstream|working group|community meeting)\b", re.IGNORECASE),
+        re.compile(
+            r"\b(?:workstream|working group"
+            # Meeting minutes and notes live in valkey-io/community, including the TSC's.
+            r"|(?:community|tsc|technical steering committee|governance)\s+"
+            r"(?:meeting|meetings|minutes|notes|agenda)"
+            r"|meeting\s+(?:minutes|notes|agenda))\b",
+            re.IGNORECASE,
+        ),
         ("community", "valkey", "valkey-io.github.io"),
     ),
     (

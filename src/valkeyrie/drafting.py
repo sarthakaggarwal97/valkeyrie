@@ -125,10 +125,14 @@ _MAX_ABSTENTION_BYTES: Final = 2048
 _READINESS_LABEL: Final = "a release-readiness decision"
 # The decision named AND attributed to whoever owns it, in either order.
 _READINESS_DEFERRAL: Final = re.compile(
-    r"\b(?:decision|judgement|judgment|call|matter)\b[^.]*"
-    r"\b(?:maintainers?|tsc|technical\s+steering\s+committee|project|release\s+owner)\b"
-    r"|\b(?:maintainers?|tsc|technical\s+steering\s+committee|release\s+owner)\b[^.]*"
-    r"\b(?:decide|decides|decision|judgement|judgment|call)\b",
+    # "project" alone is not an authority: it appears in almost any sentence about Valkey.
+    r"\b(?:decision|judgement|judgment|call|matter)\b[^.;:!?]*"
+    r"\b(?:maintainers?|tsc|technical\s+steering\s+committee|release\s+owner)\b"
+    r"|\b(?:maintainers?|tsc|technical\s+steering\s+committee|release\s+owner)\b[^.;:!?]*"
+    r"\b(?:decide|decides|determined?|determines|decision|judgement|judgment|call)\b"
+    # "... must be determined by the TSC": the verb precedes the authority.
+    r"|\b(?:decided?|determined?|judged)\s+by\s+(?:the\s+)?"
+    r"(?:maintainers?|tsc|technical\s+steering\s+committee|release\s+owner)\b",
     re.IGNORECASE,
 )
 
@@ -151,8 +155,13 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     (
         "a source-authority declaration",
         re.compile(
+            # "source of truth" is deliberately NOT here. The screen exists to stop Valkeyrie
+            # asserting that its own evidence is authoritative; "src/commands/<cmd>.json is the
+            # single source of truth for command metadata" is a fact about Valkey, taken from
+            # Valkey's own README, and refusing it turned "how do I add a new command" into an
+            # error every time, which is the most common onboarding question there is.
             r"\b(?:canonical|authoritative|official)\s+"
-            r"(?:source|reference|documentation|authority)\b|\bsource\s+of\s+truth\b"
+            r"(?:source|reference|documentation|authority)\b"
             r"|\b(?:is|are|was|were|remains?)\s+(?:the\s+)?"
             r"(?:canonical|authoritative|official)\b"
             r"|\baccording\s+to\b",
@@ -393,6 +402,24 @@ def _reject_json_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object
     return value
 
 
+def _is_readiness_deferral(value: str) -> bool:
+    """True only when EVERY readiness mention in the text is a deferral, clause by clause.
+
+    Matching the two patterns across the whole claim let one sentence exempt another: "The
+    maintainers make the call. Ship it." carried a deferral and a verdict, and the verdict rode
+    in on the exemption. Each clause is now judged on its own.
+    """
+    label_pattern = dict((label, pattern) for label, pattern in _PROHIBITED_MODEL_TEXT)[
+        _READINESS_LABEL
+    ]
+    for clause in re.split(r"[.;:!?\n]+", value):
+        if label_pattern.search(clause) is None:
+            continue
+        if _READINESS_DEFERRAL.search(clause) is None:
+            return False
+    return True
+
+
 def _screened_model_text(value: str, field: str, maximum: int) -> None:
     _bounded_text(value, field, maximum)
     for label, pattern in _PROHIBITED_MODEL_TEXT:
@@ -404,7 +431,7 @@ def _screened_model_text(value: str, field: str, maximum: int) -> None:
         # is. Refusing that sentence left the answer with board totals and no statement of who
         # decides, which is the part a reader needs. Nothing else is exempt, and a sentence that
         # ASSERTS readiness cannot match this shape because the decision must be attributed.
-        if label == _READINESS_LABEL and _READINESS_DEFERRAL.search(value) is not None:
+        if label == _READINESS_LABEL and _is_readiness_deferral(value):
             continue
         raise DraftingError(f"{field} contains {label}")
 

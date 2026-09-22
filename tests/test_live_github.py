@@ -388,6 +388,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
         "api_version": "valkeyrie.io/live-github/1",
         "author": None,
         "authors_of_listed": {"madolson": 2},
+        "labels": [],
         "finding": (
             'The search found 2 issues in valkey-io/valkey matching "release" and "status".'
         ),
@@ -445,6 +446,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
         "repository": "valkey",
         "since": None,
         "sort": "best-match",
+        "state": None,
         "until": None,
         "terms": ["release", "status"],
         "total_count": 2,
@@ -1873,7 +1875,7 @@ def test_an_issue_and_a_pull_request_carry_their_recent_discussion() -> None:
     assert len(comments) == MAX_DISCUSSION_ITEMS
     assert len(cast(str, comments[0]["body"]).encode("utf-8")) == MAX_DISCUSSION_BODY_BYTES
     assert comments[0]["body_truncated"] is True and comments[0]["author"] == "zuiderkwast"
-    reviews = cast(list[dict[str, object]], payload["recent_reviews"])
+    reviews = cast(list[dict[str, object]], payload["earliest_reviews"])
     assert reviews == [
         {
             "author": "madolson",
@@ -1886,7 +1888,7 @@ def test_an_issue_and_a_pull_request_carry_their_recent_discussion() -> None:
 
     # An issue has comments and no reviews.
     payload = json.loads(read_live_github(IssueQuery("valkey", 7), fetch=fetch).canonical_payload)
-    assert payload["recent_comments"] and "recent_reviews" not in payload
+    assert payload["recent_comments"] and "earliest_reviews" not in payload
 
     # A discussion that cannot be read leaves the object's own evidence intact.
     def partial(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
@@ -1897,7 +1899,7 @@ def test_an_issue_and_a_pull_request_carry_their_recent_discussion() -> None:
     payload = json.loads(
         read_live_github(PullRequestQuery("valkey", 7), fetch=partial).canonical_payload
     )
-    assert payload["recent_comments"] is None and payload["recent_reviews"] is None
+    assert payload["recent_comments"] is None and payload["earliest_reviews"] is None
     assert payload["number"] == 7
 
 
@@ -2030,7 +2032,20 @@ def test_an_advisory_is_found_by_either_identifier_and_a_miss_is_a_finding() -> 
     )
     assert payload["advisories"] == []
     assert "No published advisory" in cast(str, payload["finding"])
-    assert "2 were read" in cast(str, payload["finding"])
+    assert payload["exhaustive"] is True
+    assert "establishes" in cast(str, payload["finding"])
+
+    # A listing that FILLED its page does not establish absence: more advisories exist unread.
+    from valkeyrie.live_github import MAX_ADVISORIES
+
+    full = [advisory(f"GHSA-{i:04d}-bbbb-cccc", None) for i in range(MAX_ADVISORIES)]
+    payload = json.loads(
+        read_live_github(
+            AdvisoryQuery("valkey", "CVE-1999-0001"), fetch=lambda *a: _response(full)
+        ).canonical_payload
+    )
+    assert payload["exhaustive"] is False
+    assert "does NOT establish absence" in cast(str, payload["finding"])
 
     payload = json.loads(read_live_github(AdvisoryQuery("valkey"), fetch=fetch).canonical_payload)
     assert payload["kind"] == "advisory_list" and len(payload["advisories"]) == 2

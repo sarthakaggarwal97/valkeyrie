@@ -51,6 +51,11 @@ class IssueSearchQuery:
     # A GitHub login: only items this user authored. "What has madolson contributed" is an author
     # search with no terms; searching the login as a word finds mentions, not authorship.
     author: str | None = None
+    # open or closed, and repository labels that must all be present. "How many open bugs are
+    # there" is a state and a label, not words to match: searching for "open" and "bugs" as terms
+    # finds the items that happen to say those words. Both waive the term minimum.
+    state: str | None = None
+    labels: tuple[str, ...] = ()
     # GitHub requires an explicit is:issue or is:pull-request on authenticated
     # search/issues requests and returns 422 without one. Anonymous requests are not yet
     # enforced, which is why this was invisible until the runtime started authenticating.
@@ -238,6 +243,9 @@ MAX_RELEASE_NOTES_BYTES: Final = 24 * 1024
 MAX_WINDOW_BODY_BYTES: Final = 600
 _SEARCH_SINCE: Final = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # GitHub's login rules: 1 to 39 alphanumerics or single hyphens, not at either end.
+MAX_SEARCH_LABELS: Final = 3
+# A label as GitHub allows it, minus the quote and backslash that would escape the qualifier.
+_SEARCH_LABEL: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/-]{0,63}$")
 _GITHUB_LOGIN: Final = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
 MAX_SEARCH_PER_PAGE: Final = 20
 # Supplementary searches carry whole issue bodies, so they take a smaller page than
@@ -346,8 +354,13 @@ _LIVE_DISCOVERY_TERMS: Final = frozenset(
     }
 )
 _EVENT_DISCOVERY: Final = re.compile(r"\b(?:event|events|conference|meetup)\b", re.IGNORECASE)
+# Meeting wording, including the TSC's. Minutes and notes live in valkey-io/community, and
+# "TSC meeting notes" was searching valkey-io/valkey and truthfully reporting that it found none.
 _COMMUNITY_MEETING_DISCOVERY: Final = re.compile(
-    r"\bcommunity\s+(?:meeting|meetings)\b", re.IGNORECASE
+    r"\b(?:community|tsc|technical\s+steering\s+committee|governance)\s+"
+    r"(?:meeting|meetings|minutes|notes|agenda)\b"
+    r"|\b(?:meeting|meetings)\s+(?:minutes|notes|agenda)\b",
+    re.IGNORECASE,
 )
 _SEARCH_STOP_WORDS: Final = frozenset(
     {
@@ -612,14 +625,16 @@ def read_live_github(
     if isinstance(query, ProjectQuery):
         return _read_project(query, projects_fetch, observed_clock)
 
-    source_url, object_type, normalizer = _rest_request(query)
+    request = _rest_request(query)
+    source_url, object_type, normalizer = request[0], request[1], request[2]
+    # Most reads share one response bound; a file declares its own, because a 240 KB source file
+    # arrives base64-encoded inside JSON.
+    max_bytes = request[3] if len(request) == 4 else MAX_RESPONSE_BYTES
     try:
-        response = (fetch or fetch_public_github)(
-            source_url, REQUEST_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES
-        )
+        response = (fetch or fetch_public_github)(source_url, REQUEST_TIMEOUT_SECONDS, max_bytes)
     except GitHubReadError as error:
         raise LiveGitHubError(f"live GitHub read failed: {error}") from error
-    value = _response_object(response, source="REST")
+    value = _response_object(response, source="REST", maximum_bytes=max_bytes)
     payload = normalizer(value)
     if isinstance(query, (PullRequestQuery, IssueQuery)):
         payload = _with_discussion(
@@ -653,6 +668,8 @@ def read_live_github(
 # A file's evidence payload. The network read may be the whole file (valkey.conf is 143 KB), but
 # what reaches the model is either a small file whole or the windows around the asked-for words.
 MAX_FILE_TEXT_BYTES: Final = 12 * 1024
+# The largest contents response a file read may accept: 384 KiB of JSON carries a 280 KB file.
+MAX_FILE_RESPONSE_BYTES: Final = 384 * 1024
 FILE_WINDOW_LINES: Final = 24
 MAX_FILE_WINDOWS: Final = 6
 # A repository path: segments of ordinary file characters, no traversal, no leading slash.
@@ -711,6 +728,7 @@ def _with_author_tally(
     after: str | None = None
     total: int | None = None
     complete = False
+    seen_cursors: set[str] = set()
     try:
         for _ in range(MAX_AUTHOR_TALLY_PAGES):
             response = projects_fetch(
@@ -736,12 +754,16 @@ def _with_author_tally(
             if not has_next:
                 complete = sum(tally.values()) == total
                 break
-            if cursor is None:
+            # A cursor that does not advance would count the same page repeatedly and could
+            # reach the total with duplicates, presenting a wrong tally as complete.
+            if cursor is None or cursor in seen_cursors:
                 return payload
+            seen_cursors.add(cursor)
             after = cursor
     except (GitHubReadError, LiveGitHubError):
         return payload
-    if not complete:
+    # The tally describes the same set the listing counted, or it is not published at all.
+    if not complete or total != payload.get("total_count"):
         return payload
     return {
         **payload,
@@ -775,9 +797,15 @@ def _advisories(
         else (
             f"The advisory {identifier} is published for {OWNER}/{repository}."
             if matched
-            else f"No published advisory for {OWNER}/{repository} carries the identifier "
-            f"{identifier}; {len(normalized)} were read. This establishes that the repository "
-            "publishes no such advisory at observation time."
+            else (
+                f"No published advisory for {OWNER}/{repository} carries the identifier "
+                f"{identifier} among the {len(normalized)} read. The listing filled its page, so "
+                "more advisories exist that were not read and this does NOT establish absence."
+                if len(normalized) >= MAX_ADVISORIES
+                else f"No published advisory for {OWNER}/{repository} carries the identifier "
+                f"{identifier}; all {len(normalized)} published advisories were read. This "
+                "establishes that the repository publishes no such advisory at observation time."
+            )
         )
     )
     return {
@@ -786,6 +814,9 @@ def _advisories(
         "repository": repository,
         "identifier": identifier,
         "read_count": len(normalized),
+        # False when the page filled: the listing is bounded, so an identifier that is absent
+        # from it may still exist and no claim of absence may be made.
+        "exhaustive": len(normalized) < MAX_ADVISORIES,
         "advisories": matched,
         "finding": finding,
         "url": f"{_WEB_ROOT}/{OWNER}/{repository}/security/advisories",
@@ -870,7 +901,8 @@ def _file(
         raise LiveGitHubError("GitHub contents encoding is unsupported")
     size = _positive_or_zero_integer(value, "size")
     try:
-        content = base64.b64decode(_text(value, "content", MAX_RESPONSE_BYTES), validate=False)
+        encoded_content = re.sub(r"\s+", "", _text(value, "content", MAX_FILE_RESPONSE_BYTES))
+        content = base64.b64decode(encoded_content, validate=True)
     except (ValueError, BinasciiError) as error:
         raise LiveGitHubError("GitHub contents is not valid base64") from error
     if len(content) != size:
@@ -929,14 +961,23 @@ def _file_windows(lines: list[str], around: tuple[str, ...]) -> list[dict[str, o
     windows: list[dict[str, object]] = []
     budget = MAX_FILE_TEXT_BYTES
     for start, end in spans:
-        body = "\n".join(lines[start:end])
-        encoded = body.encode("utf-8")[:budget]
-        budget -= len(encoded)
+        # Whole lines only, and the reported range is the range actually carried: cutting the
+        # joined text at a byte offset reported lines the window did not contain.
+        kept: list[str] = []
+        for line in lines[start:end]:
+            cost = len(line.encode("utf-8")) + 1
+            if cost > budget:
+                break
+            budget -= cost
+            kept.append(line)
+        if not kept:
+            break
         windows.append(
             {
                 "first_line": start + 1,
-                "last_line": end,
-                "text": encoded.decode("utf-8", "ignore"),
+                "last_line": start + len(kept),
+                "truncated": len(kept) < end - start,
+                "text": "\n".join(kept),
             }
         )
         if budget <= 0:
@@ -978,7 +1019,11 @@ def _with_discussion(
     )
     enriched = {**payload, "recent_comments": comments}
     if reviews:
-        enriched["recent_reviews"] = _discussion_items(
+        # The reviews endpoint takes no sort parameter and returns OLDEST first, so one bounded
+        # page is the first reviews, not the last. The field says so rather than claiming they are
+        # recent: a hundred review bodies do not fit any response bound here (ten measured 72 KB),
+        # and the first reviews are where a pull request's substantive feedback usually is.
+        enriched["earliest_reviews"] = _discussion_items(
             f"{_API_ROOT}/repos/{OWNER}/{repository}/pulls/{number}/reviews"
             f"?per_page={MAX_DISCUSSION_ITEMS}",
             fetch,
@@ -1223,7 +1268,7 @@ def _page_info(info: Mapping[str, object]) -> tuple[bool, str | None]:
 Normalizer: TypeAlias = Callable[[Mapping[str, object]], dict[str, object]]
 
 
-def _rest_request(query: object) -> tuple[str, str, Normalizer]:
+def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str, Normalizer, int]:
     if isinstance(query, PullRequestQuery):
         repository = _repository(query.repository)
         number = _entity_id(query.number, "pull request number")
@@ -1238,11 +1283,18 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         since = _search_since(query.since)
         until = _search_since(query.until)
         author = _search_author(query.author)
+        state = query.state
+        if state is not None and state not in {"open", "closed"}:
+            raise LiveGitHubError("search state must be open or closed")
+        labels = tuple(_search_label(label) for label in query.labels[:MAX_SEARCH_LABELS])
+        if len(query.labels) > MAX_SEARCH_LABELS:
+            raise LiveGitHubError("search names too many labels")
         if until is not None and since is None:
             raise LiveGitHubError("search window end requires a start")
         if until is not None and since is not None and until < since:
             raise LiveGitHubError("search window end precedes its start")
-        terms = _search_terms(query.terms, minimum=0 if (since or author) else MIN_SEARCH_TERMS)
+        scoped_without_terms = bool(since or author or state or labels)
+        terms = _search_terms(query.terms, minimum=0 if scoped_without_terms else MIN_SEARCH_TERMS)
         search_repository = _optional_repository(query.repository)
         per_page = _search_per_page(query.per_page)
         scope: tuple[str, ...] = tuple(
@@ -1265,6 +1317,9 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
             raise LiveGitHubError("issue search kind must be issue or pull-request")
         window: list[str] = []
         parameters: dict[str, str] = {}
+        if state is not None:
+            window.append(f"is:{state}")
+        window.extend(f'label:"{label}"' for label in labels)
         if author is not None:
             window.append(f"author:{author}")
             # Authorship alone has nothing to rank by; newest first is what "their work" wants.
@@ -1303,6 +1358,8 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
                 since=since,
                 until=until,
                 author=author,
+                state=state,
+                labels=labels,
                 search_query=search_query,
             ),
         )
@@ -1330,7 +1387,15 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         url = f"{_API_ROOT}/repos/{OWNER}/{repository}/contents/{segments}"
         if ref is not None:
             url += f"?ref={quote(ref, safe='')}"
-        return url, "file", lambda value: _file(value, repository, path, ref, query.around)
+        # A file needs its own transport bound: src/server.h is 240 KB of text, which arrives
+        # base64-encoded inside JSON at about 331 KB, over the shared 256 KiB response bound. The
+        # evidence payload stays small either way; this is only what may be read.
+        return (
+            url,
+            "file",
+            lambda value: _file(value, repository, path, ref, query.around),
+            MAX_FILE_RESPONSE_BYTES,
+        )
     if isinstance(query, ReleaseByTagQuery):
         repository = _repository(query.repository)
         tag = _tag(query.tag)
@@ -1497,6 +1562,8 @@ def _issue_search(
     since: str | None = None,
     until: str | None = None,
     author: str | None = None,
+    state: str | None = None,
+    labels: tuple[str, ...] = (),
     search_query: str | None = None,
 ) -> dict[str, object]:
     incomplete = _boolean(value, "incomplete_results")
@@ -1533,6 +1600,8 @@ def _issue_search(
         "since": since,
         "until": until,
         "author": author,
+        "state": state,
+        "labels": list(labels),
         "per_page": per_page,
         "total_count": total_count,
         "query": search_query,
@@ -1545,7 +1614,16 @@ def _issue_search(
         # library has nothing on it was the answer, and the model abstained for want of it two
         # times in five. Every word here is derived from fields above; nothing is added.
         "finding": _search_finding(
-            kind, terms, repositories, total_count, since, len(normalized), until, author
+            kind,
+            terms,
+            repositories,
+            total_count,
+            since,
+            len(normalized),
+            until,
+            author,
+            state,
+            labels,
         ),
     }
 
@@ -1568,6 +1646,8 @@ def _search_finding(
     shown: int = 0,
     until: str | None = None,
     author: str | None = None,
+    state: str | None = None,
+    labels: tuple[str, ...] = (),
 ) -> str:
     span = f"from {since} through {until}" if until else f"on or after {since}"
     if since is None:
@@ -1576,6 +1656,10 @@ def _search_finding(
         what = f"pull requests merged {span}"
     else:
         what = f"issues opened {span}"
+    if state is not None:
+        what = f"{state} {what}"
+    if labels:
+        what = f"{what} labelled " + " and ".join(f'"{label}"' for label in labels)
     if author is not None:
         what = f"{what} authored by {author}"
     where = (
@@ -1916,7 +2000,9 @@ def _project_item(value: object) -> dict[str, object]:
     }
 
 
-def _response_object(response: object, *, source: str) -> Mapping[str, object]:
+def _response_object(
+    response: object, *, source: str, maximum_bytes: int = MAX_RESPONSE_BYTES
+) -> Mapping[str, object]:
     if not isinstance(response, HttpResponse):
         raise LiveGitHubError(f"{source} fetcher returned the wrong response type")
     if type(response.status) is not int:
@@ -1927,7 +2013,7 @@ def _response_object(response: object, *, source: str) -> Mapping[str, object]:
         raise LiveGitHubError(f"{source} response has invalid headers")
     if type(response.body) is not bytes:
         raise LiveGitHubError(f"{source} response body must be bytes")
-    if len(response.body) > MAX_RESPONSE_BYTES:
+    if len(response.body) > maximum_bytes:
         raise LiveGitHubError(f"{source} response exceeded its byte bound")
     content_types: list[str] = []
     for name, header_value in response.headers.items():
@@ -2000,6 +2086,15 @@ def _search_since(value: object) -> str | None:
         datetime.strptime(value, "%Y-%m-%d")
     except ValueError as error:
         raise LiveGitHubError("search window must be a real calendar day") from error
+    return value
+
+
+def _search_label(value: object) -> str:
+    """A repository label, placed inside a quoted qualifier so a space is not a new term."""
+    if type(value) is not str or not 1 <= len(value.encode("utf-8")) <= 64:
+        raise LiveGitHubError("search label is malformed")
+    if _SEARCH_LABEL.fullmatch(value) is None:
+        raise LiveGitHubError("search label is malformed")
     return value
 
 

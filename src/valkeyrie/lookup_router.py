@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Final, Literal
 
 from valkeyrie.live_github import (
+    MAX_SEARCH_LABELS,
     MAX_SEARCH_REPOSITORIES,
     MAX_SEARCH_TERMS,
     MIN_SEARCH_TERMS,
@@ -81,6 +82,7 @@ MAX_AROUND_TERMS: Final = 4
 _ADVISORY: Final = re.compile(
     r"^(?:GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}|CVE-[0-9]{4}-[0-9]{4,7})$", re.IGNORECASE
 )
+_LABEL: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/-]{0,63}$")
 _LOGIN: Final = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
 # A search term is one plain word: letters, digits, hyphens. No qualifier syntax can pass.
 _SEARCH_TERM: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{1,39}$")
@@ -148,6 +150,11 @@ ROUTER_SYSTEM: Final = (
     'and an issue search to those OPENED on or after it; an optional "until":"YYYY-MM-DD" closes '
     'the window on that day inclusive. With a window the terms may be empty, so "what merged '
     'this week" is a search with since and no terms, and "what happened in August" is since the '
+    'An optional "state" of "open" or "closed" and up to three "labels" filter by issue state and '
+    'repository label, and both waive the terms: "how many open bugs are there" is state open '
+    "with label bug, not the words open and bugs. Valkey labels include bug, enhancement, "
+    "cluster, documentation, good first issue, help wanted and release-blocker. The payload "
+    "carries the exact total, so a count question needs nothing more.\n"
     "1st until the 31st. Compute the days from today's date, given with the question. An optional "
     '"author":"login" restricts to items that GitHub user authored, and also waives the terms: '
     "use it for what a named person has contributed or is working on, with the login the asker "
@@ -429,7 +436,20 @@ def _parse_lookup_plan(raw: object) -> LookupPlan:
 
 def _live_lookup(kind: str, item: Mapping[str, object]) -> LiveGitHubQuery | None:
     if kind == "search":
-        _only_keys(item, {"kind", "terms", "repositories", "scope", "since", "until", "author"})
+        _only_keys(
+            item,
+            {
+                "kind",
+                "terms",
+                "repositories",
+                "scope",
+                "since",
+                "until",
+                "author",
+                "state",
+                "labels",
+            },
+        )
         return _search(item)
     if kind == "project_board":
         _only_keys(item, {"kind", "number"})
@@ -476,7 +496,21 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
     author = item.get("author")
     if author is not None and (not isinstance(author, str) or _LOGIN.fullmatch(author) is None):
         raise LookupRouterError("search author is malformed")
-    unscoped = since is None and author is None
+    state = item.get("state")
+    if state is not None and state not in {"open", "closed"}:
+        raise LookupRouterError("search state must be open or closed")
+    labels_value = item.get("labels", [])
+    if not isinstance(labels_value, Sequence) or isinstance(labels_value, str):
+        raise LookupRouterError("search labels must be an array")
+    if len(labels_value) > MAX_SEARCH_LABELS:
+        raise LookupRouterError("search names too many labels")
+    labels: list[str] = []
+    for label in labels_value:
+        if not isinstance(label, str) or _LABEL.fullmatch(label) is None:
+            raise LookupRouterError("search label is malformed")
+        if label not in labels:
+            labels.append(label)
+    unscoped = since is None and author is None and state is None and not labels
     terms = item.get("terms", [])
     if not isinstance(terms, Sequence) or isinstance(terms, str):
         raise LookupRouterError("search terms must be an array")
@@ -522,6 +556,8 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
         since=since,
         until=until,
         author=author,
+        state=state,
+        labels=tuple(labels),
     )
 
 

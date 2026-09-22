@@ -516,7 +516,6 @@ def test_exact_fields_and_types_are_enforced(
         "See [the documentation](anywhere).",
         f"valkey/src/server.c@{'1' * 40} defines this behavior.",
         "The canonical source confirms this.",
-        "This file is the source of truth.",
         "The release is ready.",
         "The build is ready to ship.",
         "Go/no-go: go.",
@@ -768,4 +767,25 @@ def test_a_readiness_deferral_is_allowed_while_every_verdict_is_still_refused() 
         "9.2 can now ship.",
     ):
         with pytest.raises(DraftingError, match="release-readiness decision"):
+            _screened_model_text(refused, "claim text", 4096)
+
+
+def test_a_project_artifact_may_be_called_the_source_of_truth() -> None:
+    """The screen exists to stop Valkeyrie asserting that its OWN evidence is authoritative.
+    "src/commands/<cmd>.json is the single source of truth for command metadata" is a fact about
+    Valkey, taken from Valkey's own README, and refusing it made "how do I add a new command"
+    return an error every time, which is the most common onboarding question there is."""
+    from valkeyrie.drafting import _screened_model_text
+
+    for allowed in (
+        "The JSON file in src/commands is the single source of truth for command metadata.",
+        "commands.def is generated from the JSON files and is the source of truth for dispatch.",
+    ):
+        _screened_model_text(allowed, "claim text", 4096)
+    for refused in (
+        "According to the canonical documentation, use HSET.",
+        "This is the authoritative reference for the command.",
+        "valkey-doc is the official documentation.",
+    ):
+        with pytest.raises(DraftingError, match="source-authority declaration"):
             _screened_model_text(refused, "claim text", 4096)

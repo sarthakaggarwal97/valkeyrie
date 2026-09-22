@@ -2787,3 +2787,110 @@ def test_the_corpus_is_searched_with_the_routers_english_restatement(
     plan = cast(Mapping[str, object], services.requests["req_spanish"]["plan"])
     assert plan["question"] == question, "the answer turn sees the asker's question"
     assert cast(Mapping[str, object], services.model_calls[0])["question"] == question
+
+
+def test_the_retry_happens_once_per_request_even_across_recovery(
+    manifest: dict[str, object],
+) -> None:
+    """The flag rides the same revision as the widened evidence. Without it, a worker recovering a
+    crashed request abstained, refetched observations whose ids differ only by observation time,
+    and retried again: three model calls for one request."""
+    services = _AbstainsUntilGitHub()
+    services.live_observation = _live_observation(
+        kind="issue_search",
+        object_type="issue",
+        source_url="https://api.github.com/search/issues?q=backlog",
+        url=None,
+    )
+    services.complete = False
+    first = run_runtime_event(
+        _event(request_id="req_once", question="why does valkey need a replication backlog"),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert first["outcome"] == "partial", "completion was blocked, as a crash would"
+    plan = cast(Mapping[str, object], services.requests["req_once"]["plan"])
+    assert plan["retry_attempted"] is True
+    assert len(services.model_calls) == 2
+
+    services.complete = True
+    recovered = run_runtime_event(
+        _event(
+            request_id="req_once",
+            question="why does valkey need a replication backlog",
+            owner="worker-2",
+            now="2026-08-19T10:10:00Z",
+            completed_at="2026-08-19T10:10:01Z",
+        ),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert recovered["outcome"] in {"answer", "abstention"}
+    assert len(services.model_calls) == 3, "one more inference, and no second retry"
+
+
+def test_an_indeterminate_plan_revision_stops_rather_than_answering(
+    manifest: dict[str, object],
+) -> None:
+    """A state-store failure during the revision is not a reason to answer: the write may or may
+    not have landed, so this worker cannot describe what it is answering over. It used to escape
+    as an unhandled exception and leave the request open after its first inference."""
+
+    class Broken(FakeServices):
+        def revise_plan(self, **kwargs: object) -> bool:
+            raise RuntimeError("dynamodb timeout")
+
+    services = Broken()
+    services.retrieval = ()
+    services.live_observation = _live_observation(
+        kind="issue_search",
+        object_type="issue",
+        source_url="https://api.github.com/search/issues?q=x",
+        url=None,
+    )
+    services.output = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": "abstention",
+        "reason": "Nothing here describes it.",
+    }
+    result = run_runtime_event(
+        _event(request_id="req_indet", question="why does valkey need a replication backlog"),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] in {"abstention", "partial"}
+    assert "dynamodb" not in json.dumps(result)
+
+
+def test_an_extra_claim_field_is_ignored_and_a_missing_one_is_fatal(
+    manifest: dict[str, object],
+) -> None:
+    """The claim that reaches the user is rebuilt from exactly claim_id, text and evidence_ids, so
+    an unread extra key cannot carry anything into the answer. Refusing the whole answer over one
+    threw away a correct reply on some model draws."""
+    services = FakeServices()
+    claim = dict(cast(list[dict[str, object]], services.output["claims"])[0])
+    claim["confidence"] = "high"
+    claim["url"] = "https://example.invalid/should-never-be-rendered"
+    services.output = {**services.output, "claims": [claim]}
+    result = run_runtime_event(
+        _event(request_id="req_extra"), services, root=ROOT, manifest=manifest
+    )
+    assert result["outcome"] == "answer"
+    returned = cast(list[Mapping[str, object]], result["claims"])[0]
+    assert set(returned) == {"claim_id", "text", "evidence_ids"}
+    assert "example.invalid" not in json.dumps(result)
+
+    missing = FakeServices()
+    without = {k: v for k, v in claim.items() if k != "evidence_ids"}
+    missing.output = {**missing.output, "claims": [without]}
+    assert (
+        run_runtime_event(_event(request_id="req_missing"), missing, root=ROOT, manifest=manifest)[
+            "outcome"
+        ]
+        == "error"
+    )

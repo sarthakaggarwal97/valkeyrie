@@ -230,7 +230,11 @@ _CREDENTIAL: Final = re.compile(
     r"|xox[abprs]-[A-Za-z0-9-]{10,}"
     r"|ASIA[A-Z0-9]{16}|AKIA[A-Z0-9]{16}"
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
-    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})"
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+    # A labelled secret: the name says what it is, so the value does not have to be recognisable.
+    r"|(?i:(?:secret|token|password|passwd|api[_-]?key|access[_-]?key)"
+    r"(?:_?[a-z]+)?\s*[:=]\s*)\S{12,}"
+    r"|(?i:authorization\s*:\s*(?:bearer|basic)\s+)\S{12,})"
 )
 # Distinguishes "not yet looked up" from "looked up and absent", so an absent token is
 # not re-fetched on every question.
@@ -676,6 +680,8 @@ def _answer(
         "question": question,
         "evidence_mode": evidence_mode,
         "route": "exact_lookup" if provisional.routes[0] == "exact_lookup" else "semantic",
+        # Set true by the one abstention retry, in the same revision that widens the evidence.
+        "retry_attempted": False,
         "generation_id": generation_id,
         "knowledge_base_id": plan_knowledge_base_id,
         "application_revision": manifest["application_revision"],
@@ -956,8 +962,12 @@ def _accept_output(
     cited: set[str] = set()
     seen: set[str] = set()
     for raw in cast(list[object], value["claims"]):
-        if not isinstance(raw, Mapping) or set(raw) != {"claim_id", "text", "evidence_ids"}:
-            raise ApplicationRuntimeError("model claim has an unknown or missing field")
+        # The three fields must be present. An EXTRA field is ignored rather than fatal: the claim
+        # that reaches the user is rebuilt below from exactly these three, so an unread key cannot
+        # carry anything into the answer, and refusing the whole answer over one threw away a
+        # correct reply to "how do I add a new command" on some draws.
+        if not isinstance(raw, Mapping) or not {"claim_id", "text", "evidence_ids"} <= set(raw):
+            raise ApplicationRuntimeError("model claim has a missing field")
         claim_id = raw["claim_id"]
         text = _bounded_text(raw["text"], "claim text", 4096)
         ids = raw["evidence_ids"]
@@ -1130,6 +1140,8 @@ def _retry_with_supplement(
     place under the revised plan, never an error. Controls are rechecked immediately before the
     second inference, as they are before the first.
     """
+    if plan.get("retry_attempted") is True:
+        return None
     question = cast(str, plan["question"])
     try:
         supplement = _forced_supplementary_live_evidence(services, question)
@@ -1143,9 +1155,19 @@ def _retry_with_supplement(
         return None
     revised = dict(plan)
     revised["evidence"] = [_evidence_value(item) for item in widened]
-    if not services.revise_plan(
-        request_id=request_id, revision=revision, fence=fence, plan=revised
-    ):
+    # The flag rides the SAME revision as the widened evidence, so a worker that recovers this
+    # request after a crash sees that the retry already happened. Without it, recovery abstained,
+    # refetched observations whose ids differ only by observation time, and retried again.
+    revised["retry_attempted"] = True
+    try:
+        written = services.revise_plan(
+            request_id=request_id, revision=revision, fence=fence, plan=revised
+        )
+    except Exception:
+        # An indeterminate write: the revision may or may not have landed, so this worker stops
+        # rather than answering over a state it cannot describe.
+        return _Retry(revision, lost=True)
+    if not written:
         return _Retry(revision, lost=True)
     next_revision = revision + 1
     if not _controls_enabled(services):
@@ -1650,6 +1672,7 @@ def _existing_plan(
         "question",
         "evidence_mode",
         "route",
+        "retry_attempted",
         "generation_id",
         "knowledge_base_id",
         "application_revision",
@@ -2338,26 +2361,31 @@ class AwsRuntimeServices:
             by_repository[repository].extend(r for r in own if r.text not in seen)
         merged: list[RetrievedChunk] = []
         chosen: set[str] = set()
-        for position in range(10):
+        # A cursor per repository, so a duplicate consumes no share. Skipping a position instead
+        # left a bucket short whenever two repositories returned the same chunk.
+        cursors = dict.fromkeys(intent.repositories, 0)
+        for _ in range(share):
             for repository in intent.repositories:
                 bucket = by_repository[repository]
-                if position < min(share, len(bucket)) and len(merged) < 10:
-                    candidate = bucket[position]
-                    # The same chunk can reach two buckets, since a per-repository call is scoped
-                    # by filter and not by what the text is about. One copy is evidence; two waste
-                    # a slot the other side of a comparison needed.
+                taken = 0
+                while cursors[repository] < len(bucket) and taken == 0 and len(merged) < 10:
+                    candidate = bucket[cursors[repository]]
+                    cursors[repository] += 1
                     if candidate.text in chosen:
                         continue
                     chosen.add(candidate.text)
                     merged.append(candidate)
-        # Any remaining room goes to the combined ranking, so a scope with one rich repository is
-        # not left short because the other had little to say.
-        for result in combined:
-            if len(merged) >= 10:
-                break
-            if result.text not in chosen:
-                chosen.add(result.text)
-                merged.append(result)
+                    taken = 1
+        # Remaining room goes to whatever is left, own results first and then the combined
+        # ranking: floor division leaves a remainder, and a scope with one rich repository must
+        # not come back short because the other had little to say.
+        for source in (*by_repository.values(), list(combined)):
+            for result in source:
+                if len(merged) >= 10:
+                    break
+                if result.text not in chosen:
+                    chosen.add(result.text)
+                    merged.append(result)
         return tuple(merged)
 
     @staticmethod
@@ -2374,11 +2402,17 @@ class AwsRuntimeServices:
         repository keeps whatever the combined call already gave it."""
         try:
             response = _runtime_retrieve(client, knowledge_base_id, intent.query, scoped)
-            return verify_retrieval_results(
+            results = verify_retrieval_results(
                 response, generation_id, "generation_id", 10, (repository,)
             )
         except Exception:
             return ()
+        # The filter said one repository; the metadata must agree. Verification allows any
+        # reviewed repository in the requested set, so a result from elsewhere would otherwise
+        # count toward this repository's share and the named side would still go unrepresented.
+        return tuple(
+            result for result in results if result.metadata.get("repository") == repository
+        )
 
     def read_structured_record(
         self, *, generation_id: str, record_id: str, expected_content_digest: str
