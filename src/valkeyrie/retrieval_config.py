@@ -10,6 +10,7 @@ import re
 import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from types import MappingProxyType
 from typing import cast
@@ -500,6 +501,10 @@ def _migration(value: object, candidate_ids: set[str]) -> Mapping[str, object] |
     approved_on = _text(migration.get("approved_on"), "migration approved_on")
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", approved_on):
         raise RetrievalConfigError("migration approved_on must be a calendar date")
+    try:
+        date.fromisoformat(approved_on)
+    except ValueError as error:
+        raise RetrievalConfigError("migration approved_on must be a calendar date") from error
     source = _identifier(migration.get("from_candidate"), "migration from_candidate")
     target = _identifier(migration.get("to_candidate"), "migration to_candidate")
     if source == target:

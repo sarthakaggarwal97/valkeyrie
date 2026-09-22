@@ -375,8 +375,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
     assert payload == {
         "api_version": "valkeyrie.io/live-github/1",
         "finding": (
-            'The search found 2 issues in valkey-io/valkey whose title or body contains "release" '
-            'and "status".'
+            'The search found 2 issues in valkey-io/valkey matching "release" and "status".'
         ),
         "items": [
             {
@@ -1405,8 +1404,8 @@ def test_a_question_naming_two_repositories_is_searched_in_both() -> None:
         ).canonical_payload
     )
     assert empty["finding"] == (
-        "The search completed and found no issues in valkey-io/valkey-glide whose title or body "
-        'contains "streaming" and "compression". This establishes that no such issues existed '
+        "The search completed and found no issues in valkey-io/valkey-glide matching "
+        '"streaming" and "compression". This establishes that no such issues existed '
         "there at observation time."
     )
 
@@ -1548,3 +1547,131 @@ def test_a_date_window_search_lists_recent_items_with_short_bodies() -> None:
     # Without a window the term minimum still holds.
     with pytest.raises(LiveGitHubError, match="requires from 2"):
         read_live_github(IssueSearchQuery((), repository="valkey", kind="issue"), fetch=fetch)
+
+
+def test_project_paging_fails_closed_on_a_stuck_cursor_a_repeated_item_or_an_unfinished_walk() -> (
+    None
+):
+    """Three ways a bounded walk could present an incomplete or duplicated board as whole, each
+    refused: a cursor that does not advance, an item id seen on two pages, and a final page that
+    still says another follows."""
+    from valkeyrie.live_github import MAX_PROJECT_PAGES
+
+    def page(has_next: bool, cursor: str | None, total: int, suffix: str) -> dict[str, object]:
+        value = _project()
+        project = cast(dict[str, Any], value["data"])["organization"]["projectV2"]
+        project["items"]["totalCount"] = total
+        project["items"]["pageInfo"] = {"hasNextPage": has_next, "endCursor": cursor}
+        for node in project["items"]["nodes"]:
+            node["id"] = node["id"] + suffix
+        return value
+
+    # Stuck cursor: page two says "next is c1" again. Refused on the second page, not walked
+    # to the cap and accepted because the counts happened to line up.
+    stuck = iter([page(True, "c1", 9, "-a"), page(True, "c1", 9, "-b"), page(True, "c1", 9, "-c")])
+    with pytest.raises(LiveGitHubError, match="did not advance"):
+        read_live_github(ProjectQuery(14), projects_fetch=lambda *a: _response(next(stuck)))
+
+    # A page whose items repeat the previous page's ids, with the total agreeing on the count.
+    repeated = iter([page(True, "c1", 6, "-a"), page(False, None, 6, "-a")])
+    with pytest.raises(LiveGitHubError, match="repeat an item"):
+        read_live_github(ProjectQuery(14), projects_fetch=lambda *a: _response(next(repeated)))
+
+    # Every page through the cap says another follows: the board is larger than the walk.
+    endless = iter(
+        [page(True, f"c{i}", 3 * MAX_PROJECT_PAGES, f"-{i}") for i in range(MAX_PROJECT_PAGES)]
+    )
+    with pytest.raises(LiveGitHubError, match="exceeds the page bound"):
+        read_live_github(ProjectQuery(14), projects_fetch=lambda *a: _response(next(endless)))
+
+    # Pages disagreeing on the total are refused whichever page is first.
+    with pytest.raises(LiveGitHubError, match="disagree on the item total"):
+        normalize_project_response(
+            [page(True, "c1", 6, "-a"), page(False, None, 7, "-b")], number=14
+        )
+
+
+def test_release_membership_is_conclusive_only_within_one_commit_page_and_per_tag() -> None:
+    """A tag is recorded as checked only when its commit window was read whole: a full page may
+    hide the merge on the next one, so the tag is left unchecked rather than reported absent.
+    A malformed listing for one tag leaves that tag unchecked and the pull request intact; a
+    failed release list leaves membership unknown, never fails the read."""
+    from valkeyrie.live_github import MEMBERSHIP_COMMIT_PAGE
+
+    merge_sha = "a" * 40
+    value = _pull_request(number=7)
+    value["merged_at"] = "2026-09-15T21:15:53Z"
+    value["merge_commit_sha"] = merge_sha
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        if url.endswith("/pulls/7"):
+            return _response(value)
+        if "/releases?per_page=" in url:
+            return _response(
+                [
+                    {"tag_name": "full"},
+                    {"tag_name": "found"},
+                    {"tag_name": "broken"},
+                    {"tag_name": "empty"},
+                ]
+            )
+        if "sha=full&" in url:
+            # A full page, none of them the merge: inconclusive.
+            return _response([{"sha": f"{i:040x}"} for i in range(1, MEMBERSHIP_COMMIT_PAGE + 1)])
+        if "sha=found&" in url:
+            return _response([{"sha": merge_sha}])
+        if "sha=broken&" in url:
+            return _response({"not": "a list"})
+        if "sha=empty&" in url:
+            return _response([])
+        raise AssertionError(url)
+
+    payload = json.loads(
+        read_live_github(PullRequestQuery("valkey", 7), fetch=fetch).canonical_payload
+    )
+    assert payload["release_membership_checked"] == ["found", "empty"]
+    assert payload["released_in"] == ["found"]
+    assert payload["number"] == 7, "the pull request read itself is intact"
+
+    def no_releases(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        if url.endswith("/pulls/7"):
+            return _response(value)
+        raise GitHubReadError("GitHub returned HTTP 503")
+
+    payload = json.loads(
+        read_live_github(PullRequestQuery("valkey", 7), fetch=no_releases).canonical_payload
+    )
+    assert payload["released_in"] is None and payload["release_membership_checked"] == []
+
+
+def test_release_by_tag_binds_the_endpoint_the_tag_and_the_notes_bound() -> None:
+    from valkeyrie.live_github import MAX_RELEASE_NOTES_BYTES, ReleaseByTagQuery
+
+    value = _release()
+    value["tag_name"] = "9.1.0"
+    value["body"] = "é" * (MAX_RELEASE_NOTES_BYTES // 2 + 10)
+    value["html_url"] = "https://github.com/valkey-io/valkey/releases/tag/9.1.0"
+    seen: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        seen.append(url)
+        return _response(value)
+
+    payload = json.loads(
+        read_live_github(ReleaseByTagQuery("valkey", "9.1.0"), fetch=fetch).canonical_payload
+    )
+    assert seen == ["https://api.github.com/repos/valkey-io/valkey/releases/tags/9.1.0"]
+    assert payload["tag"] == "9.1.0"
+    assert len(payload["body"].encode("utf-8")) <= MAX_RELEASE_NOTES_BYTES
+    assert payload["body"].encode("utf-8").decode("utf-8") == payload["body"], "cut on a boundary"
+    assert payload["body_truncated"] is True
+
+    # A response for a different tag than asked is refused, and a tag is one path segment.
+    other = dict(value)
+    other["tag_name"] = "9.0.0"
+    other["html_url"] = "https://github.com/valkey-io/valkey/releases/tag/9.0.0"
+    with pytest.raises(LiveGitHubError, match="conflicts with the query"):
+        read_live_github(ReleaseByTagQuery("valkey", "9.1.0"), fetch=lambda *a: _response(other))
+    for bad in ("../latest", "9.1.0/notes", "-leading", "a" * 300):
+        with pytest.raises(LiveGitHubError, match="malformed"):
+            read_live_github(ReleaseByTagQuery("valkey", bad), fetch=fetch)

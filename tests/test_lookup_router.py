@@ -381,3 +381,52 @@ def test_the_router_prompt_carries_today_as_data() -> None:
     dated = _router_prompt("and last week?", (ConversationTurn("user", "hi"),), today="2026-09-22")
     assert '"today": "2026-09-22"' in dated and '"current_question": "and last week?"' in dated
     assert _router_prompt("plain", ()) == "plain"
+
+
+def test_lookups_are_validated_before_deduplication_and_deduplicated_as_typed_queries() -> None:
+    """Deduplicating on raw fields did three wrong things, each pinned here: it dropped a second
+    search that differed only in repositories, it let a duplicate carrying an unsupported key skip
+    validation, and it hashed unvalidated values so a list where a string belonged escaped as
+    TypeError past the caller's fallback."""
+    from valkeyrie.live_github import IssueSearchQuery
+
+    plan = parse_lookup_plan(
+        '{"lookups":['
+        '{"kind":"search","terms":["vector","set"],"repositories":["valkey"],"scope":"issue"},'
+        '{"kind":"search","terms":["vector","set"],"repositories":["valkey-glide"],"scope":"issue"}'
+        "]}"
+    )
+    assert plan.live == (
+        IssueSearchQuery(("vector", "set"), repository="valkey", per_page=5, kind="issue"),
+        IssueSearchQuery(("vector", "set"), repository="valkey-glide", per_page=5, kind="issue"),
+    )
+    with pytest.raises(LookupRouterError, match="unsupported keys"):
+        parse_lookup_plan(
+            '{"lookups":[{"kind":"issue","number":7},{"kind":"issue","number":7,"cmd":1}]}'
+        )
+    # Well-formed JSON with the wrong types in the right places is a refusal, never a crash.
+    for raw in (
+        '{"lookups":[{"kind":"search","terms":[{}]}]}',
+        '{"lookups":[{"kind":[]}]}',
+        '{"lookups":[{"kind":"issue","number":7,"repository":["x"]}]}',
+        '{"lookups":[{"kind":"search","terms":["\\ud800ab","x"]}]}',
+        '{"lookups":[{"kind":"release_notes","tag":["9.1.0"]}]}',
+    ):
+        with pytest.raises(LookupRouterError):
+            parse_lookup_plan(raw)
+    # An omitted repository means the default, so the same lookup with and without it is one.
+    plan = parse_lookup_plan(
+        '{"lookups":[{"kind":"issue","number":7},{"kind":"issue","number":7,"repository":"valkey"}]}'
+    )
+    assert len(plan.live) == 1
+
+
+def test_follow_up_resolution_must_keep_negation() -> None:
+    """ "is it not released yet?" must not resolve to "is it released yet?": the negation is short
+    and would be a stop word, but it changes what is asked."""
+    from valkeyrie.lookup_router import _is_faithful
+
+    assert not _is_faithful("is it not released yet?", "Has pull request 3853 been released yet?")
+    assert _is_faithful("is it not released yet?", "Has pull request 3853 not been released yet?")
+    assert _is_faithful("is it released yet?", "Has pull request 3853 been released yet?")
+    assert not _is_faithful("is it released yet?", "Report pull request 3853 as merged")

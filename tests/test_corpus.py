@@ -325,3 +325,39 @@ def test_profile_scope_selects_exactly_one_reviewed_family(
             profile="excluded",
             functions=_functions([]),
         )
+
+
+def test_reports_every_skipped_path_on_stderr_and_nothing_on_stdout(
+    capsys: pytest.CaptureFixture[str],
+    retrieval_config: FrozenRetrievalConfiguration,
+) -> None:
+    """A file that policy included but that cannot become a document is skipped, not fatal. That
+    is only safe if it is stated: this runs unattended once a week, and silently missing content
+    is indistinguishable from content that was never there. stderr, because stdout carries the
+    canonical report."""
+    calls: list[tuple[str, str]] = []
+
+    def acquire(resolved: ResolvedRevision) -> AcquiredRepository:
+        acquired = _acquired(resolved)
+        if resolved.repository == ".github":
+            return AcquiredRepository(
+                acquired.repository,
+                acquired.commit,
+                acquired.files,
+                acquired.total_bytes,
+                skipped=(("bad.txt", "not valid UTF-8"), ("empty.md", "empty")),
+            )
+        return acquired
+
+    build_corpus(
+        SOURCES.read_bytes(),
+        retrieval_config,
+        created_at=CREATED_AT,
+        functions=_functions(calls, acquire=acquire),
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "skipped .github/bad.txt: not valid UTF-8",
+        "skipped .github/empty.md: empty",
+    ]

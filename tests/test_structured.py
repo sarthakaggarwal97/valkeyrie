@@ -152,8 +152,14 @@ def test_record_and_collection_serialization_is_deterministic() -> None:
     records = _records()
 
     assert canonical_records_bytes(records) == canonical_records_bytes(tuple(reversed(records)))
-    assert canonical_record_bytes(records[3]) == canonical_record_bytes(records[3])
-    assert record_checksum(records[3]) == record_checksum(records[3])
+    # A record rebuilt from scratch serializes and checksums identically: the serialization
+    # depends on the record's content, never on object identity or construction order.
+    rebuilt = _records()[3]
+    assert rebuilt is not records[3]
+    assert canonical_record_bytes(records[3]) == canonical_record_bytes(rebuilt)
+    assert record_checksum(records[3]) == record_checksum(rebuilt)
+    # And a different record does not collide.
+    assert record_checksum(records[3]) != record_checksum(records[2])
 
     index = ExactLookup(tuple(reversed(records)))
     ordered = [

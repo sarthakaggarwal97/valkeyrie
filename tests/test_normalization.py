@@ -177,8 +177,9 @@ def test_identical_inputs_are_byte_identical_and_input_order_independent() -> No
     assert [canonical_metadata_identity_bytes(item) for item in forward] == [
         canonical_metadata_identity_bytes(item) for item in reverse
     ]
+    # The same document built in the other order serializes to the same identity bytes.
     assert canonical_document_identity_bytes(forward[0]) == canonical_document_identity_bytes(
-        forward[0]
+        reverse[0]
     )
 
 

@@ -12,6 +12,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -28,6 +29,7 @@ from valkeyrie.bedrock_response import (
 from valkeyrie.drafting import DraftingError, _screened_model_text
 from valkeyrie.github import fetch_github_graphql, fetch_public_github
 from valkeyrie.live_github import (
+    IssueSearchQuery,
     LiveGitHubError,
     LiveGitHubQuery,
     infer_live_query,
@@ -169,6 +171,17 @@ class RuntimeServices(Protocol):
         result: Mapping[str, object] | None = None,
     ) -> bool: ...
 
+    def revise_plan(
+        self, *, request_id: str, revision: int, fence: int, plan: Mapping[str, object]
+    ) -> bool:
+        """Replace the persisted plan under the same fence, advancing the revision by one.
+
+        Conditional on the current revision and fence and on no outcome: the same guard the
+        completion uses. False means the request moved on without us (a recovering worker took
+        it, or it completed), and the caller must stop rather than answer over the winner.
+        """
+        ...
+
     def converse(
         self,
         *,
@@ -205,6 +218,8 @@ _MAX_EVIDENCE_BYTES: Final = 64 * 1024
 # The most of the byte budget live records may take together, leaving the corpus at least the
 # rest: about four chunks, enough to say what a thing is while GitHub says where it stands.
 _MAX_LIVE_EVIDENCE_BYTES: Final = 40 * 1024
+# Concurrent live reads per request: a plan holds at most six lookups.
+_LIVE_READ_WORKERS: Final = 6
 _RELEASE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 _RELEASE_ARTIFACT: Final = re.compile(
     r"^valkey-(?P<release>[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?)\.tar\.gz$"
@@ -469,13 +484,21 @@ def _answer(
     generation_id: str | None
     plan_knowledge_base_id: str | None
     evidence_mode: Literal["static", "live"]
-    routed = _routed_evidence(
-        services,
-        question,
-        requested=requested,
-        knowledge_base_id=knowledge_base_id,
-        conversation=conversation,
-        today=now[:10],
+    # An exact identifier is a deterministic lookup of one generation-bound record: the model
+    # router has nothing to add and could only replace it with semantic retrieval, which it did
+    # when its plan was accepted first. The exact route is also never widened by the abstention
+    # retry (see plan["route"]), since a searched-for record is not the record that was asked for.
+    routed = (
+        None
+        if provisional.routes[0] == "exact_lookup"
+        else _routed_evidence(
+            services,
+            question,
+            requested=requested,
+            knowledge_base_id=knowledge_base_id,
+            conversation=conversation,
+            today=now[:10],
+        )
     )
     if routed is not None:
         evidence, generation_id, plan_knowledge_base_id, evidence_mode, question = routed
@@ -609,6 +632,7 @@ def _answer(
         "question_digest": request_digest,
         "question": question,
         "evidence_mode": evidence_mode,
+        "route": "exact_lookup" if provisional.routes[0] == "exact_lookup" else "semantic",
         "generation_id": generation_id,
         "knowledge_base_id": plan_knowledge_base_id,
         "application_revision": manifest["application_revision"],
@@ -647,6 +671,7 @@ def _answer(
             lease_expires_at=lease_expires_at,
             completed_at=completed_at,
             manifest=manifest,
+            completion_clock=completion_clock,
         )
     return _execute_plan(
         services,
@@ -753,11 +778,11 @@ def _execute_plan(
         )
     # Generated here, after execution and immediately before the completing write, so the audit
     # records when the request actually finished rather than when its caller was preparing it.
-    terminal_at = _completion_timestamp(completion_clock, completed_at)
     try:
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
         outcome, claims, citations, message = _accept_output(normalized.response_text, evidence)
     except (ApplicationRuntimeError, BedrockResponseError, DraftingError):
+        terminal_at = _completion_timestamp(completion_clock, completed_at)
         failed = RuntimeResult(
             "error",
             request_id,
@@ -780,14 +805,32 @@ def _execute_plan(
                 "partial", request_id, "Request completion could not be confirmed."
             )
         return failed
-    if outcome == "abstention" and plan.get("evidence_mode") == "static":
-        # One more attempt before giving up. A corpus-only abstention on a question about work
-        # that has not shipped is the residual refusal class; the GitHub supplement is what covers
-        # it, and here it is forced on regardless of the intent gate. Everything else stays
-        # single: one request, one terminal write, one replayable result.
-        retried = _retry_with_supplement(services, plan, evidence)
+    if (
+        outcome == "abstention"
+        and plan.get("evidence_mode") == "static"
+        and plan.get("route") != "exact_lookup"
+    ):
+        # One more attempt before giving up, as a NEW plan revision. A corpus-only abstention on
+        # a question about work that has not shipped is the residual refusal class; the GitHub
+        # supplement covers it, forced on regardless of the intent gate. The widened evidence is
+        # persisted under the same fence before the second model call, so the durable plan
+        # always names every record the answer was grounded in and a redelivery replays against
+        # a plan that contains the cited ids. If the revision write is lost, the request moved
+        # on without us and the abstention is not written either.
+        retried = _retry_with_supplement(
+            services, plan, evidence, request_id=request_id, revision=revision, fence=fence
+        )
         if retried is not None:
-            outcome, claims, citations, message = retried
+            if retried.lost:
+                return RuntimeResult(
+                    "partial", request_id, "Request completion could not be confirmed."
+                )
+            revision = retried.revision
+            if retried.output is not None:
+                outcome, claims, citations, message = retried.output
+    # Sampled after every model call this request will make, so the terminal record does not
+    # predate its own completion.
+    terminal_at = _completion_timestamp(completion_clock, completed_at)
     if outcome == "abstention":
         # Applied here, at the single point where a parsed model outcome becomes a result,
         # rather than at each return site. The model writes its own reason, so wrapping the
@@ -870,10 +913,12 @@ def _accept_output(
             raise ApplicationRuntimeError("model claim ID is malformed")
         if claim_id in seen:
             raise ApplicationRuntimeError("model claim ID is duplicated")
+        # Every id must be a string BEFORE the membership test: an object where an id belongs is
+        # unhashable, and the TypeError it raised escaped the fail-closed catch as a crash.
         if (
             not isinstance(ids, list)
             or not 1 <= len(ids) <= 20
-            or any(item not in known for item in ids)
+            or any(not isinstance(item, str) or item not in known for item in ids)
         ):
             raise ApplicationRuntimeError("model claim evidence is unknown or missing")
         if len(ids) != len(set(cast(list[str], ids))):
@@ -985,14 +1030,13 @@ def _routed_evidence(
         # question from four grounded claims to an abstention.
         if not plan.live:
             records.extend(_supplementary_live_evidence(services, question))
-    for query in plan.live:
-        # Each live lookup fails independently: one unavailable object must not discard the rest.
-        try:
-            record: RuntimeEvidence | None = _live_evidence(services.read_live(query))
-        except Exception:
-            record = None
-        if record is not None:
-            records.append(record)
+    # Coverage invariant: a repository the question NAMES is always searched, whatever the router
+    # chose. Routing is one model draw, and the draw that omitted valkey-glide from "does
+    # valkey-glide support X?" produced an abstention where the other draws answered. The router
+    # decides how to look; the question decides where. Only repositories the router did not
+    # already cover are added, so a complete plan costs nothing extra.
+    live = _with_named_repository_coverage(plan.live, question)
+    records.extend(_live_records(services, live))
     if not records:
         return None
     evidence = _bounded_evidence(tuple(records))
@@ -1001,20 +1045,36 @@ def _routed_evidence(
     return evidence, None, None, "live", question
 
 
+@dataclass(frozen=True)
+class _Retry:
+    """Outcome of the abstention retry. ``lost`` means the plan revision was not ours to write."""
+
+    revision: int
+    lost: bool = False
+    output: tuple[str, tuple[Mapping[str, object], ...], tuple[str, ...], str | None] | None = None
+
+
 def _retry_with_supplement(
     services: RuntimeServices,
     plan: Mapping[str, object],
     evidence: tuple[RuntimeEvidence, ...],
-) -> tuple[str, tuple[Mapping[str, object], ...], tuple[str, ...], str | None] | None:
-    """Ask once more with the GitHub supplement forced on. None means keep the abstention.
+    *,
+    request_id: str,
+    revision: int,
+    fence: int,
+) -> _Retry | None:
+    """Ask once more with the GitHub supplement forced on. None means keep the abstention as is.
 
-    Only runs when the first pass had no live evidence: if the supplement already contributed and
-    the model still abstained, a second identical package would not change its mind. The retry
-    must ADD something, so it returns None when no new live record was found. Any failure inside
-    the retry is swallowed: the abstention it would have replaced is the fallback, never an error.
+    The retry must ADD something: it runs only when the forced supplement contributes at least
+    one evidence id the first package did not have, after bounding. That is the right condition,
+    not "no live evidence yet": a plan whose live records did not help can still be rescued by
+    different ones, and a plan that already holds what the supplement would add cannot.
+
+    The widened package is persisted as a plan revision BEFORE the second model call. Any
+    failure inside the retry itself (a fetch, the model, the parse) leaves the abstention in
+    place under the revised plan, never an error. Controls are rechecked immediately before the
+    second inference, as they are before the first.
     """
-    if any(isinstance(item, LiveRuntimeEvidence) for item in evidence):
-        return None
     question = cast(str, plan["question"])
     try:
         supplement = _forced_supplementary_live_evidence(services, question)
@@ -1022,9 +1082,19 @@ def _retry_with_supplement(
         return None
     if not supplement:
         return None
+    known = {item.evidence_id for item in evidence}
     widened = _bounded_evidence((*evidence, *supplement))
-    if not any(isinstance(item, LiveRuntimeEvidence) for item in widened):
+    if not any(item.evidence_id not in known for item in widened):
         return None
+    revised = dict(plan)
+    revised["evidence"] = [_evidence_value(item) for item in widened]
+    if not services.revise_plan(
+        request_id=request_id, revision=revision, fence=fence, plan=revised
+    ):
+        return _Retry(revision, lost=True)
+    next_revision = revision + 1
+    if not _controls_enabled(services):
+        return _Retry(next_revision)
     try:
         response = services.converse(
             model_id=cast(str, plan["model_id"]),
@@ -1035,30 +1105,89 @@ def _retry_with_supplement(
             reasoning_effort=cast(str, plan["reasoning_effort"]),
         )
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
-        outcome, claims, citations, message = _accept_output(normalized.response_text, widened)
+        output = _accept_output(normalized.response_text, widened)
     except Exception:
-        return None
-    if outcome != "answer":
-        return None
-    return outcome, claims, citations, message
+        return _Retry(next_revision)
+    if output[0] != "answer":
+        return _Retry(next_revision)
+    return _Retry(next_revision, output=output)
 
 
 def _forced_supplementary_live_evidence(
     services: RuntimeServices, question: str
 ) -> tuple[RuntimeEvidence, ...]:
     """The supplement with its intent gate bypassed: both kinds, given enough search terms."""
-    records: list[RuntimeEvidence] = []
-    for kind in ("pull-request", "issue"):
-        query = infer_supplementary_search(question, kind=kind, force=True)
-        if query is None:
-            return ()
+    return tuple(_live_records(services, _supplement_queries(question, force=True)))
+
+
+def _with_named_repository_coverage(
+    live: tuple[LiveGitHubQuery, ...], question: str
+) -> tuple[LiveGitHubQuery, ...]:
+    """Append a search in every repository the question names that no routed lookup touches."""
+    try:
+        named = infer_supplementary_search(question, force=True)
+    except LiveGitHubError:
+        return live
+    if named is None:
+        return live
+    covered: set[str] = set()
+    for query in live:
+        repository = getattr(query, "repository", None)
+        if isinstance(repository, str):
+            covered.add(repository)
+        covered.update(getattr(query, "repositories", ()))
+    wanted: tuple[str, ...] = (
+        *((named.repository,) if named.repository is not None else ()),
+        *named.repositories,
+    )
+    # The core repository is the default subject, named or not; only OTHER named repositories
+    # carry the coverage obligation. "valkey" alone would add a search to every question.
+    missing = tuple(r for r in wanted if r != "valkey" and r not in covered)
+    if not missing:
+        return live
+    return (
+        *live,
+        IssueSearchQuery(
+            named.terms,
+            repository=missing[0],
+            repositories=missing[1:],
+            per_page=named.per_page,
+            kind="pull-request",
+        ),
+        IssueSearchQuery(
+            named.terms,
+            repository=missing[0],
+            repositories=missing[1:],
+            per_page=named.per_page,
+            kind="issue",
+        ),
+    )
+
+
+def _live_records(
+    services: RuntimeServices, queries: Sequence[LiveGitHubQuery]
+) -> list[RuntimeEvidence]:
+    """Read every live lookup, concurrently, keeping plan order and failing each independently.
+
+    The reads are independent HTTP requests of 0.2 to 0.5 s each; a six-lookup plan ran them one
+    after another. One unavailable object must not discard the rest, so each read's failure is
+    its own None.
+    """
+    if not queries:
+        return []
+
+    def read(query: LiveGitHubQuery) -> RuntimeEvidence | None:
         try:
-            record: RuntimeEvidence | None = _live_evidence(services.read_live(query))
+            return _live_evidence(services.read_live(query))
         except Exception:
-            record = None
-        if record is not None:
-            records.append(record)
-    return tuple(records)
+            return None
+
+    if len(queries) == 1:
+        results = [read(queries[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=min(len(queries), _LIVE_READ_WORKERS)) as pool:
+            results = list(pool.map(read, queries))
+    return [record for record in results if record is not None]
 
 
 def _supplementary_live_evidence(
@@ -1074,25 +1203,22 @@ def _supplementary_live_evidence(
     Best effort by design: anonymous GitHub reads are rate limited, and a corpus answer must
     not fail because a supplement was unavailable. Every failure yields no supplement.
     """
-    # Both kinds, because GitHub requires an explicit is:issue or is:pull-request and the two
-    # answer different halves of the same question: a pull request carries the design and
-    # whether it merged, an issue carries discussion and current status.
-    evidence: list[RuntimeEvidence] = []
+    return tuple(_live_records(services, _supplement_queries(question, force=False)))
+
+
+def _supplement_queries(question: str, *, force: bool) -> tuple[LiveGitHubQuery, ...]:
+    """Both search kinds for the question, or nothing: a pull request carries the design and
+    whether it merged, an issue carries discussion and status, and GitHub requires the kind."""
+    queries: list[LiveGitHubQuery] = []
     for kind in ("pull-request", "issue"):
         try:
-            query = infer_supplementary_search(question, kind=kind)
+            query = infer_supplementary_search(question, kind=kind, force=force)
         except LiveGitHubError:
             return ()
         if query is None:
             return ()
-        # Each kind fails independently: one unavailable half must not discard the other.
-        try:
-            record: RuntimeEvidence | None = _live_evidence(services.read_live(query))
-        except Exception:
-            record = None
-        if record is not None:
-            evidence.append(record)
-    return tuple(evidence)
+        queries.append(query)
+    return tuple(queries)
 
 
 def _bounded_evidence(values: tuple[RuntimeEvidence, ...]) -> tuple[RuntimeEvidence, ...]:
@@ -1110,6 +1236,13 @@ def _bounded_evidence(values: tuple[RuntimeEvidence, ...]) -> tuple[RuntimeEvide
     """
     live = tuple(item for item in values if isinstance(item, LiveRuntimeEvidence))
     static = tuple(item for item in values if not isinstance(item, LiveRuntimeEvidence))
+    # A single live record over the whole live share is refused outright: the share is a hard
+    # bound, and the loop below would otherwise keep it as the last record standing. Every live
+    # normalizer bounds its bodies well under this, so only a malformed or hostile payload gets
+    # here, and such a record is not evidence worth the corpus it would displace.
+    live = tuple(
+        item for item in live if len(item.text.encode("utf-8")) <= _MAX_LIVE_EVIDENCE_BYTES
+    )
     # Live is capped at half the package so a supplement can never crowd out the corpus.
     kept_live = list(live[: _MAX_EVIDENCE // 2])
     # Live records have a byte share as well as a count. A router may put a board (18 KB) beside
@@ -1117,25 +1250,32 @@ def _bounded_evidence(values: tuple[RuntimeEvidence, ...]) -> tuple[RuntimeEvide
     # a question about what a feature IS lost the records that say so. Measured: the same
     # question answered twice and abstained once, on the routing draw. The largest live record
     # goes first, since it is the most expensive and, board or list, the least specific.
-    while (
-        sum(len(item.text.encode("utf-8")) for item in kept_live) > _MAX_LIVE_EVIDENCE_BYTES
-        and len(kept_live) > 1
-    ):
+    while sum(len(item.text.encode("utf-8")) for item in kept_live) > _MAX_LIVE_EVIDENCE_BYTES:
         del kept_live[max(range(len(kept_live)), key=lambda i: len(kept_live[i].text))]
     kept: list[RuntimeEvidence] = list(static[: _MAX_EVIDENCE - len(kept_live)])
     kept.extend(kept_live)
     total = sum(len(item.text.encode("utf-8")) for item in kept)
+    # Drop the lowest-ranked static record first, then live, so the byte bound is met without
+    # preferring bulk over relevance. When static evidence was supplied, its best record is kept
+    # whatever its size: a package that arrived mixed and leaves live-only would be persisted as a
+    # static plan grounded in nothing static, which is a false provenance claim.
     while total > _MAX_EVIDENCE_BYTES and len(kept) > 1:
-        # Drop the lowest-ranked static record first, then live, so the byte bound is met without
-        # preferring bulk over relevance.
-        index = max(
-            (
+        candidates = [
+            position
+            for position, item in enumerate(kept)
+            if not isinstance(item, LiveRuntimeEvidence)
+        ]
+        if len(candidates) > 1:
+            index = candidates[-1]
+        else:
+            live_positions = [
                 position
                 for position, item in enumerate(kept)
-                if not isinstance(item, LiveRuntimeEvidence)
-            ),
-            default=len(kept) - 1,
-        )
+                if isinstance(item, LiveRuntimeEvidence)
+            ]
+            if not live_positions:
+                break
+            index = max(live_positions, key=lambda i: len(kept[i].text))
         total -= len(kept[index].text.encode("utf-8"))
         del kept[index]
     return tuple(kept)
@@ -1389,8 +1529,33 @@ def _replayed_result(
         raise ApplicationRuntimeError("recorded result outcome is unsupported")
     claims = stored.get("claims", ())
     citations = stored.get("citations", ())
-    if not isinstance(claims, Sequence) or not isinstance(citations, Sequence):
+    if (
+        not isinstance(claims, Sequence)
+        or isinstance(claims, (str, bytes))
+        or not isinstance(citations, Sequence)
+        or isinstance(citations, (str, bytes))
+    ):
         raise ApplicationRuntimeError("recorded result is malformed")
+    # A replayed claim must cite evidence the persisted plan actually holds. The plan is what an
+    # auditor reconstructs the answer from; a claim citing an id outside it is a record that
+    # cannot be checked, and it is refused rather than presented as if it could.
+    plan_ids = {
+        cast(Mapping[str, object], cast(Mapping[str, object], record).get("metadata", {})).get(
+            "evidence_id"
+        )
+        for record in cast(Sequence[object], plan.get("evidence", ()))
+        if isinstance(record, Mapping)
+    }
+    for claim in claims:
+        if not isinstance(claim, Mapping) or set(claim) != {"claim_id", "text", "evidence_ids"}:
+            raise ApplicationRuntimeError("recorded claim is malformed")
+        ids = claim["evidence_ids"]
+        if not isinstance(ids, Sequence) or isinstance(ids, (str, bytes)) or not ids:
+            raise ApplicationRuntimeError("recorded claim evidence is malformed")
+        if any(
+            not isinstance(evidence_id, str) or evidence_id not in plan_ids for evidence_id in ids
+        ):
+            raise ApplicationRuntimeError("recorded claim cites evidence outside its plan")
     message = stored.get("message")
     if message is not None and not isinstance(message, str):
         raise ApplicationRuntimeError("recorded result message is malformed")
@@ -1429,6 +1594,7 @@ def _existing_plan(
         "question_digest",
         "question",
         "evidence_mode",
+        "route",
         "generation_id",
         "knowledge_base_id",
         "application_revision",
@@ -1445,6 +1611,8 @@ def _existing_plan(
     }
     if set(plan) != required:
         raise ApplicationRuntimeError("pinned execution has an unknown or missing field")
+    if plan.get("route") not in {"exact_lookup", "semantic"}:
+        raise ApplicationRuntimeError("pinned execution route is unsupported")
     _plan_generation_id(plan)
     return plan, revision, fence
 
@@ -2168,6 +2336,30 @@ class AwsRuntimeServices:
             raise ApplicationRuntimeError("request recovery returned no state")
         return _normalize_dynamodb_mapping(attributes)
 
+    def revise_plan(
+        self, *, request_id: str, revision: int, fence: int, plan: Mapping[str, object]
+    ) -> bool:
+        try:
+            self._table().update_item(
+                Key={"pk": f"request#{request_id}"},
+                UpdateExpression="SET #plan = :plan, revision = :next",
+                ConditionExpression=(
+                    "revision = :revision AND fence = :fence AND attribute_not_exists(outcome)"
+                ),
+                ExpressionAttributeNames={"#plan": "plan"},
+                ExpressionAttributeValues={
+                    ":plan": _dynamo_value(plan),
+                    ":next": revision + 1,
+                    ":revision": revision,
+                    ":fence": fence,
+                },
+            )
+        except Exception as error:
+            if _aws_error_code(error) == "ConditionalCheckFailedException":
+                return False
+            raise
+        return True
+
     def complete_request(
         self,
         *,
@@ -2278,6 +2470,14 @@ class AwsRuntimeServices:
                 # A six-lookup plan with the model's reasoning block runs to about 300 tokens;
                 # a cap it can hit truncates the JSON and loses the whole plan.
                 inferenceConfig={"maxTokens": 800},
+                # Same reasoning setting as the answer call. Measured over ten questions, three
+                # draws each: low effort routed every question at least as well as the default
+                # (it kept the named repository's search in every draw where the default dropped
+                # it once) and took 3.2 s median against 4.0 s, up to 3.5 s less on the hardest.
+                additionalModelRequestFields={
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": "low"},
+                },
             )
         )
         blocks = response.get("output", {}).get("message", {}).get("content", [])

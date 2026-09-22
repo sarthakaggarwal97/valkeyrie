@@ -668,6 +668,10 @@ def test_approved_migration_is_the_only_way_to_select_against_the_arithmetic(
     # And a bare date, digest, and non-empty measurements are required.
     for field, value, error in (
         ("approved_on", "yesterday", "calendar date"),
+        # Shape is not enough: these have the right shape and are not days that exist.
+        ("approved_on", "2026-02-30", "calendar date"),
+        ("approved_on", "2026-13-01", "calendar date"),
+        ("approved_on", "2026-00-10", "calendar date"),
         ("measured_on_corpus_generation", "rev7", "must be a digest"),
         ("measurements", {}, "must not be empty"),
     ):

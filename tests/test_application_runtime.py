@@ -182,6 +182,19 @@ class FakeServices:
         )
         return dict(item)
 
+    revise: bool = True
+
+    def revise_plan(
+        self, *, request_id: str, revision: int, fence: int, plan: Mapping[str, object]
+    ) -> bool:
+        if not self.revise:
+            return False
+        item = self.requests[request_id]
+        if item["revision"] != revision or item["fence"] != fence or "outcome" in item:
+            return False
+        item.update({"plan": dict(plan), "revision": revision + 1})
+        return True
+
     def complete_request(
         self,
         *,
@@ -1729,10 +1742,23 @@ def test_live_supplements_displace_static_evidence_rather_than_being_dropped() -
     assert sum(isinstance(item, LiveRuntimeEvidence) for item in crowded) == _MAX_EVIDENCE // 2
     assert len(crowded) == _MAX_EVIDENCE
 
-    # The byte bound holds too, and is met by shedding static bulk rather than the supplement.
-    heavy = _bounded_evidence((static("ev_big", _MAX_EVIDENCE_BYTES), live("c", 100)))
+    # The byte bound holds too, and is met by shedding the lowest-ranked static bulk rather than
+    # the supplement, as long as one static record remains.
+    heavy = _bounded_evidence(
+        (static("ev_top", 100), static("ev_big", _MAX_EVIDENCE_BYTES), live("c", 100))
+    )
     assert sum(len(item.text.encode("utf-8")) for item in heavy) <= _MAX_EVIDENCE_BYTES
-    assert any(isinstance(item, LiveRuntimeEvidence) for item in heavy)
+    assert [item.evidence_id for item in heavy] == ["ev_top", "c"]
+    # The LAST static record is never shed for a live one. A package that arrived mixed and left
+    # live-only would be persisted as a static plan grounded in nothing static.
+    only = _bounded_evidence((static("ev_only", _MAX_EVIDENCE_BYTES), live("c", 100)))
+    assert [item.evidence_id for item in only] == ["ev_only"]
+    # A single live record over the live share is refused outright; the share is a hard bound.
+    from valkeyrie.application_runtime import _MAX_LIVE_EVIDENCE_BYTES as _LIVE_CAP
+
+    oversized = _bounded_evidence((static("ev_s", 100), live("huge", _LIVE_CAP + 1)))
+    assert [item.evidence_id for item in oversized] == ["ev_s"]
+    assert len(_bounded_evidence((live("fits", _LIVE_CAP),))) == 1
 
     # Live records also have a byte share. A board beside a release list took 45 KB and left two
     # corpus chunks; the same question then answered or abstained on the routing draw. The
@@ -2220,9 +2246,24 @@ def test_a_corpus_abstention_is_retried_once_with_the_github_supplement_forced_o
     kinds = [cast(IssueSearchQuery, call).kind for call in services.live_calls]
     assert kinds == ["pull-request", "issue"], "the forced supplement asks for both kinds"
     record = services.requests["req_retry"]
-    # Claim then complete: two revision steps, one terminal write, same as every other answer.
-    assert record["outcome"] == "answer" and record["revision"] == 2, "one terminal write"
+    # Claim (1), plan revision for the widened evidence (2), one terminal write (3).
+    assert record["outcome"] == "answer" and record["revision"] == 3, "one terminal write"
     assert cast(Mapping[str, object], record["result"])["outcome"] == "answer"
+    # The durable plan names every record the answer was grounded in: the retry persisted the
+    # widened evidence BEFORE the second model call, so a redelivery replays against a plan that
+    # contains the cited ids, and an auditor can reconstruct the model input.
+    plan = cast(Mapping[str, object], record["plan"])
+    persisted = {
+        cast(Mapping[str, object], cast(Mapping[str, object], item)["metadata"])["evidence_id"]
+        for item in cast(list[object], plan["evidence"])
+    }
+    cited = {
+        evidence_id
+        for claim in cast(list[Mapping[str, object]], result["claims"])
+        for evidence_id in cast(list[str], claim["evidence_ids"])
+    }
+    assert cited and cited <= persisted, (cited, persisted)
+    assert any(str(evidence_id).startswith("ev_") for evidence_id in cited)
 
     # A retry that still abstains keeps the abstention, with its guidance; it never errors.
     still = FakeServices()
@@ -2287,3 +2328,286 @@ def test_an_abstention_with_the_supplement_already_present_is_not_retried(
     )
     assert result["outcome"] == "abstention"
     assert len(services.model_calls) == 1
+
+
+def test_an_exact_identifier_bypasses_the_router_and_is_never_widened(
+    manifest: dict[str, object],
+) -> None:
+    """An exact identifier is a deterministic lookup of one generation-bound record. The router
+    has nothing to add and could only replace it with semantic retrieval, which it did when its
+    plan was accepted first. And a searched-for record is not the record that was asked for, so
+    an abstention on the exact route is not retried with a supplement."""
+    services = FakeServices()
+    release = "7.2.10"
+    artifact = f"valkey-{release}.tar.gz"
+    record_id = f"release_artifact_digest:{release}:{artifact}"
+    services.structured_record = json.dumps(
+        {
+            "api_version": "valkeyrie.io/structured-record/1",
+            "generation_id": GENERATION,
+            "identifier": {"artifact": artifact, "release": release},
+            "kind": "StructuredRecord",
+            "provenance": {"commit": COMMIT, "path": "README", "repository": "valkey-hashes"},
+            "record_id": record_id,
+            "record_type": "release_artifact_digest",
+            "source": {
+                "authority": "structured",
+                "commit": COMMIT,
+                "ref_kind": "branch",
+                "repository": "valkey-hashes",
+                "repository_url": "https://github.com/valkey-io/valkey-hashes",
+                "requested_ref": "main",
+                "source_policy_digest": "sha256:" + "e" * 64,
+                "version_scope": "release_artifacts",
+            },
+            "value": {"digest": "sha256:" + "d" * 64},
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    key_digest = __import__("hashlib").sha256(record_id.encode()).hexdigest()
+    content_digest = (
+        "sha256:" + __import__("hashlib").sha256(services.structured_record).hexdigest()
+    )
+    structured_records = {key_digest: content_digest}
+    services.generation = {
+        **cast(dict[str, object], services.generation),
+        "structured_records": structured_records,
+        "structured_index_sha256": "sha256:"
+        + __import__("hashlib")
+        .sha256(json.dumps(structured_records, sort_keys=True, separators=(",", ":")).encode())
+        .hexdigest(),
+    }
+    # The router WOULD accept a corpus plan; it must not be consulted at all.
+    services.router_reply = '{"lookups":[{"kind":"corpus_search"}]}'
+    services.output = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": "abstention",
+        "reason": "The record does not carry that.",
+    }
+    services.live_observation = _live_observation(
+        kind="issue_search",
+        object_type="issue",
+        source_url="https://api.github.com/search/issues?q=digest",
+        url=None,
+    )
+    result = run_runtime_event(
+        _event(
+            request_id="req_exact-bypass",
+            question=f"What is the SHA-256 digest for {artifact}?",
+            exact_identifier={
+                "record_type": "release_artifact_digest",
+                "release": release,
+                "artifact": artifact,
+            },
+        ),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert not hasattr(services, "route_calls") or services.route_calls == []
+    assert services.retrieve_calls == []
+    assert len(services.structured_calls) == 1
+    plan = cast(Mapping[str, object], services.requests["req_exact-bypass"]["plan"])
+    assert plan["route"] == "exact_lookup"
+    # Abstained, and NOT retried with a supplement: no live read, one model call.
+    assert result["outcome"] == "abstention"
+    assert services.live_calls == []
+    assert len(services.model_calls) == 1
+
+
+def test_a_named_repository_is_searched_even_when_the_router_omits_it(
+    manifest: dict[str, object],
+) -> None:
+    """Routing is one model draw. The draw that omitted valkey-glide from "does valkey-glide
+    support X?" produced an abstention where the others answered. The question decides WHERE to
+    look; the router only decides how. A routed plan that already covers the repository is left
+    alone, so a complete plan costs nothing extra."""
+    services = FakeServices()
+    services.router_reply = '{"lookups":[{"kind":"corpus_search"},{"kind":"releases"}]}'
+    services.live_observation = _live_observation(
+        kind="issue_search",
+        object_type="issue",
+        source_url="https://api.github.com/search/issues?q=x",
+        url=None,
+    )
+    run_runtime_event(
+        _event(
+            request_id="req_coverage",
+            question="does valkey-glide support the streaming compression in valkey 9.2?",
+        ),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    searches = [q for q in services.live_calls if isinstance(q, IssueSearchQuery)]
+    assert [(q.repository, q.kind) for q in searches] == [
+        ("valkey-glide", "pull-request"),
+        ("valkey-glide", "issue"),
+    ]
+    assert "valkey" not in {q.repository for q in searches}, "the core repo is not an obligation"
+
+    covered = FakeServices()
+    covered.router_reply = (
+        '{"lookups":[{"kind":"corpus_search"},{"kind":"search","terms":["streaming","compression"],'
+        '"repositories":["valkey-glide"],"scope":"issue"}]}'
+    )
+    covered.live_observation = services.live_observation
+    run_runtime_event(
+        _event(
+            request_id="req_covered",
+            question="does valkey-glide support the streaming compression in valkey 9.2?",
+        ),
+        covered,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert len([q for q in covered.live_calls if isinstance(q, IssueSearchQuery)]) == 1
+
+
+@pytest.mark.parametrize("retry_result", ["abstain", "raise", "lost", "controls_off"])
+def test_retry_fallbacks_keep_the_abstention_and_never_error(
+    manifest: dict[str, object], retry_result: str
+) -> None:
+    """Every failure inside the retry leaves the first abstention in place: a second abstention, a
+    model failure, a plan revision lost to a recovering worker, or controls disabled between the
+    two calls. None becomes an error and nothing leaks."""
+
+    class RetryServices(FakeServices):
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            self.model_calls.append(dict(kwargs))
+            if len(self.model_calls) == 2 and retry_result == "raise":
+                raise RuntimeError("retry failed")
+            output = {
+                "api_version": "valkeyrie.io/model-output/1",
+                "kind": "ModelOutput",
+                "outcome": "abstention",
+                "reason": "The available evidence does not establish this.",
+            }
+            return BedrockTextResponse(json.dumps(output, separators=(",", ":")), "end_turn")
+
+        def read_controls(self) -> dict[str, str]:
+            if retry_result == "controls_off" and len(self.model_calls) >= 1:
+                return {name: "false" for name in self.controls}
+            return dict(self.controls)
+
+    services = RetryServices()
+    services.live_observation = _live_observation(
+        kind="issue_search",
+        object_type="issue",
+        source_url="https://api.github.com/search/issues?q=replication",
+        url=None,
+    )
+    if retry_result == "lost":
+        services.revise = False
+    result = run_runtime_event(
+        _event(
+            request_id=f"req_retry-{retry_result.replace('_', '-')}",
+            question="why does valkey need a replication backlog",
+        ),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert len(services.live_calls) == 2, "the forced supplement was attempted"
+    if retry_result == "lost":
+        # The revision was not ours to write: someone else owns the request now.
+        assert result["outcome"] == "partial"
+        assert len(services.model_calls) == 1
+    else:
+        assert result["outcome"] == "abstention"
+        assert len(services.model_calls) == (1 if retry_result == "controls_off" else 2)
+        assert "indexed Valkey repositories" in cast(str, result["message"])
+    assert "retry failed" not in json.dumps(result)
+
+
+def test_a_retry_runs_when_forced_evidence_is_new_even_if_live_evidence_was_present(
+    manifest: dict[str, object],
+) -> None:
+    """The condition is "adds a record the first pass lacked", not "had no live evidence": a plan
+    whose live records did not help can still be rescued by different ones, and a plan that
+    already holds what the supplement would add cannot."""
+
+    class TwoKinds(FakeServices):
+        """Abstains until a SEARCH record is in the package; a release list alone does not help."""
+
+        def read_live(self, query: object) -> LiveObservation:
+            self.live_calls.append(query)
+            if isinstance(query, IssueSearchQuery):
+                return _live_observation(
+                    kind="issue_search",
+                    object_type="issue",
+                    source_url="https://api.github.com/search/issues?q=backlog",
+                    url=None,
+                )
+            return _live_observation()
+
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            self.model_calls.append(dict(kwargs))
+            evidence = cast(tuple[RuntimeEvidence, ...], kwargs["evidence"])
+            searches = [
+                e
+                for e in evidence
+                if isinstance(e, LiveRuntimeEvidence) and e.object_type == "issue"
+            ]
+            output: dict[str, object]
+            if not searches:
+                output = {
+                    "api_version": "valkeyrie.io/model-output/1",
+                    "kind": "ModelOutput",
+                    "outcome": "abstention",
+                    "reason": "Nothing here describes it.",
+                }
+            else:
+                output = {
+                    "api_version": "valkeyrie.io/model-output/1",
+                    "kind": "ModelOutput",
+                    "outcome": "answer",
+                    "claims": [
+                        {
+                            "claim_id": "c1",
+                            "text": "Tracked on GitHub.",
+                            "evidence_ids": [searches[0].evidence_id],
+                        }
+                    ],
+                }
+            return BedrockTextResponse(json.dumps(output, separators=(",", ":")), "end_turn")
+
+    services = TwoKinds()
+    # The router puts a release list in the plan (live evidence present) but no search.
+    services.router_reply = '{"lookups":[{"kind":"corpus_search"},{"kind":"releases"}]}'
+    result = run_runtime_event(
+        _event(request_id="req_retry-new", question="why does valkey need a replication backlog"),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] == "answer"
+    assert len(services.model_calls) == 2, "live evidence was present, yet the retry ran"
+    # And when the forced supplement adds nothing new, no retry: same ids as the first pass.
+    same = TwoKinds()
+    same.router_reply = (
+        '{"lookups":[{"kind":"corpus_search"},{"kind":"search","terms":["replication","backlog"],'
+        '"scope":"issue"},{"kind":"search","terms":["replication","backlog"],"scope":"pull-request"}]}'
+    )
+    same.output = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": "abstention",
+        "reason": "Nothing here describes it.",
+    }
+
+    def always_abstain(**kwargs: object) -> BedrockTextResponse:
+        same.model_calls.append(dict(kwargs))
+        return BedrockTextResponse(json.dumps(same.output, separators=(",", ":")), "end_turn")
+
+    same.converse = always_abstain  # type: ignore[method-assign]
+    result = run_runtime_event(
+        _event(request_id="req_retry-same", question="why does valkey need a replication backlog"),
+        same,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] == "abstention"
+    assert len(same.model_calls) == 1, "the forced supplement produced the same ids: no retry"

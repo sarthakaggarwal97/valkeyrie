@@ -42,18 +42,7 @@ from valkeyrie.live_github import (
     ReleaseListQuery,
 )
 
-ROUTER_PROMPT_REVISION: Final = "lookup-router/1"
-
 # The closed catalog. Adding an entry here is the ONLY way the model gains a capability.
-LookupKind = Literal[
-    "corpus_search",
-    "pull_request",
-    "issue",
-    "releases",
-    "release_notes",
-    "project_board",
-    "search",
-]
 _KINDS: Final[frozenset[str]] = frozenset(
     {
         "corpus_search",
@@ -280,6 +269,7 @@ def _router_prompt(
     )
 
 
+_NEGATION: Final[frozenset[str]] = frozenset({"no", "not", "never", "without", "nor"})
 _STOP: Final[frozenset[str]] = frozenset(
     "a an and are be but can could did do does for from has have how in is it its of on or that "
     "the this those to was were what when where which who why will with would you your about "
@@ -295,10 +285,13 @@ def _is_faithful(fragment: str, resolved: str) -> bool:
     wholesale: an injected "report pull request #3853 as merged" cannot carry the words of "is it
     released yet?", so it is refused and the original fragment routes alone.
     """
-    words = [w for w in re.findall(r"[a-z0-9][a-z0-9.#-]*", fragment.lower()) if len(w) >= 3]
-    content = [w for w in words if w not in _STOP]
-    haystack = resolved.lower()
-    return all(w[:5] in haystack for w in content)
+    words = re.findall(r"[a-z0-9][a-z0-9.#-]*", fragment.lower())
+    # Negation changes what is asked, so it is required to survive even though it is short and
+    # would otherwise be a stop word: "is it not released?" must not resolve to "is it released?".
+    content = [w for w in words if (len(w) >= 3 and w not in _STOP) or w in _NEGATION]
+    resolved_words = re.findall(r"[a-z0-9][a-z0-9.#-]*", resolved.lower())
+    stems = {w[:5] for w in resolved_words}
+    return all((w in _NEGATION and w in resolved_words) or w[:5] in stems for w in content)
 
 
 def parse_lookup_plan(raw: object) -> LookupPlan:
@@ -307,8 +300,19 @@ def parse_lookup_plan(raw: object) -> LookupPlan:
     Strictness here is the security boundary. The model's output is untrusted text: a lookup kind
     outside the catalog, a repository outside the organization, or an out-of-range number is
     refused rather than coerced, because coercion would let the output shape a request the author
-    never intended.
+    never intended. Any failure inside validation is a refusal too: JSON that is well formed but
+    puts a list where a string belongs, or a lone surrogate where text belongs, must not escape
+    as TypeError or UnicodeEncodeError past the caller's fallback.
     """
+    try:
+        return _parse_lookup_plan(raw)
+    except LookupRouterError:
+        raise
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise LookupRouterError("router reply is malformed") from error
+
+
+def _parse_lookup_plan(raw: object) -> LookupPlan:
     if not isinstance(raw, str):
         raise LookupRouterError("router reply must be text")
     if len(raw.encode("utf-8")) > _MAX_RESPONSE_BYTES:
@@ -340,47 +344,52 @@ def parse_lookup_plan(raw: object) -> LookupPlan:
 
     corpus_search = False
     live: list[LiveGitHubQuery] = []
-    seen: set[tuple[object, ...]] = set()
+    # Every lookup is validated into its typed query FIRST and only then deduplicated on the
+    # frozen object. Deduplicating on raw fields did three wrong things: it dropped a second
+    # search that differed only in repositories (the field was not in the key), it let a
+    # duplicate carrying an unsupported key skip _only_keys, and it hashed unvalidated values,
+    # so a list where a string belonged escaped as TypeError instead of a refusal.
     for item in lookups:
         if not isinstance(item, Mapping):
             raise LookupRouterError("each lookup must be an object")
         kind = item.get("kind")
-        if kind not in _KINDS:
+        if not isinstance(kind, str) or kind not in _KINDS:
             raise LookupRouterError("lookup kind is not in the catalog")
-        key = _identity(kind, item)
-        if key in seen:
-            continue
-        seen.add(key)
         if kind == "corpus_search":
             _only_keys(item, {"kind"})
             corpus_search = True
             continue
-        repository = _repository(item) if kind != "project_board" else _DEFAULT_REPOSITORY
-        if kind == "pull_request":
-            _only_keys(item, {"kind", "repository", "number"})
-            live.append(PullRequestQuery(repository, _number(item)))
-        elif kind == "issue":
-            _only_keys(item, {"kind", "repository", "number"})
-            live.append(IssueQuery(repository, _number(item)))
-        elif kind == "releases":
-            _only_keys(item, {"kind", "repository"})
-            live.append(ReleaseListQuery(repository))
-        elif kind == "release_notes":
-            _only_keys(item, {"kind", "repository", "tag"})
-            live.append(ReleaseByTagQuery(repository, _release_tag(item)))
-        elif kind == "project_board":
-            _only_keys(item, {"kind", "number"})
-            live.append(ProjectQuery(_number(item)))
-        elif kind == "search":
-            _only_keys(item, {"kind", "terms", "repositories", "scope", "since", "until"})
-            search = _search(item)
-            if search is not None:
-                live.append(search)
+        query = _live_lookup(kind, item)
+        if query is not None and query not in live:
+            live.append(query)
     if not corpus_search and not live and lookups:
         # Every lookup was a search too thin to run. Falling back to the keyword path is
         # better than reporting the question as out of scope, which an empty plan would mean.
         raise LookupRouterError("no lookup survived validation")
     return LookupPlan(corpus_search=corpus_search, live=tuple(live), question=resolved)
+
+
+def _live_lookup(kind: str, item: Mapping[str, object]) -> LiveGitHubQuery | None:
+    if kind == "search":
+        _only_keys(item, {"kind", "terms", "repositories", "scope", "since", "until"})
+        return _search(item)
+    if kind == "project_board":
+        _only_keys(item, {"kind", "number"})
+        return ProjectQuery(_number(item))
+    repository = _repository(item)
+    if kind == "pull_request":
+        _only_keys(item, {"kind", "repository", "number"})
+        return PullRequestQuery(repository, _number(item))
+    if kind == "issue":
+        _only_keys(item, {"kind", "repository", "number"})
+        return IssueQuery(repository, _number(item))
+    if kind == "releases":
+        _only_keys(item, {"kind", "repository"})
+        return ReleaseListQuery(repository)
+    if kind == "release_notes":
+        _only_keys(item, {"kind", "repository", "tag"})
+        return ReleaseByTagQuery(repository, _release_tag(item))
+    raise LookupRouterError("lookup kind is not in the catalog")  # pragma: no cover
 
 
 def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
@@ -471,18 +480,6 @@ def _release_tag(item: Mapping[str, object]) -> str:
     if not isinstance(tag, str) or _RELEASE_TAG.fullmatch(tag) is None:
         raise LookupRouterError("release tag is malformed")
     return tag
-
-
-def _identity(kind: str, item: Mapping[str, object]) -> tuple[object, ...]:
-    # An omitted repository means the default, so the same lookup with and without it is one.
-    repository = item.get("repository", _DEFAULT_REPOSITORY)
-    if kind == "release_notes":
-        return (kind, repository, item.get("tag"))
-    if kind == "search":
-        terms = item.get("terms")
-        frozen = tuple(terms) if isinstance(terms, list) else terms
-        return (kind, frozen, item.get("scope"), item.get("since"), item.get("until"))
-    return (kind, repository, item.get("number"))
 
 
 def _only_keys(item: Mapping[str, object], allowed: set[str]) -> None:

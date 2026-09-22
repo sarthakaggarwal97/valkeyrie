@@ -120,7 +120,7 @@ def test_identical_package_bytes_produce_identical_revision(tmp_path: Path) -> N
     second = _copy_package(tmp_path, "second")
 
     assert load_prompt_package(first) == load_prompt_package(second)
-    assert load_prompt_package(first).prompt_revision == load_prompt_package(first).prompt_revision
+    assert load_prompt_package(first).prompt_revision == load_prompt_package(second).prompt_revision
 
 
 @pytest.mark.parametrize("filename", TEMPLATE_FILES)

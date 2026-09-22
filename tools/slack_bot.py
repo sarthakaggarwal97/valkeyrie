@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import threading
 from datetime import UTC, datetime
 from typing import Any
 
@@ -64,6 +65,19 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
     if len(question.encode("utf-8")) > MAX_QUESTION_BYTES:
         say(text=f"That question is over the {MAX_QUESTION_BYTES}-byte limit.", thread_ts=thread)
         return
+
+    # Slack redelivers an event whose ack it did not see. The runtime already replays the same
+    # answer for the same event, so inference is not repeated; the REPLY was, and a thread got
+    # the same answer twice. Each event is answered once per process; a redelivery that arrives
+    # after a restart still replays the stored result, which is the right answer to send.
+    key = _event_key(event)
+    with _answered_lock:
+        if key in _answered:
+            log.info("duplicate delivery of %s ignored", key)
+            return
+        _answered[key] = True
+        while len(_answered) > MAX_ANSWERED_EVENTS:
+            _answered.pop(next(iter(_answered)))
 
     conversation = _thread_history(event, client)
     try:
@@ -113,6 +127,12 @@ def _ask(
     if "FunctionError" in response:
         raise RuntimeError(f"lambda reported an error: {body}")
     return body if isinstance(body, dict) else {}
+
+
+# Events answered by this process, oldest first. Bounded so a long-lived bot does not grow.
+_answered: dict[str, bool] = {}
+_answered_lock = threading.Lock()
+MAX_ANSWERED_EVENTS = 4096
 
 
 def _event_key(event: dict[str, Any]) -> str:
@@ -187,10 +207,12 @@ def _format(result: dict[str, Any]) -> str:
     message = result.get("message")
 
     if claims:
-        body = "\n".join(f"• {c['text']}" for c in claims if c.get("text"))
+        body = "\n".join(f"• {_plain(c['text'])}" for c in claims if c.get("text"))
         if citations:
+            # Citations are application-authored from validated GitHub URLs, so the link markup
+            # is built here; the label is still escaped since it carries a path.
             sources = "\n".join(
-                f"  <{c.split(': ', 1)[-1]}|{c.split(': ', 1)[0]}>" for c in citations
+                f"  <{c.split(': ', 1)[-1]}|{_plain(c.split(': ', 1)[0])}>" for c in citations
             )
             body += f"\n\n*Sources*\n{sources}"
         return body
@@ -199,13 +221,25 @@ def _format(result: dict[str, Any]) -> str:
     # back, a partial means evidence was reachable but incomplete, and an abstention is a
     # deliberate refusal. Collapsing all three into a refusal loses the actual reply.
     if outcome == "clarification":
-        return message or "What would you like to know about the Valkey project?"
+        return (
+            _plain(message) if message else "What would you like to know about the Valkey project?"
+        )
     if outcome == "partial":
-        detail = message or "Some evidence could not be retrieved."
+        detail = _plain(message) if message else "Some evidence could not be retrieved."
         return f"{detail}\nI won't guess at the rest. Try asking without the live-status wording."
     if message:
-        return message
+        return _plain(message)
     return f"I don't have grounded evidence for that ({outcome})."
+
+
+def _plain(text: str) -> str:
+    """Escape Slack's three control characters in model-authored text.
+
+    Claims and messages are grounded in GitHub content anyone can edit. In mrkdwn, `<!channel>`
+    pages the channel and `<@U…>` mentions a person; escaped, they are just the text they were.
+    The bot's own link markup is added after escaping, so it is never affected.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def main() -> None:

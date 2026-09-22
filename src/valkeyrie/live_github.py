@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Final, Protocol, TypeAlias, cast
@@ -190,7 +191,10 @@ MIN_SEARCH_TERMS: Final = 2
 MAX_SEARCH_TERMS: Final = 8
 MAX_RELEASE_LIST: Final = 20
 MAX_SEARCH_TERM_BYTES: Final = 64
-MAX_SEARCH_BODY_BYTES: Final = 16 * 1024
+# A topic search lists five items; at 16 KiB each the search alone could exceed the live share
+# and be dropped whole by the budget. 6 KiB keeps the design section of a long issue and lets a
+# five-item search fit beside a board or a release list.
+MAX_SEARCH_BODY_BYTES: Final = 6 * 1024
 # Per-release notes bound inside a release LIST; a single release keeps its full notes.
 MAX_RELEASE_LIST_BODY_BYTES: Final = 3 * 1024
 RELEASE_LIST_BODIES: Final = 3
@@ -594,6 +598,10 @@ def read_live_github(
 # How many recent releases a merged pull request is checked against. Every release board tracks
 # at most the current line and two supported ones, so eight recent tags cover them with room.
 MAX_RELEASE_MEMBERSHIP_CHECKS: Final = 8
+# Commits listed per tag in the one-second window around the merge. A window that holds this many
+# is inconclusive (the merge may be on the next page) and the tag is left unchecked; measured
+# windows hold one commit.
+MEMBERSHIP_COMMIT_PAGE: Final = 50
 # Repositories one supplementary search may span; a question naming more is asking something else.
 MAX_SEARCH_REPOSITORIES: Final = 4
 
@@ -647,26 +655,41 @@ def _with_release_membership(
         ]
     except (GitHubReadError, LiveGitHubError):
         return {**payload, "released_in": None, "release_membership_checked": []}
-    contained: list[str] = []
-    checked: list[str] = []
-    for tag in tags:
+
+    def probe(tag: str) -> tuple[str, bool] | None:
+        """(tag, contains) when the tag was checked conclusively, None when it was not.
+
+        Everything about one tag sits inside this boundary: a malformed listing for one tag must
+        leave that tag unchecked, not turn a valid pull request read into a failure. A listing
+        that fills its page is inconclusive: the merge commit may be on a page not read, so the
+        tag is NOT recorded as checked, since "checked and absent" is the claim an answer will
+        make from it.
+        """
         try:
             listing = _response_object(
                 fetch(
                     f"{_API_ROOT}/repos/{OWNER}/{repo}/commits?sha={quote(tag, safe='')}"
-                    f"&since={since}&until={until}&per_page=10",
+                    f"&since={since}&until={until}&per_page={MEMBERSHIP_COMMIT_PAGE}",
                     REQUEST_TIMEOUT_SECONDS,
                     MAX_RESPONSE_BYTES,
                 ),
                 source="REST",
             )
+            commits = _list(listing, "items")
         except (GitHubReadError, LiveGitHubError):
-            continue
-        checked.append(tag)
-        for commit in _list(listing, "items"):
-            if isinstance(commit, Mapping) and commit.get("sha") == merge_commit:
-                contained.append(tag)
-                break
+            return None
+        if len(commits) >= MEMBERSHIP_COMMIT_PAGE:
+            return None
+        return tag, any(
+            isinstance(commit, Mapping) and commit.get("sha") == merge_commit for commit in commits
+        )
+
+    # The probes are independent reads of 0.2 to 0.5 s each; eight in sequence measured three
+    # seconds, which was the whole cost of the feature.
+    with ThreadPoolExecutor(max_workers=min(len(tags), MAX_RELEASE_MEMBERSHIP_CHECKS) or 1) as pool:
+        results = list(pool.map(probe, tags))
+    checked = [tag for tag, _ in (r for r in results if r is not None)]
+    contained = [tag for tag, inside in (r for r in results if r is not None) if inside]
     return {**payload, "released_in": contained, "release_membership_checked": checked}
 
 
@@ -686,7 +709,7 @@ def normalize_project_response(value: object, *, number: int) -> dict[str, objec
     expected_url = f"{_WEB_ROOT}/orgs/{OWNER}/projects/{project_number}"
     project: Mapping[str, object] | None = None
     nodes: list[object] = []
-    total_count = 0
+    total_count: int | None = None
     for page in pages:
         root = _object(page, "Projects response")
         if "errors" in root:
@@ -704,7 +727,7 @@ def normalize_project_response(value: object, *, number: int) -> dict[str, objec
         project = current
         items_value = _object(current.get("items"), "project items")
         page_total = _positive_or_zero_integer(items_value, "totalCount")
-        if project is current and not nodes:
+        if total_count is None:
             total_count = page_total
         elif page_total != total_count:
             raise LiveGitHubError("GitHub Projects pages disagree on the item total")
@@ -717,6 +740,8 @@ def normalize_project_response(value: object, *, number: int) -> dict[str, objec
     if len(nodes) != total_count:
         raise LiveGitHubError("GitHub Projects result is incomplete")
     items = [_project_item(item) for item in nodes]
+    if len({item["id"] for item in items}) != len(items):
+        raise LiveGitHubError("GitHub Projects pages repeat an item")
     # The board's Status column is what "what is left" means to a release manager: Todo, Needs
     # Review and To be backported are remaining work; Done and Merged are not. Every status is
     # totalled, and only items in a remaining-work status are listed in full. A 268-item board
@@ -897,6 +922,7 @@ def _read_project(
     # boards hold 150 to 300 items, so two or three pages. The page count is bounded so a runaway
     # board cannot turn one question into an unbounded walk.
     pages: list[Mapping[str, object]] = []
+    seen_cursors: set[str] = set()
     after: str | None = None
     for _ in range(MAX_PROJECT_PAGES):
         variables: Mapping[str, object] = {
@@ -922,10 +948,18 @@ def _read_project(
             raise LiveGitHubError("GitHub Projects requires authenticated GraphQL access")
         value = _response_object(response, source="GraphQL")
         pages.append(value)
-        page_info = _project_page_info(value)
-        if not page_info[0]:
+        has_next, cursor = _project_page_info(value)
+        if not has_next:
             break
-        after = page_info[1]
+        # A cursor that does not advance would walk the same page until the cap and then, if
+        # the node count happened to equal the total, present a duplicated board as complete.
+        if cursor is None or cursor in seen_cursors:
+            raise LiveGitHubError("GitHub Projects paging did not advance")
+        seen_cursors.add(cursor)
+        after = cursor
+    else:
+        # Every page said another followed. The walk is bounded, so the board is not whole.
+        raise LiveGitHubError("GitHub Projects board exceeds the page bound")
     payload = normalize_project_response(pages, number=number)
     return create_live_observation(
         observed_at=_observed_at(observed_clock),
@@ -1077,17 +1111,16 @@ def _search_finding(
         if repositories
         else f"the {OWNER} organization"
     )
-    matching = (
-        " whose title or body contains " + " and ".join(f'"{term}"' for term in terms)
-        if terms
-        else ""
-    )
+    matching = " matching " + " and ".join(f'"{term}"' for term in terms) if terms else ""
     if total_count == 0:
         return (
             f"The search completed and found no {what} in {where}{matching}. This establishes "
             f"that no such {what} existed there at observation time."
         )
-    listed = f" The {shown} most recently updated are listed." if shown < total_count else ""
+    # The listing order is what the request asked for: a date window orders by recency, and a
+    # topic search takes GitHub's best match. The finding must not describe one as the other.
+    order = "most recently updated" if since else "best matching"
+    listed = f" The {shown} {order} are listed." if shown < total_count else ""
     return f"The search found {total_count} {what} in {where}{matching}.{listed}"
 
 
