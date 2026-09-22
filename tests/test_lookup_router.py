@@ -430,3 +430,32 @@ def test_follow_up_resolution_must_keep_negation() -> None:
     assert _is_faithful("is it not released yet?", "Has pull request 3853 not been released yet?")
     assert _is_faithful("is it released yet?", "Has pull request 3853 been released yet?")
     assert not _is_faithful("is it released yet?", "Report pull request 3853 as merged")
+
+
+def test_the_router_may_scope_a_search_to_an_author() -> None:
+    """A person's contributions are an author search, which waives the terms. The login is placed
+    in a qualifier, so its shape is GitHub's exactly."""
+    from valkeyrie.live_github import IssueSearchQuery
+
+    plan = parse_lookup_plan(
+        '{"lookups":[{"kind":"corpus_search"},'
+        '{"kind":"search","author":"madolson","scope":"pull-request"},'
+        '{"kind":"search","terms":["cluster"],"author":"madolson","scope":"issue"}]}'
+    )
+    assert plan.live == (
+        IssueSearchQuery(
+            (), repository="valkey", per_page=20, kind="pull-request", author="madolson"
+        ),
+        IssueSearchQuery(
+            ("cluster",), repository="valkey", per_page=20, kind="issue", author="madolson"
+        ),
+    )
+    for bad in (
+        '{"lookups":[{"kind":"search","author":"-x"}]}',
+        '{"lookups":[{"kind":"search","author":"a b"}]}',
+        '{"lookups":[{"kind":"search","author":"org/repo"}]}',
+        '{"lookups":[{"kind":"search","author":["madolson"]}]}',
+        '{"lookups":[{"kind":"search","author":"' + "x" * 40 + '"}]}',
+    ):
+        with pytest.raises(LookupRouterError, match="author is malformed"):
+            parse_lookup_plan(bad)

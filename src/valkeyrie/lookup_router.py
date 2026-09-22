@@ -71,6 +71,7 @@ _REPOSITORY: Final = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 # A release tag is one path segment: no slash, no dot-dot, bounded. It is placed in a URL path.
 _RELEASE_TAG: Final = re.compile(r"^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SINCE: Final = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_LOGIN: Final = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
 # A search term is one plain word: letters, digits, hyphens. No qualifier syntax can pass.
 _SEARCH_TERM: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{1,39}$")
 _MAX_NUMBER: Final = 10_000_000
@@ -126,7 +127,13 @@ ROUTER_SYSTEM: Final = (
     'and an issue search to those OPENED on or after it; an optional "until":"YYYY-MM-DD" closes '
     'the window on that day inclusive. With a window the terms may be empty, so "what merged '
     'this week" is a search with since and no terms, and "what happened in August" is since the '
-    "1st until the 31st. Compute the days from today's date, given with the question.\n"
+    "1st until the 31st. Compute the days from today's date, given with the question. An optional "
+    '"author":"login" restricts to items that GitHub user authored, and also waives the terms: '
+    "use it for what a named person has contributed or is working on, with the login the asker "
+    "gives (madolson) or the one the corpus gives for a full name; searching a login as a word "
+    "finds mentions, not authorship. A question about a person wants corpus_search too, for their "
+    'role. Add a window only for a period the asker actually states; "lately" or "recently" '
+    "is not a period, the newest-first ordering already answers it.\n"
     "\n"
     "Rules:\n"
     "- Choose every lookup that would help, up to six in total; a question about a feature that "
@@ -371,7 +378,7 @@ def _parse_lookup_plan(raw: object) -> LookupPlan:
 
 def _live_lookup(kind: str, item: Mapping[str, object]) -> LiveGitHubQuery | None:
     if kind == "search":
-        _only_keys(item, {"kind", "terms", "repositories", "scope", "since", "until"})
+        _only_keys(item, {"kind", "terms", "repositories", "scope", "since", "until", "author"})
         return _search(item)
     if kind == "project_board":
         _only_keys(item, {"kind", "number"})
@@ -409,10 +416,14 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
     until = _window_day(item.get("until"))
     if until is not None and (since is None or until < since):
         raise LookupRouterError("search window is malformed")
+    author = item.get("author")
+    if author is not None and (not isinstance(author, str) or _LOGIN.fullmatch(author) is None):
+        raise LookupRouterError("search author is malformed")
+    unscoped = since is None and author is None
     terms = item.get("terms", [])
     if not isinstance(terms, Sequence) or isinstance(terms, str):
         raise LookupRouterError("search terms must be an array")
-    if not (0 if since else 1) <= len(terms) <= MAX_SEARCH_TERMS:
+    if not (1 if unscoped else 0) <= len(terms) <= MAX_SEARCH_TERMS:
         raise LookupRouterError("search terms count is out of bounds")
     normalized: list[str] = []
     for term in terms:
@@ -426,7 +437,7 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
                 normalized.append(folded)
     if len(normalized) > MAX_SEARCH_TERMS:
         raise LookupRouterError("search terms count is out of bounds")
-    if since is None and len(normalized) < MIN_SEARCH_TERMS:
+    if unscoped and len(normalized) < MIN_SEARCH_TERMS:
         return None
     repositories_value = item.get("repositories", [_DEFAULT_REPOSITORY])
     if not isinstance(repositories_value, Sequence) or isinstance(repositories_value, str):
@@ -449,10 +460,11 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
         repository=repositories[0],
         repositories=tuple(repositories[1:]),
         # A window lists many short items (a period summary); a topic search a few whole ones.
-        per_page=WINDOW_PER_PAGE if since else SUPPLEMENT_PER_PAGE,
+        per_page=WINDOW_PER_PAGE if (since or author) else SUPPLEMENT_PER_PAGE,
         kind=scope,
         since=since,
         until=until,
+        author=author,
     )
 
 

@@ -46,6 +46,9 @@ class IssueSearchQuery:
     since: str | None = None
     # The window's last day, inclusive; None means through today. "In August" is since and until.
     until: str | None = None
+    # A GitHub login: only items this user authored. "What has madolson contributed" is an author
+    # search with no terms; searching the login as a word finds mentions, not authorship.
+    author: str | None = None
     # GitHub requires an explicit is:issue or is:pull-request on authenticated
     # search/issues requests and returns 422 without one. Anonymous requests are not yet
     # enforced, which is why this was invisible until the runtime started authenticating.
@@ -203,6 +206,8 @@ MAX_RELEASE_NOTES_BYTES: Final = 24 * 1024
 # Body bound per item in a date-window search: many titles, short bodies.
 MAX_WINDOW_BODY_BYTES: Final = 600
 _SEARCH_SINCE: Final = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# GitHub's login rules: 1 to 39 alphanumerics or single hyphens, not at either end.
+_GITHUB_LOGIN: Final = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
 MAX_SEARCH_PER_PAGE: Final = 20
 # Supplementary searches carry whole issue bodies, so they take a smaller page than
 # a routed search: twenty bodies exceed MAX_RESPONSE_BYTES.
@@ -823,11 +828,12 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
     if isinstance(query, IssueSearchQuery):
         since = _search_since(query.since)
         until = _search_since(query.until)
+        author = _search_author(query.author)
         if until is not None and since is None:
             raise LiveGitHubError("search window end requires a start")
         if until is not None and since is not None and until < since:
             raise LiveGitHubError("search window end precedes its start")
-        terms = _search_terms(query.terms, minimum=0 if since else MIN_SEARCH_TERMS)
+        terms = _search_terms(query.terms, minimum=0 if (since or author) else MIN_SEARCH_TERMS)
         search_repository = _optional_repository(query.repository)
         per_page = _search_per_page(query.per_page)
         scope: tuple[str, ...] = tuple(
@@ -850,12 +856,16 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
             raise LiveGitHubError("issue search kind must be issue or pull-request")
         window: list[str] = []
         parameters: dict[str, str] = {}
+        if author is not None:
+            window.append(f"author:{author}")
+            # Authorship alone has nothing to rank by; newest first is what "their work" wants.
+            parameters = {"sort": "updated", "order": "desc"}
         if since is not None:
             # A merged window needs is:merged, or unmerged pull requests with a merged date of
             # nothing would be excluded silently and the count would mislead. Newest first: a
             # period summary wants the recent end, and best match has nothing to match on.
             span = f"{since}..{until}" if until else f">={since}"
-            window = (
+            window.extend(
                 ["is:merged", f"merged:{span}"]
                 if query.kind == "pull-request"
                 else [f"created:{span}"]
@@ -875,7 +885,14 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
             url,
             "issue",
             lambda value: _issue_search(
-                value, terms, scope or None, per_page, query.kind, since=since, until=until
+                value,
+                terms,
+                scope or None,
+                per_page,
+                query.kind,
+                since=since,
+                until=until,
+                author=author,
             ),
         )
     if isinstance(query, LatestReleaseQuery):
@@ -1047,6 +1064,7 @@ def _issue_search(
     *,
     since: str | None = None,
     until: str | None = None,
+    author: str | None = None,
 ) -> dict[str, object]:
     incomplete = _boolean(value, "incomplete_results")
     items = _list(value, "items")
@@ -1061,7 +1079,11 @@ def _issue_search(
     if len(items) > per_page:
         raise LiveGitHubError("GitHub issue search items exceed the requested page bound")
     normalized = [
-        _search_item(_object(item, "search item"), repositories, compact=since is not None)
+        _search_item(
+            _object(item, "search item"),
+            repositories,
+            compact=since is not None or author is not None,
+        )
         for item in items
     ]
     identities = [(item["repository"], item["number"]) for item in normalized]
@@ -1074,9 +1096,10 @@ def _issue_search(
         "repository": repositories[0] if repositories and len(repositories) == 1 else None,
         "repositories": list(repositories) if repositories else None,
         "terms": list(terms),
-        "sort": "updated" if since else SEARCH_SORT,
+        "sort": "updated" if (since or author) else SEARCH_SORT,
         "since": since,
         "until": until,
+        "author": author,
         "per_page": per_page,
         "total_count": total_count,
         "items": normalized,
@@ -1085,7 +1108,7 @@ def _issue_search(
         # library has nothing on it was the answer, and the model abstained for want of it two
         # times in five. Every word here is derived from fields above; nothing is added.
         "finding": _search_finding(
-            kind, terms, repositories, total_count, since, len(normalized), until
+            kind, terms, repositories, total_count, since, len(normalized), until, author
         ),
     }
 
@@ -1098,6 +1121,7 @@ def _search_finding(
     since: str | None = None,
     shown: int = 0,
     until: str | None = None,
+    author: str | None = None,
 ) -> str:
     span = f"from {since} through {until}" if until else f"on or after {since}"
     if since is None:
@@ -1106,6 +1130,8 @@ def _search_finding(
         what = f"pull requests merged {span}"
     else:
         what = f"issues opened {span}"
+    if author is not None:
+        what = f"{what} authored by {author}"
     where = (
         " or ".join(f"{OWNER}/{r}" for r in repositories)
         if repositories
@@ -1119,7 +1145,7 @@ def _search_finding(
         )
     # The listing order is what the request asked for: a date window orders by recency, and a
     # topic search takes GitHub's best match. The finding must not describe one as the other.
-    order = "most recently updated" if since else "best matching"
+    order = "most recently updated" if (since or author) else "best matching"
     listed = f" The {shown} {order} are listed." if shown < total_count else ""
     return f"The search found {total_count} {what} in {where}{matching}.{listed}"
 
@@ -1525,6 +1551,15 @@ def _search_since(value: object) -> str | None:
         datetime.strptime(value, "%Y-%m-%d")
     except ValueError as error:
         raise LiveGitHubError("search window must be a real calendar day") from error
+    return value
+
+
+def _search_author(value: object) -> str | None:
+    """A GitHub login, or None. Placed in a search qualifier verbatim, so its shape is exact."""
+    if value is None:
+        return None
+    if type(value) is not str or _GITHUB_LOGIN.fullmatch(value) is None:
+        raise LiveGitHubError("search author must be a GitHub login")
     return value
 
 

@@ -374,6 +374,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
     payload = _decoded(observation)
     assert payload == {
         "api_version": "valkeyrie.io/live-github/1",
+        "author": None,
         "finding": (
             'The search found 2 issues in valkey-io/valkey matching "release" and "status".'
         ),
@@ -1675,3 +1676,45 @@ def test_release_by_tag_binds_the_endpoint_the_tag_and_the_notes_bound() -> None
     for bad in ("../latest", "9.1.0/notes", "-leading", "a" * 300):
         with pytest.raises(LiveGitHubError, match="malformed"):
             read_live_github(ReleaseByTagQuery("valkey", bad), fetch=fetch)
+
+
+def test_an_author_search_carries_the_login_with_or_without_a_window() -> None:
+    """ "What has madolson contributed" is an author search with no terms. The login must survive
+    beside a window: the first version reassigned the qualifier list when a window was set and
+    silently searched everyone's pull requests, reporting 137 for an author with 0."""
+    seen: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        seen.append(url)
+        item = _search_item(number=4712, pull_request=True)
+        return _response({"total_count": 161, "incomplete_results": False, "items": [item]})
+
+    payload = json.loads(
+        read_live_github(
+            IssueSearchQuery(
+                (), repository="valkey", per_page=20, kind="pull-request", author="madolson"
+            ),
+            fetch=fetch,
+        ).canonical_payload
+    )
+    assert "q=repo%3Avalkey-io%2Fvalkey+is%3Apull-request+author%3Amadolson&sort=updated" in seen[0]
+    assert payload["author"] == "madolson" and payload["terms"] == []
+    assert payload["finding"].startswith("The search found 161 pull requests authored by madolson")
+
+    seen.clear()
+    read_live_github(
+        IssueSearchQuery(
+            (), repository="valkey", kind="pull-request", author="zuiderkwast", since="2026-08-22"
+        ),
+        fetch=fetch,
+    )
+    assert "author%3Azuiderkwast+is%3Amerged+merged%3A%3E%3D2026-08-22" in seen[0]
+
+    for bad in ("-lead", "trailing-", "a--b", "x" * 40, "user name", "org/repo"):
+        with pytest.raises(LiveGitHubError, match="GitHub login"):
+            read_live_github(
+                IssueSearchQuery((), repository="valkey", kind="issue", author=bad), fetch=fetch
+            )
+    # No author and no window: the term minimum still holds.
+    with pytest.raises(LiveGitHubError, match="requires from 2"):
+        read_live_github(IssueSearchQuery((), repository="valkey", kind="issue"), fetch=fetch)
