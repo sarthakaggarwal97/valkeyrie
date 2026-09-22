@@ -173,7 +173,12 @@ _FEATURE_ALIASES: Final = (
         ("CONTRIBUTING", "Developer Certificate of Origin", "DCO", "pull request"),
     ),
     (
-        re.compile(r"\b(?:event|events|conference|meetup)\b", re.IGNORECASE),
+        re.compile(
+            # Not the event loop, the events API or a keyspace event: those are core internals.
+            r"\b(?:event|events)\b(?!\s*(?:loop|handler|handlers|api|notification|notifications))"
+            r"(?![- ]driven)|\b(?:conference|meetup)\b",
+            re.IGNORECASE,
+        ),
         ("events calendar",),
     ),
     (
@@ -228,7 +233,12 @@ _CATEGORY_SCOPES: Final = (
         ("valkey", "community", "valkey-io.github.io"),
     ),
     (
-        re.compile(r"\b(?:event|events|conference|meetup)\b", re.IGNORECASE),
+        re.compile(
+            # Not the event loop, the events API or a keyspace event: those are core internals.
+            r"\b(?:event|events)\b(?!\s*(?:loop|handler|handlers|api|notification|notifications))"
+            r"(?![- ]driven)|\b(?:conference|meetup)\b",
+            re.IGNORECASE,
+        ),
         ("valkey-io.github.io", "community"),
     ),
     (
@@ -251,6 +261,15 @@ _CATEGORY_SCOPES: Final = (
         ("valkey", "valkey-io.github.io"),
     ),
 )
+# Core server commands whose first word also names an ecosystem: MODULE LOAD/LIST/UNLOAD and the
+# CLIENT subcommands are implemented in the server, not in a module or a client library.
+_CORE_COMMAND: Final = re.compile(
+    r"\bMODULE\s+(?:LOAD|LOADEX|UNLOAD|LIST|HELP)\b"
+    r"|\bCLIENT\s+(?:LIST|INFO|ID|KILL|NO-EVICT|NO-TOUCH|PAUSE|UNPAUSE|REPLY|SETNAME|GETNAME"
+    r"|SETINFO|UNBLOCK|TRACKING|TRACKINGINFO|CACHING|HELP)\b"
+)
+
+
 _MODULE_ALIASES: Final = MappingProxyType(
     {
         "valkey-bloom": ("valkey bloom", "bloom module", "bloom filter module"),
@@ -323,6 +342,11 @@ def _requested_repositories(query: str) -> tuple[str, ...]:
         if pattern.search(query):
             return repositories
 
+    # MODULE LOAD and CLIENT LIST are core server commands. Matching the bare words "module" and
+    # "client" sent them to the eight module repositories and the sixteen client libraries, where
+    # the answer is not.
+    if _CORE_COMMAND.search(query) is not None:
+        return ("valkey", "valkey-doc")
     if _contains_term(query, "glide"):
         specific = _repositories_for_aliases(query, _CLIENT_ALIASES, _GLIDE_REPOSITORIES)
         return specific or _GLIDE_REPOSITORIES

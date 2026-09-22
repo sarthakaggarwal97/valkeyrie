@@ -142,14 +142,21 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     (
         "a link",
         re.compile(
-            r"\b(?:https?|ftp)://|\bwww\.|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}/",
+            # "Edit valkey.conf/foo" was read as a domain. Schemes, www., and the hosts an answer
+            # might actually link to; a file path with an extension is not a link.
+            r"\b(?:https?|ftp)://|\bwww\.|"
+            r"\b(?:github\.com|api\.github\.com|valkey\.io|[a-z0-9-]+\.github\.io)/",
             re.IGNORECASE,
         ),
     ),
     (
         "a citation label",
         re.compile(
-            r"\[[^\]\n]*\]\s*\(|\[[0-9]+\]|\b[a-z0-9.][a-z0-9._-]*/[^\s@]+@[0-9a-f]{7,40}\b"
+            # "[MATCH pattern] (with optional COUNT)" is command syntax and "c->argv[1]" is C
+            # indexing; both were refused as citations. A Markdown link has no space before its
+            # target, and a citation number stands alone rather than following an identifier.
+            r"\[[^\]\n]*\]\(|(?<![A-Za-z0-9_\])])\[[0-9]+\]"
+            r"|\b[a-z0-9.][a-z0-9._-]*/[^\s@]+@[0-9a-f]{7,40}\b"
         ),
     ),
     (
@@ -160,27 +167,58 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             # single source of truth for command metadata" is a fact about Valkey, taken from
             # Valkey's own README, and refusing it turned "how do I add a new command" into an
             # error every time, which is the most common onboarding question there is.
-            r"\b(?:canonical|authoritative|official)\s+"
-            r"(?:source|reference|documentation|authority)\b"
-            r"|\b(?:is|are|was|were|remains?)\s+(?:the\s+)?"
-            r"(?:canonical|authoritative|official)\b"
-            r"|\baccording\s+to\b",
+            # The subject must be THIS answer's evidence. "valkey-glide is the official client
+            # library" and "the command JSON is the authoritative reference for arity" are facts
+            # about Valkey, and "according to valkey.conf, the default is no" is ordinary
+            # attribution: all three were refused, and the user lost the answer entirely.
+            r"\b(?:this|the|my|our)\s+(?:supplied\s+|retrieved\s+|provided\s+|cited\s+)?"
+            r"(?:evidence|context|sources?|documents?|records?)\b[^.;:!?]*"
+            r"\b(?:canonical|authoritative|official|source\s+of\s+truth)\b"
+            r"|\b(?:canonical|authoritative|official)\b[^.;:!?]*"
+            r"\b(?:supplied|retrieved|provided|cited)\s+(?:evidence|context|sources?)\b"
+            # "According to X" stays prohibited in every form. It is attribution prose rather than
+            # a fact, and the same sentence reads better without it: "valkey.conf sets the default
+            # to no" says more than "according to valkey.conf, the default is no".
+            r"|\baccording\s+to\b"
+            # The classic bare forms, where the authority IS the subject and no artifact is named.
+            # "the authoritative reference FOR command arity" names one and is allowed.
+            # Refused when the authority phrase ends the clause or attests something ("the
+            # canonical source confirms this"), allowed when it goes on to say what the artifact
+            # is ("the official documentation repository for Valkey commands").
+            r"|\b(?:this|the)\s+(?:canonical|authoritative|official)\s+"
+            r"(?:source|reference|documentation|authority)"
+            r"\s*(?:[.,;:!?]|$"
+            r"|\b(?:confirms?|states?|says?|shows?|indicates?|proves?)\b"
+            # "The canonical source IS authoritative" asserts the authority outright.
+            r"|\s*\b(?:is|are|was|were|remains?)\s+(?:the\s+)?"
+            r"(?:canonical|authoritative|official)\b)",
             re.IGNORECASE,
         ),
     ),
     (
         _READINESS_LABEL,
         re.compile(
-            r"\b(?:release|version|build|candidate)\s+is\s+(?:ready|approved)\b"
-            r"|\bready\s+(?:for|to)\s+(?:release|ship|tag)\b"
+            # A verdict needs a RELEASE subject. "The build is ready to accept connections",
+            # "the lazy-free worker is ready to release memory", "valkey-go is a Go client" and
+            # "Debian does not ship it by default" are not release decisions, and every one of
+            # them was refused.
+            r"\b(?:release|version|candidate)\s+is\s+(?:ready|approved)\b"
+            r"|\b(?:is|are)\s+ready\s+(?:for\s+release\b|to\s+(?:release|ship|tag)\b(?!\s+\w))"
             r"|\bapprove(?:s|d)?\s+the\s+release\b"
             r"|\bgo\s*/?\s*no[- ]?go\b"
             # A bare go verdict, which the go/no-go alternative never matched: "this is a go for
             # the release" and "given the go-ahead" are decisions in the words a release owner uses.
-            r"|\bis\s+a\s+go\b|\bgo[- ]ahead\b"
-            r"|\bship\s+it\b"
-            r"|\b(?:can|could|may)\s+(?:now\s+)?ship\b"
-            r"|\bsafe\s+to\s+(?:release|ship|tag|deploy|merge)\b",
+            # Case-sensitive "a go": the Go language is capitalised, and "valkey-go is a Go
+            # client library" was refused as a release verdict.
+            r"|\bis\s+a\s+go\b(?![- ]client|[- ]library)"
+            r"|\bgo[- ]ahead\b"
+            # "Ship it" is the verdict; "does not ship it by default" is a packaging fact.
+            r"|(?<!not\s)\bship\s+it\b(?!\s+by\s+default)"
+            r"|\b(?:can|could|may)\s+(?:now\s+)?ship\b(?!\s+(?:its|their|the)\b)"
+            # "safe to merge" about an iterator or a config is not a release decision, so the
+            # sentence must be about a release for this to be one.
+            r"|\bsafe\s+to\s+(?:release|ship|tag|deploy)\b"
+            r"|\bsafe\s+to\s+merge\b(?=[^.;:!?]*\b(?:release|candidate|version\s+[0-9])\b)",
             re.IGNORECASE,
         ),
     ),

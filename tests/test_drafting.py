@@ -782,10 +782,17 @@ def test_a_project_artifact_may_be_called_the_source_of_truth() -> None:
         "commands.def is generated from the JSON files and is the source of truth for dispatch.",
     ):
         _screened_model_text(allowed, "claim text", 4096)
+    # Naming what a repository IS stays allowed: the screen exists to stop Valkeyrie claiming
+    # that its own evidence is authoritative, not to stop it describing the project.
+    for allowed_role in (
+        "valkey-doc is the official documentation repository for Valkey commands.",
+        "The command JSON is the authoritative reference for command arity.",
+    ):
+        _screened_model_text(allowed_role, "claim text", 4096)
     for refused in (
         "According to the canonical documentation, use HSET.",
-        "This is the authoritative reference for the command.",
-        "valkey-doc is the official documentation.",
+        "The canonical source confirms this.",
+        "This evidence is the authoritative source for the answer.",
     ):
         with pytest.raises(DraftingError, match="source-authority declaration"):
             _screened_model_text(refused, "claim text", 4096)
