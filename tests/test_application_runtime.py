@@ -2141,3 +2141,133 @@ def test_a_failed_answer_is_replayable_on_redelivery(manifest: dict[str, object]
     assert second["outcome"] == "error"
     assert second["message"] == first["message"]
     assert len(services.model_calls) == 1
+
+
+class _AbstainsUntilGitHub(FakeServices):
+    """Abstains on corpus-only evidence and answers once a live record is in the package."""
+
+    def converse(self, **kwargs: object) -> BedrockTextResponse:
+        evidence = cast(tuple[RuntimeEvidence, ...], kwargs["evidence"])
+        live = [e for e in evidence if isinstance(e, LiveRuntimeEvidence)]
+        self.model_calls.append(dict(kwargs))
+        output: dict[str, object]
+        if not live:
+            output = {
+                "api_version": "valkeyrie.io/model-output/1",
+                "kind": "ModelOutput",
+                "outcome": "abstention",
+                "reason": "The indexed documents do not describe this.",
+            }
+        else:
+            output = {
+                "api_version": "valkeyrie.io/model-output/1",
+                "kind": "ModelOutput",
+                "outcome": "answer",
+                "claims": [
+                    {
+                        "claim_id": "c1",
+                        "text": "Pull request work on this is tracked on GitHub.",
+                        "evidence_ids": [live[0].evidence_id],
+                    }
+                ],
+            }
+        return BedrockTextResponse(json.dumps(output, separators=(",", ":")), "end_turn")
+
+
+def test_a_corpus_abstention_is_retried_once_with_the_github_supplement_forced_on(
+    manifest: dict[str, object],
+) -> None:
+    """A question the intent gate did not route to GitHub, that the corpus cannot answer, gets one
+    more attempt with the supplement forced on. Two model calls, one terminal write, one result:
+    the answer is grounded in the live record the retry added."""
+    question = "why does valkey need a replication backlog"  # no supplement intent term
+    services = _AbstainsUntilGitHub()
+    services.live_observation = _live_observation(
+        kind="issue_search",
+        object_type="issue",
+        source_url="https://api.github.com/search/issues?q=repo%3Avalkey-io%2Fvalkey+tiered",
+        url=None,
+    )
+    result = run_runtime_event(
+        _event(request_id="req_retry", question=question), services, root=ROOT, manifest=manifest
+    )
+    assert result["outcome"] == "answer", result
+    assert len(services.model_calls) == 2, "exactly one retry"
+    assert not any(
+        isinstance(e, LiveRuntimeEvidence)
+        for e in cast(tuple[RuntimeEvidence, ...], services.model_calls[0]["evidence"])
+    )
+    assert any(
+        isinstance(e, LiveRuntimeEvidence)
+        for e in cast(tuple[RuntimeEvidence, ...], services.model_calls[1]["evidence"])
+    )
+    kinds = [cast(IssueSearchQuery, call).kind for call in services.live_calls]
+    assert kinds == ["pull-request", "issue"], "the forced supplement asks for both kinds"
+    record = services.requests["req_retry"]
+    # Claim then complete: two revision steps, one terminal write, same as every other answer.
+    assert record["outcome"] == "answer" and record["revision"] == 2, "one terminal write"
+    assert cast(Mapping[str, object], record["result"])["outcome"] == "answer"
+
+    # A retry that still abstains keeps the abstention, with its guidance; it never errors.
+    still = FakeServices()
+    still.retrieval = ()
+    still.live_observation = services.live_observation
+    still.output = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": "abstention",
+        "reason": "Nothing here describes it.",
+    }
+    result = run_runtime_event(
+        _event(request_id="req_retry-still", question=question), still, root=ROOT, manifest=manifest
+    )
+    assert result["outcome"] == "abstention"
+    # The corpus was empty, so the forced supplement went into the FIRST package rather than
+    # being owed a second pass: one model call, with live evidence in it.
+    assert len(still.model_calls) == 1
+    assert any(
+        isinstance(e, LiveRuntimeEvidence)
+        for e in cast(tuple[RuntimeEvidence, ...], still.model_calls[0]["evidence"])
+    )
+    assert "indexed Valkey repositories" in cast(str, result["message"])
+
+    # GitHub unavailable during the retry: the abstention stands, nothing leaks.
+    down = FakeServices()
+    down.retrieval = ()
+    down.output = still.output
+    down.live_error = RuntimeError("GitHub returned HTTP 403")
+    result = run_runtime_event(
+        _event(request_id="req_retry-down", question=question), down, root=ROOT, manifest=manifest
+    )
+    assert result["outcome"] == "abstention"
+    assert down.model_calls == [], "nothing to ground an answer in, so the model is not asked"
+    assert "403" not in json.dumps(result)
+
+
+def test_an_abstention_with_the_supplement_already_present_is_not_retried(
+    manifest: dict[str, object],
+) -> None:
+    """If GitHub already contributed and the model still abstained, an identical second package
+    would not change its mind; the retry only runs when it can add something."""
+    services = FakeServices()
+    services.retrieval = ()
+    services.live_observation = _live_observation(
+        kind="issue_search",
+        object_type="issue",
+        source_url="https://api.github.com/search/issues?q=repo%3Avalkey-io%2Fvalkey+replication",
+        url=None,
+    )
+    services.output = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": "abstention",
+        "reason": "Nothing here describes it.",
+    }
+    result = run_runtime_event(
+        _event(request_id="req_no-retry", question="How does Valkey replication compression work?"),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] == "abstention"
+    assert len(services.model_calls) == 1

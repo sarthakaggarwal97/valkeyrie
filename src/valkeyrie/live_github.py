@@ -35,6 +35,9 @@ class IssueSearchQuery:
     terms: tuple[str, ...]
     repository: str | None = None
     per_page: int = 20
+    # Further repositories to search alongside ``repository``. A cross-repository question
+    # ("does valkey-glide support X from valkey 9.2?") is searched in every repository it names.
+    repositories: tuple[str, ...] = ()
     # GitHub requires an explicit is:issue or is:pull-request on authenticated
     # search/issues requests and returns 422 without one. Anonymous requests are not yet
     # enforced, which is why this was invisible until the runtime started authenticating.
@@ -386,7 +389,7 @@ _SUPPLEMENT_INTENT_TERMS: Final = frozenset(
 
 
 def infer_supplementary_search(
-    question: str, *, kind: str = "pull-request"
+    question: str, *, kind: str = "pull-request", force: bool = False
 ) -> IssueSearchQuery | None:
     """Infer a repository-scoped issue search to supplement corpus evidence.
 
@@ -414,14 +417,16 @@ def infer_supplementary_search(
         raise LiveGitHubError("live query question is outside its byte bound")
     if _UNSAFE_INFERRED_QUERY.search(question) is not None:
         raise LiveGitHubError("live query question contains an unsupported qualifier or URL")
-    repository = _inferred_repository(question)
-    terms = _inferred_search_terms(question, repository)
+    repositories = _inferred_repositories(question)
+    terms = _inferred_search_terms(question, repositories)
     # Two terms is the floor for a search worth making: one term matches too much of the
     # repository to be evidence, and zero means the question carried no subject at all.
     if len(terms) < 2:
         return None
+    # ``force`` bypasses the intent gate. It is used for one purpose: a second attempt after the
+    # corpus abstained, where the question has already proven the gate wrong by needing more.
     lowered = {word.strip("?.,:;!()").lower() for word in question.split()}
-    if not lowered & (_SUPPLEMENT_INTENT_TERMS | _LIVE_DISCOVERY_TERMS):
+    if not force and not lowered & (_SUPPLEMENT_INTENT_TERMS | _LIVE_DISCOVERY_TERMS):
         return None
     # Five items, not the default twenty. A search returns whole issue bodies, and twenty of
     # them exceeds MAX_RESPONSE_BYTES, which made every supplemented answer fail with
@@ -429,7 +434,8 @@ def infer_supplementary_search(
     # feature does and whether it has landed, which is all a supplement is for.
     return IssueSearchQuery(
         terms=terms[:MAX_SEARCH_TERMS],
-        repository=repository,
+        repository=repositories[0],
+        repositories=repositories[1:],
         per_page=SUPPLEMENT_PER_PAGE,
         kind=kind,
     )
@@ -444,7 +450,13 @@ def _single_inferred_id(question: str, pattern: re.Pattern[str], label: str) -> 
     return _entity_id(matches.pop(), f"{label} number")
 
 
-def _inferred_repository(question: str) -> str:
+def _inferred_repositories(question: str) -> tuple[str, ...]:
+    """Every reviewed repository the question names, or ("valkey",) when it names none.
+
+    Naming two used to raise, which killed the supplement on exactly the cross-repository
+    questions ("does valkey-glide support X from valkey 9.2?"). A search can carry several repo:
+    qualifiers, so the question is searched in all of them.
+    """
     lowered = question.casefold()
     matches = {
         repository
@@ -456,21 +468,40 @@ def _inferred_repository(question: str) -> str:
         )
         is not None
     }
+    # "Valkey" on its own usually means the project, not the core repository ("upcoming Valkey
+    # events" is about the website). The core repository counts when named explicitly as
+    # valkey-io/valkey, or when the bare word stands beside ANOTHER repository's name, where the
+    # contrast is what makes it a repository ("does valkey-glide support X from valkey 9.2?").
     if re.search(rf"(?<![a-z0-9._-]){re.escape(OWNER)}/valkey(?![a-z0-9._-])", lowered):
         matches.add("valkey")
-    if len(matches) > 1:
+    elif matches:
+        stripped = re.sub(r"valkey-[a-z0-9.-]+", " ", lowered)
+        if re.search(r"(?<![a-z0-9._/-])valkey(?![a-z0-9._-])", stripped):
+            matches.add("valkey")
+    if not matches:
+        # No repository named: the topic decides. Events live on the website repository and
+        # community matters in the community repository, as before.
+        if _EVENT_DISCOVERY.search(question) is not None:
+            return ("valkey-io.github.io",)
+        if _COMMUNITY_MEETING_DISCOVERY.search(question) is not None:
+            return ("community",)
+        return ("valkey",)
+    if len(matches) > MAX_SEARCH_REPOSITORIES:
+        raise LiveGitHubError("live query question names too many repositories")
+    return tuple(sorted(matches))
+
+
+def _inferred_repository(question: str) -> str:
+    """The single repository a question names, for lookups that take exactly one."""
+    repositories = _inferred_repositories(question)
+    if len(repositories) > 1:
         raise LiveGitHubError("live query question names multiple reviewed repositories")
-    if matches:
-        return matches.pop()
-    if _EVENT_DISCOVERY.search(question) is not None:
-        return "valkey-io.github.io"
-    if _COMMUNITY_MEETING_DISCOVERY.search(question) is not None:
-        return "community"
-    return "valkey"
+    return repositories[0]
 
 
-def _inferred_search_terms(question: str, repository: str) -> tuple[str, ...]:
-    ignored = {"valkey", OWNER, repository}
+def _inferred_search_terms(question: str, repository: str | tuple[str, ...]) -> tuple[str, ...]:
+    named = (repository,) if isinstance(repository, str) else repository
+    ignored = {"valkey", OWNER, *named}
     terms: list[str] = []
     for token in _QUESTION_TOKEN.findall(question):
         normalized = token.casefold()
@@ -530,6 +561,8 @@ def read_live_github(
 # How many recent releases a merged pull request is checked against. Every release board tracks
 # at most the current line and two supported ones, so eight recent tags cover them with room.
 MAX_RELEASE_MEMBERSHIP_CHECKS: Final = 8
+# Repositories one supplementary search may span; a question naming more is asking something else.
+MAX_SEARCH_REPOSITORIES: Final = 4
 
 
 def _with_release_membership(
@@ -733,14 +766,22 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         terms = _search_terms(query.terms)
         search_repository = _optional_repository(query.repository)
         per_page = _search_per_page(query.per_page)
-        # A repo: qualifier already scopes to one repository. Sending org: alongside it
-        # makes GitHub union the two scopes and return items from sibling repositories,
-        # which _search_item then correctly rejects as conflicting with the query. That
-        # turned every repository-scoped search into a live-unavailable failure.
-        if search_repository is not None:
-            qualifiers = [f"repo:{OWNER}/{search_repository}"]
-        else:
-            qualifiers = [f"org:{OWNER}"]
+        scope: tuple[str, ...] = tuple(
+            dict.fromkeys(
+                r
+                for r in ((search_repository,) if search_repository else ())
+                + tuple(query.repositories)
+                if r is not None
+            )
+        )
+        if len(scope) > MAX_SEARCH_REPOSITORIES:
+            raise LiveGitHubError("issue search names too many repositories")
+        for r in scope:
+            _repository(r)
+        # A repo: qualifier scopes to one repository, and several of them are OR-ed by GitHub.
+        # org: must NOT be sent alongside: it unions the whole organization back in, and
+        # _search_item then correctly rejects the sibling-repository items as out of scope.
+        qualifiers = [f"repo:{OWNER}/{r}" for r in scope] or [f"org:{OWNER}"]
         if query.kind not in {"issue", "pull-request"}:
             raise LiveGitHubError("issue search kind must be issue or pull-request")
         encoded_query = urlencode(
@@ -755,7 +796,7 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         return (
             url,
             "issue",
-            lambda value: _issue_search(value, terms, search_repository, per_page),
+            lambda value: _issue_search(value, terms, scope or None, per_page),
         )
     if isinstance(query, LatestReleaseQuery):
         repository = _repository(query.repository)
@@ -904,7 +945,7 @@ def _issue(value: Mapping[str, object], repository: str, number: int) -> dict[st
 def _issue_search(
     value: Mapping[str, object],
     terms: tuple[str, ...],
-    repository: str | None,
+    repositories: tuple[str, ...] | None,
     per_page: int,
 ) -> dict[str, object]:
     incomplete = _boolean(value, "incomplete_results")
@@ -919,7 +960,7 @@ def _issue_search(
         raise LiveGitHubError("GitHub issue search result is incomplete")
     if len(items) > per_page:
         raise LiveGitHubError("GitHub issue search items exceed the requested page bound")
-    normalized = [_search_item(_object(item, "search item"), repository) for item in items]
+    normalized = [_search_item(_object(item, "search item"), repositories) for item in items]
     identities = [(item["repository"], item["number"]) for item in normalized]
     if len(identities) != len(set(identities)):
         raise LiveGitHubError("GitHub issue search contains duplicate items")
@@ -927,7 +968,8 @@ def _issue_search(
         "api_version": _API_VERSION,
         "kind": "issue_search",
         "owner": OWNER,
-        "repository": repository,
+        "repository": repositories[0] if repositories and len(repositories) == 1 else None,
+        "repositories": list(repositories) if repositories else None,
         "terms": list(terms),
         "sort": SEARCH_SORT,
         "order": SEARCH_ORDER,
@@ -951,13 +993,15 @@ def _search_body(value: Mapping[str, object]) -> tuple[str | None, bool]:
     return encoded[:MAX_SEARCH_BODY_BYTES].decode("utf-8", "ignore"), True
 
 
-def _search_item(value: Mapping[str, object], scoped_repository: str | None) -> dict[str, object]:
+def _search_item(
+    value: Mapping[str, object], scoped_repositories: tuple[str, ...] | None
+) -> dict[str, object]:
     repository_url = _text(value, "repository_url", 512)
     repository_prefix = f"{_API_ROOT}/repos/{OWNER}/"
     if not repository_url.startswith(repository_prefix):
         raise LiveGitHubError("GitHub search item repository is outside the fixed owner")
     repository = _repository(repository_url.removeprefix(repository_prefix))
-    if scoped_repository is not None and repository != scoped_repository:
+    if scoped_repositories is not None and repository not in scoped_repositories:
         raise LiveGitHubError("GitHub search item repository conflicts with the query")
 
     # A search returns up to 20 items, so its per-item body bound is tighter than the

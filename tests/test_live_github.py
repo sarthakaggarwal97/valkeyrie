@@ -422,6 +422,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
         "order": "desc",
         "owner": OWNER,
         "per_page": 20,
+        "repositories": ["valkey"],
         "repository": "valkey",
         "sort": "updated",
         "terms": ["release", "status"],
@@ -1356,3 +1357,60 @@ def test_a_merged_pull_request_reports_which_recent_releases_contain_it() -> Non
         ).canonical_payload
     )
     assert "released_in" not in payload
+
+
+def test_a_question_naming_two_repositories_is_searched_in_both() -> None:
+    """Naming two repositories used to raise, which killed the supplement on exactly the
+    cross-repository questions. A search carries one repo: qualifier per repository and GitHub ORs
+    them; org: is never sent alongside, since it would union the whole organization back in."""
+    from valkeyrie.live_github import _inferred_repositories
+
+    assert _inferred_repositories("does valkey-glide support X from valkey 9.2?") == (
+        "valkey",
+        "valkey-glide",
+    )
+    assert _inferred_repositories("compare valkey-glide and valkey-py reconnects") == (
+        "valkey-glide",
+        "valkey-py",
+    )
+    # The core name inside a longer name does not count as the core repository.
+    assert _inferred_repositories("what is new in valkey-glide") == ("valkey-glide",)
+    assert _inferred_repositories("how does failover work") == ("valkey",)
+
+    seen: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        seen.append(url)
+        return _response({"total_count": 0, "incomplete_results": False, "items": []})
+
+    read_live_github(
+        IssueSearchQuery(
+            ("streaming", "compression"), repository="valkey", repositories=("valkey-glide",)
+        ),
+        fetch=fetch,
+    )
+    assert "q=repo%3Avalkey-io%2Fvalkey+repo%3Avalkey-io%2Fvalkey-glide+is%3Aissue" in seen[0]
+    assert "org%3A" not in seen[0]
+
+    # An item from a repository outside the scope is still refused.
+    def leaking(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        item = {
+            "repository_url": "https://api.github.com/repos/valkey-io/valkey-py",
+            "number": 1,
+            "title": "t",
+            "state": "open",
+            "html_url": "https://github.com/valkey-io/valkey-py/issues/1",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "body": "",
+            "user": {"login": "x"},
+            "labels": [],
+        }
+        return _response({"total_count": 1, "incomplete_results": False, "items": [item]})
+
+    with pytest.raises(LiveGitHubError, match="conflicts with the query"):
+        read_live_github(
+            IssueSearchQuery(
+                ("streaming", "compression"), repository="valkey", repositories=("valkey-glide",)
+            ),
+            fetch=leaking,
+        )

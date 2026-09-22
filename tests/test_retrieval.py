@@ -722,3 +722,26 @@ def test_alias_expansion_cannot_exceed_query_bound() -> None:
 
     with pytest.raises(RetrievalError, match="outside its bound"):
         derive_retrieval_intent(query)
+
+
+def test_the_core_repository_is_included_when_named_alongside_another() -> None:
+    """ "does valkey-glide support the compression in valkey 9.2?" spans both repositories.
+
+    The core name is excluded from the explicit scan because it is a substring of every other
+    repository name; it is admitted when it stands alone as a word.
+    """
+    from valkeyrie.retrieval import derive_retrieval_intent
+
+    assert set(
+        derive_retrieval_intent(
+            "does valkey-glide support the compression in valkey 9.2?"
+        ).repositories
+    ) == {"valkey-glide", "valkey"}
+    assert derive_retrieval_intent("what is new in valkey-glide 2.6").repositories == (
+        "valkey-glide",
+    )
+    assert set(
+        derive_retrieval_intent(
+            "compare valkey-glide and valkey-py reconnect handling"
+        ).repositories
+    ) == {"valkey-glide", "valkey-py"}

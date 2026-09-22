@@ -572,6 +572,16 @@ def _answer(
                 _evidence(retrieved, generation_id)
                 + _supplementary_live_evidence(services, question)
             )
+            if not evidence:
+                # Nothing in the corpus and the gate kept GitHub out: force it before refusing.
+                # It is the same recovery _execute_plan makes after a model abstention, moved
+                # ahead of the model here because there is nothing to send it yet.
+                try:
+                    evidence = _bounded_evidence(
+                        _forced_supplementary_live_evidence(services, question)
+                    )
+                except Exception:
+                    evidence = ()
         plan_knowledge_base_id = knowledge_base_id
         evidence_mode = "static"
     if not evidence:
@@ -766,6 +776,14 @@ def _execute_plan(
                 "partial", request_id, "Request completion could not be confirmed."
             )
         return failed
+    if outcome == "abstention" and plan.get("evidence_mode") == "static":
+        # One more attempt before giving up. A corpus-only abstention on a question about work
+        # that has not shipped is the residual refusal class; the GitHub supplement is what covers
+        # it, and here it is forced on regardless of the intent gate. Everything else stays
+        # single: one request, one terminal write, one replayable result.
+        retried = _retry_with_supplement(services, plan, evidence)
+        if retried is not None:
+            outcome, claims, citations, message = retried
     if outcome == "abstention":
         # Applied here, at the single point where a parsed model outcome becomes a result,
         # rather than at each return site. The model writes its own reason, so wrapping the
@@ -975,6 +993,66 @@ def _routed_evidence(
     if plan.corpus_search:
         return evidence, generation_id, knowledge_base_id, "static", question
     return evidence, None, None, "live", question
+
+
+def _retry_with_supplement(
+    services: RuntimeServices,
+    plan: Mapping[str, object],
+    evidence: tuple[RuntimeEvidence, ...],
+) -> tuple[str, tuple[Mapping[str, object], ...], tuple[str, ...], str | None] | None:
+    """Ask once more with the GitHub supplement forced on. None means keep the abstention.
+
+    Only runs when the first pass had no live evidence: if the supplement already contributed and
+    the model still abstained, a second identical package would not change its mind. The retry
+    must ADD something, so it returns None when no new live record was found. Any failure inside
+    the retry is swallowed: the abstention it would have replaced is the fallback, never an error.
+    """
+    if any(isinstance(item, LiveRuntimeEvidence) for item in evidence):
+        return None
+    question = cast(str, plan["question"])
+    try:
+        supplement = _forced_supplementary_live_evidence(services, question)
+    except Exception:
+        return None
+    if not supplement:
+        return None
+    widened = _bounded_evidence((*evidence, *supplement))
+    if not any(isinstance(item, LiveRuntimeEvidence) for item in widened):
+        return None
+    try:
+        response = services.converse(
+            model_id=cast(str, plan["model_id"]),
+            system=tuple(cast(list[str], plan["system"])),
+            question=question,
+            evidence=widened,
+            maximum_output_tokens=cast(int, plan["maximum_output_tokens"]),
+            reasoning_effort=cast(str, plan["reasoning_effort"]),
+        )
+        normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
+        outcome, claims, citations, message = _accept_output(normalized.response_text, widened)
+    except Exception:
+        return None
+    if outcome != "answer":
+        return None
+    return outcome, claims, citations, message
+
+
+def _forced_supplementary_live_evidence(
+    services: RuntimeServices, question: str
+) -> tuple[RuntimeEvidence, ...]:
+    """The supplement with its intent gate bypassed: both kinds, given enough search terms."""
+    records: list[RuntimeEvidence] = []
+    for kind in ("pull-request", "issue"):
+        query = infer_supplementary_search(question, kind=kind, force=True)
+        if query is None:
+            return ()
+        try:
+            record: RuntimeEvidence | None = _live_evidence(services.read_live(query))
+        except Exception:
+            record = None
+        if record is not None:
+            records.append(record)
+    return tuple(records)
 
 
 def _supplementary_live_evidence(

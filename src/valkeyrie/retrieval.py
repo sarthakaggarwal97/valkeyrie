@@ -258,6 +258,14 @@ def _requested_repositories(query: str) -> tuple[str, ...]:
     if explicit:
         if explicit == ("valkey-skills",):
             return ("valkey-doc", "valkey-skills")
+        # A question naming another repository AND the core one ("does valkey-glide support the
+        # compression in valkey 9.2?") spans both. The core name is excluded from the explicit
+        # scan because it is a substring of every other repository; it is admitted here only when
+        # it appears as a whole word on its own, not as part of a longer name.
+        # Only beside another repository's name does the bare word mean the core repository;
+        # on its own it means the project, and the category scopes below handle that.
+        if _contains_term(re.sub(r"valkey-[a-z0-9.-]+", " ", query, flags=re.IGNORECASE), "valkey"):
+            return (*explicit, "valkey")
         return explicit
 
     if re.search(
