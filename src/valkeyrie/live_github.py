@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Final, Protocol, TypeAlias, cast
 from urllib.parse import quote, urlencode
 
@@ -154,6 +154,13 @@ ALLOWED_REPOSITORIES: Final = frozenset(
 REQUEST_TIMEOUT_SECONDS: Final = 8.0
 MAX_RESPONSE_BYTES: Final = 256 * 1024
 MAX_COLLECTION_ITEMS: Final = 100
+# Pages of MAX_COLLECTION_ITEMS a single board read may walk: 500 items covers every valkey-io
+# release board with room, and bounds the work one question can cause.
+MAX_PROJECT_PAGES: Final = 5
+# Statuses that mean an item is finished, so it is counted but not listed. Everything else is
+# remaining work and is listed in full (up to MAX_REMAINING_ITEMS).
+_COMPLETED_STATUSES: Final[frozenset[str]] = frozenset({"Done", "Merged", "Closed", "Released"})
+MAX_REMAINING_ITEMS: Final = 120
 MAX_ENTITY_ID: Final = 2**63 - 1
 MAX_TAG_BYTES: Final = 255
 MIN_SEARCH_TERMS: Final = 2
@@ -168,7 +175,7 @@ SUPPLEMENT_PER_PAGE: Final = 5
 SEARCH_SORT: Final = "updated"
 SEARCH_ORDER: Final = "desc"
 PROJECTS_GRAPHQL_QUERY: Final = """\
-query ValkeyrieProject($owner: String!, $number: Int!, $itemCount: Int!) {
+query ValkeyrieProject($owner: String!, $number: Int!, $itemCount: Int!, $after: String) {
   organization(login: $owner) {
     projectV2(number: $number) {
       id
@@ -178,11 +185,15 @@ query ValkeyrieProject($owner: String!, $number: Int!, $itemCount: Int!) {
       public
       closed
       url
-      items(first: $itemCount) {
+      items(first: $itemCount, after: $after) {
         totalCount
+        pageInfo { hasNextPage endCursor }
         nodes {
           id
           type
+          status: fieldValueByName(name: "Status") {
+            ... on ProjectV2ItemFieldSingleSelectValue { name }
+          }
           content {
             __typename
             ... on Issue {
@@ -506,6 +517,8 @@ def read_live_github(
         raise LiveGitHubError(f"live GitHub read failed: {error}") from error
     value = _response_object(response, source="REST")
     payload = normalizer(value)
+    if isinstance(query, PullRequestQuery) and payload.get("merged_at") is not None:
+        payload = _with_release_membership(payload, query.repository, fetch or fetch_public_github)
     return create_live_observation(
         observed_at=_observed_at(observed_clock),
         source_url=source_url,
@@ -514,35 +527,149 @@ def read_live_github(
     )
 
 
-def normalize_project_response(value: object, *, number: int) -> dict[str, object]:
-    """Normalize the fixed Projects GraphQL response without retaining unapproved fields."""
-    project_number = _entity_id(number, "project number")
-    root = _object(value, "Projects response")
-    if "errors" in root:
-        raise LiveGitHubError("GitHub Projects GraphQL returned errors")
-    data = _object(root.get("data"), "Projects data")
-    organization = _object(data.get("organization"), "Projects organization")
-    project = _object(organization.get("projectV2"), "Projects project")
-    if _integer(project, "number") != project_number:
-        raise LiveGitHubError("GitHub Projects returned a conflicting project number")
-    expected_url = f"{_WEB_ROOT}/orgs/{OWNER}/projects/{project_number}"
-    _exact_url(project, "url", expected_url)
-    if _boolean(project, "public") is not True:
-        raise LiveGitHubError("GitHub Projects returned a non-public project")
+# How many recent releases a merged pull request is checked against. Every release board tracks
+# at most the current line and two supported ones, so eight recent tags cover them with room.
+MAX_RELEASE_MEMBERSHIP_CHECKS: Final = 8
 
-    items_value = _object(project.get("items"), "project items")
-    # totalCount is the board's size, not ours to bound: real release boards hold 150 to 300
-    # items against a page of 100, and refusing them meant no release board could be read at
-    # all. The PAGE stays bounded; the payload says when it is a partial view so an answer can
-    # say "the first 100 of 268 items" rather than presenting a page as the whole board.
-    total_count = _positive_or_zero_integer(items_value, "totalCount")
-    nodes = _list(items_value, "nodes")
-    if len(nodes) > MAX_COLLECTION_ITEMS:
-        raise LiveGitHubError("GitHub project items exceed the requested page bound")
-    partial = total_count > len(nodes)
-    if not partial and total_count != len(nodes):
+
+def _with_release_membership(
+    payload: dict[str, object], repository: str, fetch: GitHubFetcher
+) -> dict[str, object]:
+    """Add which recent releases contain a merged pull request's merge commit.
+
+    "Has X shipped?" is the question release-watchers ask most, and merged and released are
+    different facts: a change merged to unstable is in no release until a tag includes it.
+
+    The test is exact and small. GitHub's compare endpoint answers it but embeds every file diff,
+    over a megabyte for a diverged tag, past every bound here; GraphQL's compare needs the repo
+    scope this token deliberately lacks. Instead, the commits reachable from a tag are listed for
+    the one-second window around the merge instant: a tag that contains the merge commit returns
+    it (about 8 KB), one that does not returns an empty list. merged_at is the merge commit's
+    committer date, which is what that listing is indexed by.
+
+    A failure to check any tag leaves it out of release_membership_checked rather than failing the
+    pull request read: membership is an addition to an answer the pull request itself supports.
+    """
+    merge_commit = payload.get("merge_commit_sha")
+    merged_at = payload.get("merged_at")
+    if (
+        not isinstance(merge_commit, str)
+        or _SHA.fullmatch(merge_commit) is None
+        or not isinstance(merged_at, str)
+    ):
+        return {**payload, "released_in": None, "release_membership_checked": []}
+    repo = _repository(repository)
+    try:
+        merged = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
+    except ValueError:
+        return {**payload, "released_in": None, "release_membership_checked": []}
+    since = (merged - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    until = (merged + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        releases = _response_object(
+            fetch(
+                f"{_API_ROOT}/repos/{OWNER}/{repo}/releases"
+                f"?per_page={MAX_RELEASE_MEMBERSHIP_CHECKS}",
+                REQUEST_TIMEOUT_SECONDS,
+                MAX_RESPONSE_BYTES,
+            ),
+            source="REST",
+        )
+        tags = [
+            _tag(_text(_object(item, "release"), "tag_name", MAX_TAG_BYTES))
+            for item in _list(releases, "items")[:MAX_RELEASE_MEMBERSHIP_CHECKS]
+        ]
+    except (GitHubReadError, LiveGitHubError):
+        return {**payload, "released_in": None, "release_membership_checked": []}
+    contained: list[str] = []
+    checked: list[str] = []
+    for tag in tags:
+        try:
+            listing = _response_object(
+                fetch(
+                    f"{_API_ROOT}/repos/{OWNER}/{repo}/commits?sha={quote(tag, safe='')}"
+                    f"&since={since}&until={until}&per_page=10",
+                    REQUEST_TIMEOUT_SECONDS,
+                    MAX_RESPONSE_BYTES,
+                ),
+                source="REST",
+            )
+        except (GitHubReadError, LiveGitHubError):
+            continue
+        checked.append(tag)
+        for commit in _list(listing, "items"):
+            if isinstance(commit, Mapping) and commit.get("sha") == merge_commit:
+                contained.append(tag)
+                break
+    return {**payload, "released_in": contained, "release_membership_checked": checked}
+
+
+def normalize_project_response(value: object, *, number: int) -> dict[str, object]:
+    """Normalize one or more pages of the fixed Projects query into one complete board.
+
+    ``value`` is a single response object, or a sequence of them for a board that spanned pages.
+    Every page must describe the same project; the pages together must hold exactly totalCount
+    items, so a truncated walk is refused rather than presented as the board.
+    """
+    project_number = _entity_id(number, "project number")
+    pages = (
+        list(value) if isinstance(value, Sequence) and not isinstance(value, Mapping) else [value]
+    )
+    if not 1 <= len(pages) <= MAX_PROJECT_PAGES:
+        raise LiveGitHubError("GitHub Projects page count is outside its bound")
+    expected_url = f"{_WEB_ROOT}/orgs/{OWNER}/projects/{project_number}"
+    project: Mapping[str, object] | None = None
+    nodes: list[object] = []
+    total_count = 0
+    for page in pages:
+        root = _object(page, "Projects response")
+        if "errors" in root:
+            raise LiveGitHubError("GitHub Projects GraphQL returned errors")
+        data = _object(root.get("data"), "Projects data")
+        organization = _object(data.get("organization"), "Projects organization")
+        current = _object(organization.get("projectV2"), "Projects project")
+        if _integer(current, "number") != project_number:
+            raise LiveGitHubError("GitHub Projects returned a conflicting project number")
+        _exact_url(current, "url", expected_url)
+        if _boolean(current, "public") is not True:
+            raise LiveGitHubError("GitHub Projects returned a non-public project")
+        if project is not None and _text(current, "id", 256) != _text(project, "id", 256):
+            raise LiveGitHubError("GitHub Projects pages describe different projects")
+        project = current
+        items_value = _object(current.get("items"), "project items")
+        page_total = _positive_or_zero_integer(items_value, "totalCount")
+        if project is current and not nodes:
+            total_count = page_total
+        elif page_total != total_count:
+            raise LiveGitHubError("GitHub Projects pages disagree on the item total")
+        page_nodes = _list(items_value, "nodes")
+        if len(page_nodes) > MAX_COLLECTION_ITEMS:
+            raise LiveGitHubError("GitHub project items exceed the requested page bound")
+        nodes.extend(page_nodes)
+    if project is None:  # pragma: no cover - at least one page is required above
+        raise LiveGitHubError("GitHub Projects returned no pages")
+    if len(nodes) != total_count:
         raise LiveGitHubError("GitHub Projects result is incomplete")
     items = [_project_item(item) for item in nodes]
+    # The board's Status column is what "what is left" means to a release manager: Todo, Needs
+    # Review and To be backported are remaining work; Done and Merged are not. Every status is
+    # totalled, and only items in a remaining-work status are listed in full. A 268-item board
+    # listed whole is 70 KB, past the evidence bound, and the 243 merged rows carry nothing an
+    # answer about remaining work needs; the totals say the board is 91% done, the open items say
+    # what the 9% is.
+    by_status: dict[str, int] = {}
+    for item in items:
+        label = cast(str | None, item.get("status")) or "(no status)"
+        by_status[label] = by_status.get(label, 0) + 1
+    remaining = [
+        item
+        for item in items
+        if (cast(str | None, item.get("status")) or "(no status)") not in _COMPLETED_STATUSES
+    ]
+    # Bounded for the evidence budget; a board with more open work than this is summarised by its
+    # totals and the newest items, and the payload says so.
+    remaining_truncated = len(remaining) > MAX_REMAINING_ITEMS
+    remaining = remaining[:MAX_REMAINING_ITEMS]
     return {
         "api_version": _API_VERSION,
         "kind": "project",
@@ -554,11 +681,38 @@ def normalize_project_response(value: object, *, number: int) -> dict[str, objec
         "closed": _boolean(project, "closed"),
         "url": expected_url,
         "total_count": total_count,
-        "items": items,
-        "items_shown": len(items),
         "items_total": total_count,
-        "partial": partial,
+        "items_by_status": dict(sorted(by_status.items())),
+        "remaining_items": remaining,
+        "remaining_truncated": remaining_truncated,
+        "partial": False,
     }
+
+
+def _project_page_info(value: Mapping[str, object]) -> tuple[bool, str | None]:
+    """Return (has_next_page, end_cursor) for one page, fail-closed on shape."""
+    try:
+        items = cast(
+            Mapping[str, object],
+            cast(
+                Mapping[str, object],
+                cast(
+                    Mapping[str, object], cast(Mapping[str, object], value["data"])["organization"]
+                )["projectV2"],
+            )["items"],
+        )
+    except (KeyError, TypeError) as error:
+        raise LiveGitHubError("GitHub Projects response lacks page information") from error
+    if items.get("pageInfo") is None:
+        return False, None
+    info = _object(items.get("pageInfo"), "project pageInfo")
+    has_next = _boolean(info, "hasNextPage")
+    if not has_next:
+        return False, None
+    cursor = info.get("endCursor")
+    if not isinstance(cursor, str) or not cursor or len(cursor) > 512:
+        raise LiveGitHubError("GitHub Projects page cursor is malformed")
+    return True, cursor
 
 
 Normalizer: TypeAlias = Callable[[Mapping[str, object]], dict[str, object]]
@@ -635,28 +789,41 @@ def _read_project(
     number = _entity_id(query.number, "project number")
     if projects_fetch is None:
         raise LiveGitHubError("GitHub Projects requires an injected authenticated GraphQL fetcher")
-    variables: Mapping[str, object] = {
-        "owner": OWNER,
-        "number": number,
-        "itemCount": MAX_COLLECTION_ITEMS,
-    }
-    try:
-        response = projects_fetch(
-            PROJECTS_GRAPHQL_QUERY,
-            variables,
-            REQUEST_TIMEOUT_SECONDS,
-            MAX_RESPONSE_BYTES,
-        )
-    except GitHubReadError as error:
-        raise LiveGitHubError(f"GitHub Projects read failed: {error}") from error
-    if (
-        isinstance(response, HttpResponse)
-        and type(response.status) is int
-        and response.status in {401, 403}
-    ):
-        raise LiveGitHubError("GitHub Projects requires authenticated GraphQL access")
-    value = _response_object(response, source="GraphQL")
-    payload = normalize_project_response(value, number=number)
+    # A board is read whole. GraphQL offers no filter on item state, and "what is left" is
+    # answered by the board's Status column, which only a complete read can total: the release
+    # boards hold 150 to 300 items, so two or three pages. The page count is bounded so a runaway
+    # board cannot turn one question into an unbounded walk.
+    pages: list[Mapping[str, object]] = []
+    after: str | None = None
+    for _ in range(MAX_PROJECT_PAGES):
+        variables: Mapping[str, object] = {
+            "owner": OWNER,
+            "number": number,
+            "itemCount": MAX_COLLECTION_ITEMS,
+            "after": after,
+        }
+        try:
+            response = projects_fetch(
+                PROJECTS_GRAPHQL_QUERY,
+                variables,
+                REQUEST_TIMEOUT_SECONDS,
+                MAX_RESPONSE_BYTES,
+            )
+        except GitHubReadError as error:
+            raise LiveGitHubError(f"GitHub Projects read failed: {error}") from error
+        if (
+            isinstance(response, HttpResponse)
+            and type(response.status) is int
+            and response.status in {401, 403}
+        ):
+            raise LiveGitHubError("GitHub Projects requires authenticated GraphQL access")
+        value = _response_object(response, source="GraphQL")
+        pages.append(value)
+        page_info = _project_page_info(value)
+        if not page_info[0]:
+            break
+        after = page_info[1]
+    payload = normalize_project_response(pages, number=number)
     return create_live_observation(
         observed_at=_observed_at(observed_clock),
         source_url=f"{_API_ROOT}/graphql",
@@ -687,6 +854,7 @@ def _pull_request(value: Mapping[str, object], repository: str, number: int) -> 
         "updated_at": _timestamp(value, "updated_at"),
         "closed_at": _nullable_timestamp(value, "closed_at"),
         "merged_at": _nullable_timestamp(value, "merged_at"),
+        "merge_commit_sha": _nullable_sha(value, "merge_commit_sha"),
         "api_url": _exact_url(value, "url", api_url),
         "url": _exact_url(value, "html_url", web_url),
     }
@@ -1032,9 +1200,17 @@ def _project_item(value: object) -> dict[str, object]:
                 "state": _choice(content_value, "state", {"OPEN", "CLOSED", "MERGED"}),
                 "url": _exact_url(content_value, "url", expected_url),
             }
+    # The board's Status column (a single-select field); absent when the item has none set.
+    status_value = item.get("status")
+    status: str | None = None
+    if isinstance(status_value, Mapping) and status_value:
+        status = _text(status_value, "name", 128)
+    elif status_value not in (None, {}):
+        raise LiveGitHubError("project item status is malformed")
     return {
         "id": _text(item, "id", 256),
         "type": item_type.lower(),
+        "status": status,
         "content": normalized_content,
     }
 
@@ -1284,6 +1460,15 @@ def _timestamp(value: Mapping[str, object], key: str) -> str:
     except ValueError as error:
         raise LiveGitHubError(f"GitHub field {key} must be a canonical UTC timestamp") from error
     return result
+
+
+def _nullable_sha(value: Mapping[str, object], key: str) -> str | None:
+    sha = value.get(key)
+    if sha is None:
+        return None
+    if not isinstance(sha, str) or _SHA.fullmatch(sha) is None:
+        raise LiveGitHubError(f"GitHub field {key} is not a commit id")
+    return sha
 
 
 def _nullable_timestamp(value: Mapping[str, object], key: str) -> str | None:

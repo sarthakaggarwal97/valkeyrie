@@ -966,7 +966,7 @@ def test_project_uses_only_the_fixed_query_variables_and_bounds() -> None:
     assert calls == [
         (
             PROJECTS_GRAPHQL_QUERY,
-            {"owner": OWNER, "number": 14, "itemCount": MAX_COLLECTION_ITEMS},
+            {"owner": OWNER, "number": 14, "itemCount": MAX_COLLECTION_ITEMS, "after": None},
             REQUEST_TIMEOUT_SECONDS,
             MAX_RESPONSE_BYTES,
         )
@@ -980,8 +980,11 @@ def test_project_uses_only_the_fixed_query_variables_and_bounds() -> None:
     assert payload["kind"] == "project"
     assert payload["total_count"] == 3
     assert "unknown" not in payload
-    items = cast(list[dict[str, object]], payload["items"])
+    # Items with no Status are remaining work by definition, so all three are listed.
+    items = cast(list[dict[str, object]], payload["remaining_items"])
     assert [item["type"] for item in items] == ["issue", "pull_request", "draft_issue"]
+    assert payload["items_by_status"] == {"(no status)": 3}
+    assert payload["remaining_truncated"] is False
 
 
 @pytest.mark.parametrize("status", [401, 403])
@@ -1077,27 +1080,55 @@ def test_project_normalizer_rejects_partial_conflicting_or_unsupported_data(
         normalize_project_response(value, number=14)
 
 
-def test_a_board_larger_than_one_page_is_a_partial_view_not_a_refusal() -> None:
-    """Real release boards hold 150 to 300 items against a page of 100.
+def test_a_board_larger_than_one_page_is_read_whole_and_totalled_by_status() -> None:
+    """Release boards hold 150 to 300 items against a page of 100.
 
-    The old whole-board bound refused every one of them, so no release board could be read at all.
-    The page stays bounded; the payload states how much of the board it shows.
+    GraphQL has no filter on item state, and "what is left" means the board's Status column, which
+    only a complete read can total. The reader walks the pages and the normalizer merges them,
+    refusing a walk that comes up short of the board's own count.
     """
-    value = _project()
-    project = cast(dict[str, Any], value["data"])["organization"]["projectV2"]
-    shown = len(project["items"]["nodes"])
-    project["items"]["totalCount"] = 268
+    first = _project()
+    project = cast(dict[str, Any], first["data"])["organization"]["projectV2"]
+    project["items"]["totalCount"] = 6
+    project["items"]["pageInfo"] = {"hasNextPage": True, "endCursor": "c1"}
+    for node, status in zip(project["items"]["nodes"], ("Todo", "Done", "Done"), strict=True):
+        node["status"] = {"name": status}
+    second = copy.deepcopy(first)
+    second_project = cast(dict[str, Any], second["data"])["organization"]["projectV2"]
+    second_project["items"]["pageInfo"] = {"hasNextPage": False, "endCursor": None}
+    for node in second_project["items"]["nodes"]:
+        node["id"] = node["id"] + "-p2"
+        node["status"] = {"name": "Needs Review"}
 
-    payload = normalize_project_response(value, number=14)
-    assert payload["items_shown"] == shown
-    assert payload["items_total"] == 268
-    assert payload["partial"] is True
+    pages = iter([first, second])
+    seen_cursors: list[object] = []
 
-    # More nodes than the page can hold is a response that cannot be trusted.
-    project["items"]["nodes"] = project["items"]["nodes"] * (MAX_COLLECTION_ITEMS + 1)
-    project["items"]["totalCount"] = len(project["items"]["nodes"])
-    with pytest.raises(LiveGitHubError, match="exceed the requested page bound"):
-        normalize_project_response(value, number=14)
+    def fetch(
+        query: str, variables: Mapping[str, object], timeout_seconds: float, max_bytes: int
+    ) -> HttpResponse:
+        seen_cursors.append(variables["after"])
+        return _response(next(pages))
+
+    observation = read_live_github(ProjectQuery(14), projects_fetch=fetch)
+    payload = json.loads(observation.canonical_payload)
+    assert seen_cursors == [None, "c1"]
+    assert payload["items_total"] == 6
+    assert payload["partial"] is False
+    assert payload["items_by_status"] == {"Done": 2, "Needs Review": 3, "Todo": 1}
+    # Done items are counted, not listed; the four remaining are listed in board order.
+    assert [item["status"] for item in payload["remaining_items"]] == [
+        "Todo",
+        "Needs Review",
+        "Needs Review",
+        "Needs Review",
+    ]
+    assert payload["remaining_truncated"] is False
+
+    # A walk that ends short of the board's count is refused, not presented as the board.
+    short = _project()
+    cast(dict[str, Any], short["data"])["organization"]["projectV2"]["items"]["totalCount"] = 9
+    with pytest.raises(LiveGitHubError, match="incomplete"):
+        normalize_project_response(short, number=14)
 
 
 def test_project_redacted_item_is_complete_only_with_null_content() -> None:
@@ -1110,7 +1141,9 @@ def test_project_redacted_item_is_complete_only_with_null_content() -> None:
 
     normalized = normalize_project_response(value, number=14)
 
-    assert normalized["items"] == [{"id": "PVTI_redacted", "type": "redacted", "content": None}]
+    assert normalized["remaining_items"] == [
+        {"id": "PVTI_redacted", "type": "redacted", "status": None, "content": None}
+    ]
 
 
 def test_observation_clock_must_be_timezone_aware_and_is_not_called_on_failure() -> None:
@@ -1275,3 +1308,51 @@ def test_release_list_includes_prereleases_that_latest_omits() -> None:
     # And the page size itself is bounded.
     with pytest.raises(LiveGitHubError, match="outside its bound"):
         read_live_github(ReleaseListQuery("valkey", 500), fetch=lambda *args: _response([]))
+
+
+def test_a_merged_pull_request_reports_which_recent_releases_contain_it() -> None:
+    """Merged and released are different facts, and "has X shipped?" needs the second.
+
+    The check lists the commits reachable from each recent tag in the one-second window around the
+    merge instant: a tag that contains the merge commit returns it, one that does not returns
+    nothing. Compare would answer too but embeds every file diff, over a megabyte for a diverged
+    tag; GraphQL compare needs the repo scope the token deliberately lacks.
+    """
+    merge_sha = "a" * 40
+    value = _pull_request(number=7)
+    value["merged_at"] = "2026-09-15T21:15:53Z"
+    value["merge_commit_sha"] = merge_sha
+    seen: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        seen.append(url)
+        if url.endswith("/pulls/7"):
+            return _response(value)
+        if "/releases?per_page=" in url:
+            return _response([{"tag_name": "9.2.0-rc1"}, {"tag_name": "9.1.2"}])
+        if "/commits?sha=9.2.0-rc1&" in url:
+            return _response([{"sha": merge_sha}])
+        if "/commits?sha=9.1.2&" in url:
+            return _response([])
+        raise AssertionError(url)
+
+    payload = json.loads(
+        read_live_github(PullRequestQuery("valkey", 7), fetch=fetch).canonical_payload
+    )
+    assert payload["released_in"] == ["9.2.0-rc1"]
+    assert payload["release_membership_checked"] == ["9.2.0-rc1", "9.1.2"]
+    # The window is the merge instant plus or minus one second, on both sides.
+    window = next(u for u in seen if "/commits?sha=9.2.0-rc1&" in u)
+    assert "since=2026-09-15T21:15:52Z" in window and "until=2026-09-15T21:15:54Z" in window
+
+    # An unmerged pull request is not checked at all: no releases call, no commits calls.
+    seen.clear()
+    open_value = _pull_request(number=7)
+    open_value["merged_at"] = None
+    open_value["merge_commit_sha"] = None
+    payload = json.loads(
+        read_live_github(
+            PullRequestQuery("valkey", 7), fetch=lambda *a: _response(open_value)
+        ).canonical_payload
+    )
+    assert "released_in" not in payload
