@@ -122,6 +122,17 @@ _MAX_CLAIM_TEXT_BYTES: Final = 4 * 1024
 _MAX_CLARIFICATION_BYTES: Final = 1024
 _MAX_ABSTENTION_BYTES: Final = 2048
 
+_READINESS_LABEL: Final = "a release-readiness decision"
+# The decision named AND attributed to whoever owns it, in either order.
+_READINESS_DEFERRAL: Final = re.compile(
+    r"\b(?:decision|judgement|judgment|call|matter)\b[^.]*"
+    r"\b(?:maintainers?|tsc|technical\s+steering\s+committee|project|release\s+owner)\b"
+    r"|\b(?:maintainers?|tsc|technical\s+steering\s+committee|release\s+owner)\b[^.]*"
+    r"\b(?:decide|decides|decision|judgement|judgment|call)\b",
+    re.IGNORECASE,
+)
+
+
 _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     ("an evidence ID", re.compile(r"\bev_[a-z0-9-]+")),
     (
@@ -149,12 +160,15 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
         ),
     ),
     (
-        "a release-readiness decision",
+        _READINESS_LABEL,
         re.compile(
             r"\b(?:release|version|build|candidate)\s+is\s+(?:ready|approved)\b"
             r"|\bready\s+(?:for|to)\s+(?:release|ship|tag)\b"
             r"|\bapprove(?:s|d)?\s+the\s+release\b"
             r"|\bgo\s*/?\s*no[- ]?go\b"
+            # A bare go verdict, which the go/no-go alternative never matched: "this is a go for
+            # the release" and "given the go-ahead" are decisions in the words a release owner uses.
+            r"|\bis\s+a\s+go\b|\bgo[- ]ahead\b"
             r"|\bship\s+it\b"
             r"|\b(?:can|could|may)\s+(?:now\s+)?ship\b"
             r"|\bsafe\s+to\s+(?:release|ship|tag|deploy|merge)\b",
@@ -382,8 +396,17 @@ def _reject_json_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object
 def _screened_model_text(value: str, field: str, maximum: int) -> None:
     _bounded_text(value, field, maximum)
     for label, pattern in _PROHIBITED_MODEL_TEXT:
-        if pattern.search(value) is not None:
-            raise DraftingError(f"{field} contains {label}")
+        if pattern.search(value) is None:
+            continue
+        # One exemption, for one rule. A readiness question may be answered with facts plus who
+        # decides, and "whether X is ready to release is the maintainers' decision" is the
+        # opposite of a verdict: it names readiness only to hand it to the people whose call it
+        # is. Refusing that sentence left the answer with board totals and no statement of who
+        # decides, which is the part a reader needs. Nothing else is exempt, and a sentence that
+        # ASSERTS readiness cannot match this shape because the decision must be attributed.
+        if label == _READINESS_LABEL and _READINESS_DEFERRAL.search(value) is not None:
+            continue
+        raise DraftingError(f"{field} contains {label}")
 
 
 def _bounded_text(value: object, field: str, maximum: int) -> None:

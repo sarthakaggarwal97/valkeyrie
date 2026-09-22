@@ -743,3 +743,29 @@ def test_first_person_action_claims_remain_refused(
     value = _answer(_claim("a-claim", [package.records[0].evidence_id], text))
     with pytest.raises(DraftingError, match="completed project-state write"):
         accept_model_output(value, bundle, package)
+
+
+def test_a_readiness_deferral_is_allowed_while_every_verdict_is_still_refused() -> None:
+    """A readiness question may be answered with facts plus who decides. "Whether X is ready to
+    release is the maintainers' decision" is the opposite of a verdict, and refusing it left the
+    answer with board totals and no statement of who decides, which is the part that matters."""
+    from valkeyrie.drafting import _screened_model_text
+
+    for allowed in (
+        "Whether 9.2 is ready to release is a decision that belongs to the Valkey maintainers.",
+        "Whether the candidate is ready to release remains a decision for the maintainers.",
+        "The Valkey 9.2 board has 162 items: 90 Merged, 23 Needs Review, 14 Todo.",
+    ):
+        _screened_model_text(allowed, "claim text", 4096)
+    for refused in (
+        "Valkey 9.2 is ready to release.",
+        "9.2 is ready for release.",
+        "The release is ready.",
+        "The candidate is approved.",
+        "It is safe to release 9.2.",
+        "This is a go for the release.",
+        "Ship it.",
+        "9.2 can now ship.",
+    ):
+        with pytest.raises(DraftingError, match="release-readiness decision"):
+            _screened_model_text(refused, "claim text", 4096)
