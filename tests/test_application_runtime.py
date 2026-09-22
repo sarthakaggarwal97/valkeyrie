@@ -1512,7 +1512,26 @@ def test_aws_static_retrieval_reuses_intent_aliases_and_scoped_fallback(
         question="How does hash field expiration work?",
     )
     assert len(values) == 1
-    assert len(bedrock.calls) == 2
+    # Two repositories were named, so after the OR-scoped call each gets its own call and a share
+    # of the ten. One OR-scoped call ranks purely by similarity and can return all ten from one
+    # side, which loses the other side of a comparison.
+    assert len(bedrock.calls) == 3
+    per_repository = [
+        cast(
+            dict[str, object],
+            cast(dict[str, object], call["retrievalConfiguration"])["vectorSearchConfiguration"],
+        )["filter"]
+        for call in bedrock.calls[1:]
+    ]
+    assert per_repository == [
+        {
+            "andAll": [
+                {"equals": {"key": "generation_id", "value": GENERATION}},
+                {"equals": {"key": "repository", "value": repository}},
+            ]
+        }
+        for repository in ("valkey", "valkey-doc")
+    ]
     first_query = cast(dict[str, str], bedrock.calls[0]["retrievalQuery"])["text"]
     assert first_query.endswith("HEXPIRE HPEXPIRE HTTL HPERSIST")
     first_config = cast(dict[str, object], bedrock.calls[0]["retrievalConfiguration"])
@@ -1528,8 +1547,34 @@ def test_aws_static_retrieval_reuses_intent_aliases_and_scoped_fallback(
             },
         ]
     }
-    second_config = cast(dict[str, object], bedrock.calls[1]["retrievalConfiguration"])
-    assert cast(dict[str, object], second_config["vectorSearchConfiguration"])["filter"] == {
+
+    # A single-repository scope that finds nothing still falls back to the generation-only filter,
+    # which is what keeps a mis-scoped question answerable.
+    class Empty(Bedrock):
+        def retrieve(self, **kwargs: object) -> dict[str, object]:
+            self.calls.append(dict(kwargs))
+            if len(self.calls) == 1:
+                return {"retrievalResults": []}
+            return {
+                "retrievalResults": [
+                    {
+                        "content": {"type": "TEXT", "text": "HEXPIRE expires hash fields."},
+                        "location": {"type": "S3", "s3Location": {"uri": "s3://bucket/key"}},
+                        "metadata": metadata,
+                    }
+                ]
+            }
+
+    empty = Empty()
+    monkeypatch.setattr(AwsRuntimeServices, "_boto3", staticmethod(lambda: Sdk(empty)))
+    values = service.retrieve(
+        knowledge_base_id="ABCDEFGHIJ",
+        generation_id=GENERATION,
+        question="What does valkey-doc say about HEXPIRE?",
+    )
+    assert len(values) == 1 and len(empty.calls) == 2
+    fallback = cast(dict[str, object], empty.calls[1]["retrievalConfiguration"])
+    assert cast(dict[str, object], fallback["vectorSearchConfiguration"])["filter"] == {
         "equals": {"key": "generation_id", "value": GENERATION}
     }
 
@@ -2611,3 +2656,134 @@ def test_a_retry_runs_when_forced_evidence_is_new_even_if_live_evidence_was_pres
     )
     assert result["outcome"] == "abstention"
     assert len(same.model_calls) == 1, "the forced supplement produced the same ids: no retry"
+
+
+def test_a_question_carrying_a_credential_is_refused_before_anything_reads_it(
+    manifest: dict[str, object],
+) -> None:
+    """A pasted token must not reach a model, a search qualifier, or a persisted row. The refusal
+    names the reason without echoing the value, and ordinary questions with hashes, digests or
+    command names are never caught."""
+    services = FakeServices()
+    result = run_runtime_event(
+        _event(
+            request_id="req_secret",
+            question="why does ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ012345 not work with valkey?",
+        ),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] == "abstention"
+    assert "credential" in cast(str, result["message"])
+    assert "ghp_" not in json.dumps(result), "the value is never echoed"
+    assert services.requests == {} and services.model_calls == [] and services.retrieve_calls == []
+
+    for shape in (
+        "xoxb-1234567890-abcdefghij",
+        "github_pat_11ABCDEFG0aBcDeFgHiJkLmNoPqRsTuVwXyZ",
+        "AKIAIOSFODNN7EXAMPLE",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g",
+    ):
+        assert (
+            run_runtime_event(
+                _event(
+                    request_id=f"req_secret-{abs(hash(shape)) % 9999}", question=f"is {shape} ok"
+                ),
+                FakeServices(),
+                root=ROOT,
+                manifest=manifest,
+            )["outcome"]
+            == "abstention"
+        )
+
+    ordinary = FakeServices()
+    result = run_runtime_event(
+        _event(
+            request_id="req_ordinary",
+            question="what is the sha256 digest sha256:"
+            + "a" * 64
+            + " for and does HSETEX accept AKIA as a field name?",
+        ),
+        ordinary,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] == "answer", "an ordinary question must not be screened out"
+
+
+def test_every_request_row_carries_the_tables_ttl_attribute(manifest: dict[str, object]) -> None:
+    """The table has TTL enabled on expires_at and nothing was setting it: a request row holds the
+    asker's question and its evidence, and kept forever that is a growing store the audit no longer
+    needs. Replay only has to outlive a redelivery."""
+    from datetime import datetime
+
+    from valkeyrie.application_runtime import _REQUEST_RETENTION_DAYS
+
+    services = FakeServices()
+    run_runtime_event(_event(request_id="req_ttl"), services, root=ROOT, manifest=manifest)
+    expires_at = services.requests["req_ttl"]["expires_at"]
+    # The event's own clock, 2026-08-19T10:00:00Z, plus the retention window.
+    started = int(datetime.fromisoformat("2026-08-19T10:00:00+00:00").timestamp())
+    assert expires_at == started + _REQUEST_RETENTION_DAYS * 86_400
+    assert isinstance(expires_at, int)
+
+
+def test_a_bare_greeting_is_answered_deterministically_without_spending_a_lookup(
+    manifest: dict[str, object],
+) -> None:
+    """A greeting carries no subject, so there is nothing to retrieve and nothing to ground. Asking
+    back is the right reply and it is the same reply every time; leaving it to the model spent a
+    routing call and an inference to sometimes answer "insufficient evidence" to "hi"."""
+    for greeting in ("hi", "Hello there!", "good morning", "thanks", "hey valkeyrie"):
+        services = FakeServices()
+        result = run_runtime_event(
+            _event(request_id=f"req_hi-{abs(hash(greeting)) % 9999}", question=greeting),
+            services,
+            root=ROOT,
+            manifest=manifest,
+        )
+        assert result["outcome"] == "clarification", greeting
+        assert "Valkey" in cast(str, result["message"])
+        assert services.model_calls == [] and services.retrieve_calls == []
+        assert services.live_calls == [] and services.requests == {}
+
+    # A greeting with a question attached is a question.
+    services = FakeServices()
+    result = run_runtime_event(
+        _event(request_id="req_hi-question", question="hi, where do command docs go?"),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] == "answer" and services.model_calls
+
+
+def test_the_corpus_is_searched_with_the_routers_english_restatement(
+    manifest: dict[str, object],
+) -> None:
+    """A question in another language retrieved nothing from an English corpus. The restatement is
+    used for retrieval only: the plan, and so the answer turn, keeps the asker's own question."""
+    services = FakeServices()
+    services.router_reply = (
+        '{"lookups":[{"kind":"corpus_search"}],'
+        '"retrieval_query":"How does replication compression work in Valkey?"}'
+    )
+    question = "¿Cómo funciona la compresión de replicación en Valkey?"
+    run_runtime_event(
+        _event(request_id="req_spanish", question=question),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert services.retrieve_calls == [
+        {
+            "knowledge_base_id": "ABCDEFGHIJ",
+            "generation_id": GENERATION,
+            "question": "How does replication compression work in Valkey?",
+        }
+    ]
+    plan = cast(Mapping[str, object], services.requests["req_spanish"]["plan"])
+    assert plan["question"] == question, "the answer turn sees the asker's question"
+    assert cast(Mapping[str, object], services.model_calls[0])["question"] == question

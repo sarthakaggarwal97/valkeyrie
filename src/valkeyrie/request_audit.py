@@ -60,6 +60,10 @@ _OBSERVATION_TYPES: Final = frozenset(
         "tag",
         "release",
         "controller_status",
+        # A repository file at a ref, and a published security advisory: both are bounded reads
+        # of one exact object, like the rest, and both carry their own provenance in the payload.
+        "file",
+        "advisory",
     }
 )
 _MAX_URL_CHARACTERS: Final = 2_048

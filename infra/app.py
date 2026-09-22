@@ -306,18 +306,15 @@ class KnowledgePlaneStack(Stack):
             iam.PolicyStatement(
                 sid="ConditionalGenerationLifecycle",
                 # No DeleteItem: lifecycle rows are the audit trail of what was published.
-                # TransactWriteItems is the activation compare-and-swap: a condition check on the
-                # candidate and a put of the active pointer in one transaction. Without it every
-                # refresh would ingest for an hour and then fail at the final write.
+                # Direct writes reach the generation rows and the candidate pointer only. The
+                # ACTIVE pointer is deliberately absent: activation is a compare-and-swap that
+                # checks the candidate and puts the pointer in one transaction, and an identity
+                # that can also PutItem the pointer directly can skip that check and activate a
+                # generation the evaluation gate never passed.
                 actions=[
                     "dynamodb:GetItem",
                     "dynamodb:PutItem",
                     "dynamodb:UpdateItem",
-                    "dynamodb:TransactWriteItems",
-                    # The CAS transaction's ConditionCheck element on the candidate row is
-                    # authorized as its own action; the fourth manual refresh reached activation
-                    # and was denied exactly here after every earlier step had passed.
-                    "dynamodb:ConditionCheckItem",
                 ],
                 resources=[state_table.attr_arn],
                 # Scoped to the corpus-owned key families. The same table also holds request
@@ -327,9 +324,39 @@ class KnowledgePlaneStack(Stack):
                         "dynamodb:LeadingKeys": [
                             "generation#*",
                             "candidate_generation",
-                            "active_generation",
                         ]
                     }
+                },
+            )
+        )
+        publisher.add_to_policy(
+            iam.PolicyStatement(
+                sid="ActivateOnlyInsideTheCheckedTransaction",
+                # The active pointer may be written ONLY as part of a transaction. DynamoDB
+                # authorizes each item of a TransactWriteItems by its own action, so PutItem has
+                # to be granted here; dynamodb:EnclosingOperation is what confines it to the
+                # transaction, and the transaction is what checks the candidate row. Verified
+                # against real DynamoDB with a scoped session: the transaction is allowed, and a
+                # direct PutItem or UpdateItem of the pointer is denied. Granting PutItem without
+                # this condition would let a compromised refresh activate a generation the
+                # evaluation gate never passed; omitting PutItem breaks activation after an hour
+                # of ingestion, which the IAM simulator does not reveal.
+                actions=[
+                    "dynamodb:TransactWriteItems",
+                    "dynamodb:ConditionCheckItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:GetItem",
+                ],
+                resources=[state_table.attr_arn],
+                conditions={
+                    "ForAllValues:StringLike": {
+                        "dynamodb:LeadingKeys": [
+                            "generation#*",
+                            "candidate_generation",
+                            "active_generation",
+                        ]
+                    },
+                    "StringEquals": {"dynamodb:EnclosingOperation": "TransactWriteItems"},
                 },
             )
         )

@@ -296,10 +296,10 @@ def test_complete_runner_makes_exactly_582_calls_and_persists_authoritative_resu
         item["profile"]["model_revision"]: item["profile"]["profile_revision"] for item in raw
     } == {
         "us.anthropic.claude-fable-5": (
-            "sha256:5d48e57394f190144e1e9688e1818b82ee0496eac0b5acdb0f518d556fe0c030"
+            "sha256:90f552cba6bd2c95b4c7414caf45de899e7b4a5a80d4d9152ae0603a64e15fae"
         ),
         "amazon.nova-pro-v1:0": (
-            "sha256:7a3a102ab224b5e27a12e84b47707fc8faa2ea91a11b7a6ea83a0d39b362b293"
+            "sha256:25c183e62ffb7a267bceeb2a1e866b0aedc393384c1b090d6d45bee277203c0e"
         ),
     }
     assert all(item["complete"] is True and len(item["observations"]) == 291 for item in raw)

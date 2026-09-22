@@ -67,7 +67,7 @@ GITHUB_TOKEN_SECRET_ID: Final = "valkeyrie/development/github-read-token"
 KNOWLEDGE_STACK_NAME: Final = "valkeyrie-development-knowledge-plane"
 KNOWLEDGE_BASE_ID: Final = "ONVASJDDNX"
 D01_TEMPLATE_SHA256: Final = (
-    "sha256:079e00bf1c1d28d5ce28ca309f8acc2efa99c5247621674228d2039960387791"
+    "sha256:99cd1ad6798d333397df8e2d5975c558cc8c0cb9d82b7d7b603650141a325448"
 )
 
 
@@ -802,7 +802,9 @@ def _runtime_statements(stack: Stack, artifact: ApplicationArtifact) -> list[dic
         {
             "Sid": "ReadFailClosedRuntimeControls",
             "Effect": "Allow",
-            "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+            # GetParameters only: the runtime reads both control parameters in one call and has
+            # never used the single-parameter action.
+            "Action": ["ssm:GetParameters"],
             "Resource": controls,
         },
         {

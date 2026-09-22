@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
+from binascii import Error as BinasciiError
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -61,6 +63,33 @@ class LatestReleaseQuery:
 
 
 @dataclass(frozen=True)
+class AdvisoryQuery:
+    """Published security advisories for a repository, or the one an identifier names.
+
+    "Is Valkey affected by CVE-2026-23479, and which version fixed it?" is answered by the
+    advisory's own patched_versions, which no other source here carries.
+    """
+
+    repository: str
+    identifier: str | None = None
+
+
+@dataclass(frozen=True)
+class FileQuery:
+    """One repository file at a ref, as text, bounded to the part that answers the question.
+
+    A config default, a command's JSON, or a function body is an exact fact in one file; retrieval
+    returns whichever chunks embedding similarity picked. ``around`` narrows a large file to the
+    lines near those words, since valkey.conf is 143 KB and src/server.h is 240 KB.
+    """
+
+    repository: str
+    path: str
+    ref: str | None = None
+    around: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ReleaseByTagQuery:
     """One release by its tag, with its notes whole.
 
@@ -109,6 +138,8 @@ LiveGitHubQuery: TypeAlias = (
     | LatestReleaseQuery
     | ReleaseByTagQuery
     | ReleaseListQuery
+    | FileQuery
+    | AdvisoryQuery
     | WorkflowRunQuery
     | CheckRunQuery
     | ProjectQuery
@@ -590,6 +621,14 @@ def read_live_github(
         raise LiveGitHubError(f"live GitHub read failed: {error}") from error
     value = _response_object(response, source="REST")
     payload = normalizer(value)
+    if isinstance(query, (PullRequestQuery, IssueQuery)):
+        payload = _with_discussion(
+            payload,
+            query.repository,
+            query.number,
+            fetch or fetch_public_github,
+            reviews=isinstance(query, PullRequestQuery),
+        )
     if isinstance(query, PullRequestQuery) and payload.get("merged_at") is not None:
         payload = _with_release_membership(payload, query.repository, fetch or fetch_public_github)
     if (
@@ -608,6 +647,26 @@ def read_live_github(
 
 # How many recent releases a merged pull request is checked against. Every release board tracks
 # at most the current line and two supported ones, so eight recent tags cover them with room.
+# Discussion on an issue or pull request, where the project's reasoning lives. Ten comments of a
+# debated pull request measured 72 KB and a single review body 28 KB, so each body is cut hard and
+# only the most recent are carried: the rationale is in what was said, not in every word of it.
+# A file's evidence payload. The network read may be the whole file (valkey.conf is 143 KB), but
+# what reaches the model is either a small file whole or the windows around the asked-for words.
+MAX_FILE_TEXT_BYTES: Final = 12 * 1024
+FILE_WINDOW_LINES: Final = 24
+MAX_FILE_WINDOWS: Final = 6
+# A repository path: segments of ordinary file characters, no traversal, no leading slash.
+_REPO_PATH: Final = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+# Published advisories per repository read at once, and the bound on one advisory's description.
+MAX_ADVISORIES: Final = 20
+MAX_ADVISORY_DESCRIPTION_BYTES: Final = 4 * 1024
+# A GHSA id or a CVE id, the two ways an advisory is named.
+_ADVISORY_ID: Final = re.compile(
+    r"^(?:GHSA-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4}|CVE-[0-9]{4}-[0-9]{4,7})$",
+    re.IGNORECASE,
+)
+MAX_DISCUSSION_ITEMS: Final = 8
+MAX_DISCUSSION_BODY_BYTES: Final = 1200
 MAX_RELEASE_MEMBERSHIP_CHECKS: Final = 8
 # Commits listed per tag in the one-second window around the merge. A window that holds this many
 # is inconclusive (the merge may be on the next page) and the tag is left unchecked; measured
@@ -688,6 +747,273 @@ def _with_author_tally(
         **payload,
         "authors_of_all": dict(sorted(tally.items(), key=lambda pair: (-pair[1], pair[0]))),
     }
+
+
+def _advisories(
+    value: Mapping[str, object], repository: str, identifier: str | None
+) -> dict[str, object]:
+    """Normalize published advisories, narrowed to one when an identifier was given.
+
+    An identifier that matches nothing is not an error: "no published advisory for that id" is
+    the answer to "is Valkey affected", and the payload says how many were searched so the
+    absence is a finding rather than a gap.
+    """
+    items = _list(value, "items")[:MAX_ADVISORIES]
+    normalized = [_advisory(_object(item, "advisory"), repository) for item in items]
+    matched = normalized
+    if identifier is not None:
+        wanted = identifier.casefold()
+        matched = [
+            item
+            for item in normalized
+            if str(item.get("ghsa_id", "")).casefold() == wanted
+            or str(item.get("cve_id") or "").casefold() == wanted
+        ]
+    finding = (
+        f"{len(normalized)} published advisories were read for {OWNER}/{repository}."
+        if identifier is None
+        else (
+            f"The advisory {identifier} is published for {OWNER}/{repository}."
+            if matched
+            else f"No published advisory for {OWNER}/{repository} carries the identifier "
+            f"{identifier}; {len(normalized)} were read. This establishes that the repository "
+            "publishes no such advisory at observation time."
+        )
+    )
+    return {
+        "api_version": _API_VERSION,
+        "kind": "advisory" if identifier is not None else "advisory_list",
+        "repository": repository,
+        "identifier": identifier,
+        "read_count": len(normalized),
+        "advisories": matched,
+        "finding": finding,
+        "url": f"{_WEB_ROOT}/{OWNER}/{repository}/security/advisories",
+    }
+
+
+def _advisory(value: Mapping[str, object], repository: str) -> dict[str, object]:
+    ghsa = _text(value, "ghsa_id", 64)
+    if not ghsa.startswith("GHSA-"):
+        raise LiveGitHubError("GitHub advisory identifier is malformed")
+    description, truncated = _advisory_description(value)
+    affected: list[dict[str, object]] = []
+    for raw in _list(value, "vulnerabilities")[:MAX_COLLECTION_ITEMS]:
+        item = _object(raw, "advisory vulnerability")
+        package = item.get("package")
+        affected.append(
+            {
+                "package": _text(_object(package, "advisory package"), "name", 256)
+                if isinstance(package, Mapping)
+                else None,
+                "vulnerable_versions": _nullable_text(item, "vulnerable_version_range", 512),
+                "patched_versions": _nullable_text(item, "patched_versions", 512),
+            }
+        )
+    return {
+        "ghsa_id": ghsa,
+        "cve_id": _nullable_text(value, "cve_id", 64),
+        "severity": _nullable_text(value, "severity", 32),
+        "summary": _text(value, "summary", 1024),
+        "description": description,
+        "description_truncated": truncated,
+        "cwe_ids": [str(x) for x in _list(value, "cwe_ids")[:MAX_COLLECTION_ITEMS]],
+        "published_at": _nullable_timestamp(value, "published_at"),
+        "withdrawn_at": _nullable_timestamp(value, "withdrawn_at"),
+        "affected": affected,
+        "url": _github_api_url(
+            value, "html_url", f"{_WEB_ROOT}/{OWNER}/{repository}/security/advisories/"
+        ),
+    }
+
+
+def _advisory_description(value: Mapping[str, object]) -> tuple[str | None, bool]:
+    raw = value.get("description")
+    if raw is None:
+        return None, False
+    if type(raw) is not str:
+        raise LiveGitHubError("GitHub advisory description must be a string")
+    encoded = raw.encode("utf-8")
+    if len(encoded) <= MAX_ADVISORY_DESCRIPTION_BYTES:
+        return raw, False
+    return encoded[:MAX_ADVISORY_DESCRIPTION_BYTES].decode("utf-8", "ignore"), True
+
+
+def _advisory_identifier(value: object) -> str:
+    if type(value) is not str or _ADVISORY_ID.fullmatch(value) is None:
+        raise LiveGitHubError("advisory identifier must be a GHSA or CVE id")
+    # A CVE id is conventionally upper case and a GHSA id lower after the prefix, so the asker's
+    # spelling is kept and matching is case-insensitive; uppercasing a GHSA id printed an
+    # identifier GitHub does not use back into the evidence.
+    return f"CVE-{value[4:]}" if value[:4].casefold() == "cve-" else value
+
+
+def _file(
+    value: Mapping[str, object],
+    repository: str,
+    path: str,
+    ref: str | None,
+    around: tuple[str, ...],
+) -> dict[str, object]:
+    """Normalize the contents response, carrying only the text that answers the question.
+
+    GitHub returns the file base64-encoded. It is decoded here and then bounded: a file within
+    MAX_FILE_TEXT_BYTES is carried whole, and a larger one is reduced to numbered windows around
+    the words the query named, so the answer can quote exact lines with their line numbers. A
+    binary file is refused rather than presented as text.
+    """
+    if _text(value, "type", 32) != "file":
+        raise LiveGitHubError("GitHub contents response is not a file")
+    if _text(value, "path", 512) != path:
+        raise LiveGitHubError("GitHub contents path conflicts with the query")
+    if _text(value, "encoding", 32) != "base64":
+        raise LiveGitHubError("GitHub contents encoding is unsupported")
+    size = _positive_or_zero_integer(value, "size")
+    try:
+        content = base64.b64decode(_text(value, "content", MAX_RESPONSE_BYTES), validate=False)
+    except (ValueError, BinasciiError) as error:
+        raise LiveGitHubError("GitHub contents is not valid base64") from error
+    if len(content) != size:
+        raise LiveGitHubError("GitHub contents size conflicts with its content")
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise LiveGitHubError("GitHub contents is not UTF-8 text") from error
+    lines = text.splitlines()
+    commit = _text(value, "sha", 64)
+    payload: dict[str, object] = {
+        "api_version": _API_VERSION,
+        "kind": "file",
+        "repository": repository,
+        "path": path,
+        "ref": ref,
+        "blob_sha": commit,
+        "size_bytes": size,
+        "total_lines": len(lines),
+        "around": list(around),
+        # The contents endpoint answers with its own url carrying the resolved ref, so the exact
+        # match the other readers use does not apply; the prefix is what must hold.
+        "api_url": _github_api_url(
+            value, "url", f"{_API_ROOT}/repos/{OWNER}/{repository}/contents/"
+        ),
+        "url": _github_api_url(value, "html_url", f"{_WEB_ROOT}/{OWNER}/{repository}/"),
+    }
+    if len(content) <= MAX_FILE_TEXT_BYTES:
+        return {**payload, "text": text, "windows": None, "complete": True}
+    windows = _file_windows(lines, around)
+    return {**payload, "text": None, "windows": windows, "complete": False}
+
+
+def _file_windows(lines: list[str], around: tuple[str, ...]) -> list[dict[str, object]]:
+    """Numbered windows around the first matches of the query's words, or the file's head.
+
+    Line numbers are carried so an answer can name where a value is defined, and the windows are
+    disjoint: overlapping matches are merged rather than quoted twice.
+    """
+    wanted = [word.casefold() for word in around]
+    hits = [
+        index for index, line in enumerate(lines) if any(word in line.casefold() for word in wanted)
+    ]
+    if not hits:
+        hits = [0]
+    spans: list[tuple[int, int]] = []
+    for hit in hits:
+        start = max(0, hit - FILE_WINDOW_LINES // 2)
+        end = min(len(lines), hit + FILE_WINDOW_LINES // 2)
+        if spans and start <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], end))
+            continue
+        if len(spans) == MAX_FILE_WINDOWS:
+            break
+        spans.append((start, end))
+    windows: list[dict[str, object]] = []
+    budget = MAX_FILE_TEXT_BYTES
+    for start, end in spans:
+        body = "\n".join(lines[start:end])
+        encoded = body.encode("utf-8")[:budget]
+        budget -= len(encoded)
+        windows.append(
+            {
+                "first_line": start + 1,
+                "last_line": end,
+                "text": encoded.decode("utf-8", "ignore"),
+            }
+        )
+        if budget <= 0:
+            break
+    return windows
+
+
+def _github_api_url(value: Mapping[str, object], key: str, prefix: str) -> str:
+    """A GitHub URL that must start with the expected prefix, for a response that adds its own
+    query (the contents endpoint returns ?ref=<resolved sha>)."""
+    url = _text(value, key, 2048)
+    if not url.startswith(prefix):
+        raise LiveGitHubError(f"GitHub field {key} is outside its expected location")
+    return url
+
+
+def _repository_path(value: object) -> str:
+    if type(value) is not str or not 1 <= len(value.encode("utf-8")) <= 512:
+        raise LiveGitHubError("file path is malformed")
+    if _REPO_PATH.fullmatch(value) is None:
+        raise LiveGitHubError("file path is malformed")
+    return value
+
+
+def _with_discussion(
+    payload: dict[str, object], repository: str, number: int, fetch: GitHubFetcher, *, reviews: bool
+) -> dict[str, object]:
+    """Add the most recent comments, and for a pull request its reviews, to the payload.
+
+    "Why was this decided" and "what did reviewers say" are answered in the discussion, which the
+    body never carries. Best effort and additive: a failure leaves the object's own evidence
+    intact and says the discussion was not read, rather than failing a read that succeeded.
+    """
+    comments = _discussion_items(
+        f"{_API_ROOT}/repos/{OWNER}/{repository}/issues/{number}/comments"
+        f"?per_page={MAX_DISCUSSION_ITEMS}&sort=created&direction=desc",
+        fetch,
+        state=False,
+    )
+    enriched = {**payload, "recent_comments": comments}
+    if reviews:
+        enriched["recent_reviews"] = _discussion_items(
+            f"{_API_ROOT}/repos/{OWNER}/{repository}/pulls/{number}/reviews"
+            f"?per_page={MAX_DISCUSSION_ITEMS}",
+            fetch,
+            state=True,
+        )
+    return enriched
+
+
+def _discussion_items(
+    url: str, fetch: GitHubFetcher, *, state: bool
+) -> list[dict[str, object]] | None:
+    """Normalize one bounded page of comments or reviews. None means it could not be read."""
+    try:
+        listing = _response_object(
+            fetch(url, REQUEST_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES), source="REST"
+        )
+        items = _list(listing, "items")[:MAX_DISCUSSION_ITEMS]
+        normalized: list[dict[str, object]] = []
+        for raw in items:
+            value = _object(raw, "discussion item")
+            body, truncated = _search_body(value, MAX_DISCUSSION_BODY_BYTES)
+            item: dict[str, object] = {
+                "author": _login(value),
+                "created_at": _timestamp(value, "submitted_at" if state else "created_at"),
+                "body": body,
+                "body_truncated": truncated,
+            }
+            if state:
+                # A review's verdict is evidence even when its body is empty: an approval and a
+                # request for changes are the two facts "what did reviewers say" most needs.
+                item["state"] = _text(value, "state", 64)
+            normalized.append(item)
+        return normalized
+    except (GitHubReadError, LiveGitHubError):
+        return None
 
 
 def _with_release_membership(
@@ -984,6 +1310,27 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         repository = _repository(query.repository)
         url = f"{_API_ROOT}/repos/{OWNER}/{repository}/releases/latest"
         return url, "release", lambda value: _release(value, repository)
+    if isinstance(query, AdvisoryQuery):
+        repository = _repository(query.repository)
+        identifier = None if query.identifier is None else _advisory_identifier(query.identifier)
+        # One listing answers both shapes: GitHub's per-advisory endpoint is not readable with
+        # this token, and the repository's published list is small (12 advisories, 22 KB).
+        url = (
+            f"{_API_ROOT}/repos/{OWNER}/{repository}/security-advisories"
+            f"?per_page={MAX_ADVISORIES}&state=published"
+        )
+        return url, "advisory", lambda value: _advisories(value, repository, identifier)
+    if isinstance(query, FileQuery):
+        repository = _repository(query.repository)
+        path = _repository_path(query.path)
+        ref = None if query.ref is None else _tag(query.ref)
+        if ref is not None and ("/" in ref or ".." in ref):
+            raise LiveGitHubError("file ref is malformed")
+        segments = "/".join(quote(part, safe="") for part in path.split("/"))
+        url = f"{_API_ROOT}/repos/{OWNER}/{repository}/contents/{segments}"
+        if ref is not None:
+            url += f"?ref={quote(ref, safe='')}"
+        return url, "file", lambda value: _file(value, repository, path, ref, query.around)
     if isinstance(query, ReleaseByTagQuery):
         repository = _repository(query.repository)
         tag = _tag(query.tag)

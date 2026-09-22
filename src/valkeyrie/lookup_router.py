@@ -33,6 +33,8 @@ from valkeyrie.live_github import (
     MIN_SEARCH_TERMS,
     SUPPLEMENT_PER_PAGE,
     WINDOW_PER_PAGE,
+    AdvisoryQuery,
+    FileQuery,
     IssueQuery,
     IssueSearchQuery,
     LiveGitHubQuery,
@@ -45,6 +47,8 @@ from valkeyrie.live_github import (
 # The closed catalog. Adding an entry here is the ONLY way the model gains a capability.
 _KINDS: Final[frozenset[str]] = frozenset(
     {
+        "file",
+        "advisory",
         "corpus_search",
         "pull_request",
         "issue",
@@ -71,6 +75,12 @@ _REPOSITORY: Final = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 # A release tag is one path segment: no slash, no dot-dot, bounded. It is placed in a URL path.
 _RELEASE_TAG: Final = re.compile(r"^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SINCE: Final = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# A file path the model may name: ordinary path characters, no traversal.
+_FILE_PATH: Final = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+MAX_AROUND_TERMS: Final = 4
+_ADVISORY: Final = re.compile(
+    r"^(?:GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}|CVE-[0-9]{4}-[0-9]{4,7})$", re.IGNORECASE
+)
 _LOGIN: Final = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
 # A search term is one plain word: letters, digits, hyphens. No qualifier syntax can pass.
 _SEARCH_TERM: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{1,39}$")
@@ -109,6 +119,17 @@ ROUTER_SYSTEM: Final = (
     "what changed since its last candidate and refers to the candidates for the feature list, so "
     "for what a major version added ask for the .0 release AND its -rc1 (and -rc2 when one "
     "exists); for a patch release its own tag is enough.\n"
+    '- {"kind":"file","repository":"valkey","path":"valkey.conf","around":["repl-compression"]}: '
+    "one file's text at the repository's default branch, or at an exact release tag with "
+    '"ref":"9.1.0". Use for a configuration default or its documentation (valkey.conf), a '
+    "command's exact definition (src/commands/<command>.json carries summary, complexity, since, "
+    "arity, flags and arguments), or a function's code (src/<file>.c). A large file is returned as "
+    'the numbered lines around the "around" words, so name the words that identify the part you '
+    "need. Prefer this over corpus_search when the asker wants an exact value, flag or signature.\n"
+    '- {"kind":"advisory","repository":"valkey","identifier":"CVE-2026-63639"}: a published '
+    "security advisory by CVE or GHSA id, carrying its severity, description and the versions "
+    "that fixed it. Omit the identifier to list the recent advisories. Use for any question about "
+    "a CVE, a GHSA id, or which release fixed a vulnerability.\n"
     '- {"kind":"project_board","number":N}: a valkey-io project board, the planning view for a '
     "release or a workstream. Use for what is planned, in progress, or remaining for a release, "
     "or what is on a board. Known boards: "
@@ -134,6 +155,12 @@ ROUTER_SYSTEM: Final = (
     "finds mentions, not authorship. A question about a person wants corpus_search too, for their "
     'role. Add a window only for a period the asker actually states; "lately" or "recently" '
     "is not a period, the newest-first ordering already answers it.\n"
+    "\n"
+    'Reply shape: {"lookups":[...]} and optionally "question" (a follow-up resolved into a '
+    'standalone question) and "retrieval_query" (see below).\n'
+    '- If the question is not in English, add "retrieval_query": the same question in English, '
+    "using the project's own vocabulary. The corpus is English, so a question in another language "
+    "retrieves nothing without it. Choose lookups exactly as you would for the English form.\n"
     "\n"
     "Rules:\n"
     "- Choose every lookup that would help, up to six in total; a question about a feature that "
@@ -180,6 +207,11 @@ class LookupPlan:
     corpus_search: bool
     live: tuple[LiveGitHubQuery, ...]
     question: str | None = None
+    # An English restatement of the question, for retrieval only. The corpus is English and the
+    # keyword scopes are English regexes, so a question asked in another language retrieved
+    # nothing useful. The ANSWER still sees the asker's own question, so the reply stays in their
+    # language and nothing about grounding changes: this only decides what is searched for.
+    retrieval_query: str | None = None
 
 
 Converse = Callable[[str, str], str]
@@ -218,7 +250,7 @@ def route_lookups(
         # asker's own words is the model (or a poisoned turn) changing the question. Either way
         # the rewrite is discarded and the original stands, so the worst case is today's
         # behaviour, never an attacker's question.
-        return LookupPlan(plan.corpus_search, plan.live, None)
+        return LookupPlan(plan.corpus_search, plan.live, None, plan.retrieval_query)
     return plan
 
 
@@ -329,7 +361,11 @@ def _parse_lookup_plan(raw: object) -> LookupPlan:
         value = json.loads(text)
     except json.JSONDecodeError as error:
         raise LookupRouterError("router reply is not JSON") from error
-    if not isinstance(value, Mapping) or not {"lookups"} <= set(value) <= {"lookups", "question"}:
+    if not isinstance(value, Mapping) or not {"lookups"} <= set(value) <= {
+        "lookups",
+        "question",
+        "retrieval_query",
+    }:
         raise LookupRouterError(
             "router reply must be an object with lookups and optionally question"
         )
@@ -343,6 +379,16 @@ def _parse_lookup_plan(raw: object) -> LookupPlan:
         if "\n" in candidate or "\x00" in candidate:
             raise LookupRouterError("resolved question must be a single line")
         resolved = candidate.strip()
+    retrieval_query: str | None = None
+    raw_retrieval = value.get("retrieval_query")
+    if raw_retrieval is not None:
+        if not isinstance(raw_retrieval, str) or not raw_retrieval.strip():
+            raise LookupRouterError("retrieval query must be text")
+        if len(raw_retrieval.encode("utf-8")) > MAX_RESOLVED_QUESTION_BYTES:
+            raise LookupRouterError("retrieval query exceeds its byte bound")
+        if "\n" in raw_retrieval or "\x00" in raw_retrieval:
+            raise LookupRouterError("retrieval query must be a single line")
+        retrieval_query = raw_retrieval.strip()
     lookups = value["lookups"]
     if not isinstance(lookups, Sequence) or isinstance(lookups, str):
         raise LookupRouterError("lookups must be an array")
@@ -373,7 +419,12 @@ def _parse_lookup_plan(raw: object) -> LookupPlan:
         # Every lookup was a search too thin to run. Falling back to the keyword path is
         # better than reporting the question as out of scope, which an empty plan would mean.
         raise LookupRouterError("no lookup survived validation")
-    return LookupPlan(corpus_search=corpus_search, live=tuple(live), question=resolved)
+    return LookupPlan(
+        corpus_search=corpus_search,
+        live=tuple(live),
+        question=resolved,
+        retrieval_query=retrieval_query,
+    )
 
 
 def _live_lookup(kind: str, item: Mapping[str, object]) -> LiveGitHubQuery | None:
@@ -383,6 +434,12 @@ def _live_lookup(kind: str, item: Mapping[str, object]) -> LiveGitHubQuery | Non
     if kind == "project_board":
         _only_keys(item, {"kind", "number"})
         return ProjectQuery(_number(item))
+    if kind == "file":
+        _only_keys(item, {"kind", "repository", "path", "ref", "around"})
+        return FileQuery(_repository(item), _file_path(item), _file_ref(item), _around_terms(item))
+    if kind == "advisory":
+        _only_keys(item, {"kind", "repository", "identifier"})
+        return AdvisoryQuery(_repository(item), _advisory_id(item))
     repository = _repository(item)
     if kind == "pull_request":
         _only_keys(item, {"kind", "repository", "number"})
@@ -485,6 +542,49 @@ def _window_day(value: object) -> str | None:
     if not isinstance(value, str) or _SINCE.fullmatch(value) is None:
         raise LookupRouterError("search window is malformed")
     return value
+
+
+def _file_path(item: Mapping[str, object]) -> str:
+    """A repository-relative path, validated again by the transport before it enters a URL."""
+    path = item.get("path")
+    if not isinstance(path, str) or _FILE_PATH.fullmatch(path) is None:
+        raise LookupRouterError("file path is malformed")
+    return path
+
+
+def _file_ref(item: Mapping[str, object]) -> str | None:
+    ref = item.get("ref")
+    if ref is None:
+        return None
+    if not isinstance(ref, str) or _RELEASE_TAG.fullmatch(ref) is None:
+        raise LookupRouterError("file ref is malformed")
+    return ref
+
+
+def _around_terms(item: Mapping[str, object]) -> tuple[str, ...]:
+    """Words that locate the part of a large file to carry. Free text, but bounded and plain:
+    they are matched against file lines here, never sent anywhere."""
+    around = item.get("around", [])
+    if not isinstance(around, Sequence) or isinstance(around, str):
+        raise LookupRouterError("file around must be an array")
+    if len(around) > MAX_AROUND_TERMS:
+        raise LookupRouterError("file around holds too many terms")
+    terms: list[str] = []
+    for term in around:
+        if not isinstance(term, str) or not 2 <= len(term) <= 120 or "\n" in term:
+            raise LookupRouterError("file around term is malformed")
+        if term not in terms:
+            terms.append(term)
+    return tuple(terms)
+
+
+def _advisory_id(item: Mapping[str, object]) -> str | None:
+    identifier = item.get("identifier")
+    if identifier is None:
+        return None
+    if not isinstance(identifier, str) or _ADVISORY.fullmatch(identifier) is None:
+        raise LookupRouterError("advisory identifier is malformed")
+    return identifier
 
 
 def _release_tag(item: Mapping[str, object]) -> str:

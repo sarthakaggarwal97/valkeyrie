@@ -241,6 +241,7 @@ def test_publisher_holds_exactly_publication_and_refresh_permission(
         "ReadGenerationObjects",
         "ListGenerationObjects",
         "ConditionalGenerationLifecycle",
+        "ActivateOnlyInsideTheCheckedTransaction",
         "IngestExactKnowledgeBase",
         "SmokeTestCandidateRetrieval",
     }
@@ -637,17 +638,51 @@ def test_publisher_refresh_permission_is_scoped_and_cannot_delete(tmp_path: Path
         "dynamodb:GetItem",
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
-        "dynamodb:TransactWriteItems",
-        "dynamodb:ConditionCheckItem",
     ]
     assert lifecycle["Resource"] == {"Fn::GetAtt": ["StateTable", "Arn"]}
     # The table also holds request audits and protected approvals; the publisher is confined to
-    # the corpus-owned key families.
+    # the corpus-owned key families. The ACTIVE pointer is NOT among them: an identity that can
+    # PutItem the pointer directly can skip the candidate check and activate a generation the
+    # evaluation gate never passed, which is the whole point of the compare-and-swap.
     assert lifecycle["Condition"] == {
         "ForAllValues:StringLike": {
-            "dynamodb:LeadingKeys": ["generation#*", "candidate_generation", "active_generation"]
+            "dynamodb:LeadingKeys": ["generation#*", "candidate_generation"]
         }
     }
+
+    activation = statements["ActivateOnlyInsideTheCheckedTransaction"]
+    assert activation["Action"] == [
+        "dynamodb:TransactWriteItems",
+        "dynamodb:ConditionCheckItem",
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+    ]
+    assert activation["Resource"] == {"Fn::GetAtt": ["StateTable", "Arn"]}
+    # PutItem has to be here because DynamoDB authorizes each item of a transaction by its own
+    # action; EnclosingOperation is what confines it to the transaction, which is what checks the
+    # candidate row. Verified against real DynamoDB: the transaction is allowed and a direct put
+    # of the pointer is denied.
+    assert activation["Condition"] == {
+        "ForAllValues:StringLike": {
+            "dynamodb:LeadingKeys": ["generation#*", "candidate_generation", "active_generation"]
+        },
+        "StringEquals": {"dynamodb:EnclosingOperation": "TransactWriteItems"},
+    }
+    # No statement lets the active pointer be written OUTSIDE a transaction.
+    for statement in _statements(policy):
+        keys = (
+            statement.get("Condition", {})
+            .get("ForAllValues:StringLike", {})
+            .get("dynamodb:LeadingKeys", [])
+        )
+        actions = statement["Action"]
+        actions = actions if isinstance(actions, list) else [actions]
+        if "active_generation" in keys and {"dynamodb:PutItem", "dynamodb:UpdateItem"} & set(
+            actions
+        ):
+            assert statement["Condition"].get("StringEquals", {}) == {
+                "dynamodb:EnclosingOperation": "TransactWriteItems"
+            }
 
     ingest = statements["IngestExactKnowledgeBase"]
     assert ingest["Action"] == ["bedrock:StartIngestionJob", "bedrock:GetIngestionJob"]

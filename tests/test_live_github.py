@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
@@ -327,7 +328,17 @@ def test_every_rest_query_is_one_fixed_bounded_get_and_normalized(
 
     observation = read_live_github(query, fetch=fetch, observed_clock=lambda: OBSERVED)
 
-    assert calls == [(source_url, REQUEST_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES)]
+    # The primary read is exactly one fixed bounded GET. An issue or pull request additionally
+    # reads its discussion, each equally bounded; those are additive and never replace it.
+    assert calls[0] == (source_url, REQUEST_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES)
+    assert all(
+        timeout == REQUEST_TIMEOUT_SECONDS and limit == MAX_RESPONSE_BYTES
+        for _, timeout, limit in calls[1:]
+    )
+    assert all(
+        "/comments?" in url or "/reviews?" in url or "/releases" in url or "/commits?" in url
+        for url, _, _ in calls[1:]
+    )
     assert observation.source_url == source_url
     assert observation.object_type == object_type
     assert observation.observed_at == "2026-08-19T23:58:28Z"
@@ -787,13 +798,17 @@ def test_observed_at_is_sampled_only_after_the_fetch_and_normalization() -> None
         return _response(_pull_request())
 
     def clock() -> datetime:
-        assert events == ["fetch"]
+        # Every fetch this read makes, the primary and the additive discussion reads, happens
+        # before the clock is sampled: the observation time must not precede its own evidence.
+        assert events and set(events) == {"fetch"}
         events.append("clock")
         return OBSERVED
 
     read_live_github(PullRequestQuery("valkey", 7), fetch=fetch, observed_clock=clock)
 
-    assert events == ["fetch", "clock"]
+    # Every fetch precedes the single clock sample: the observation time never predates its
+    # evidence, and the additive discussion reads are fetches like any other.
+    assert events[-1] == "clock" and set(events[:-1]) == {"fetch"} and events.count("clock") == 1
 
 
 def test_transport_failure_is_not_retried_or_replaced_with_stale_data() -> None:
@@ -1345,6 +1360,8 @@ def test_a_merged_pull_request_reports_which_recent_releases_contain_it() -> Non
             return _response([{"sha": merge_sha}])
         if "/commits?sha=9.1.2&" in url:
             return _response([])
+        if "/comments?" in url or "/reviews?" in url:
+            return _response([])
         raise AssertionError(url)
 
     payload = json.loads(
@@ -1630,6 +1647,8 @@ def test_release_membership_is_conclusive_only_within_one_commit_page_and_per_ta
             return _response({"not": "a list"})
         if "sha=empty&" in url:
             return _response([])
+        if "/comments?" in url or "/reviews?" in url:
+            return _response([])
         raise AssertionError(url)
 
     payload = json.loads(
@@ -1811,3 +1830,211 @@ def test_a_windowed_search_tallies_every_author_through_graphql_when_the_walk_is
         ).canonical_payload
     )
     assert "authors_of_all" not in payload
+
+
+def test_an_issue_and_a_pull_request_carry_their_recent_discussion() -> None:
+    """Rationale lives in the comments and the reviews, which the body never carries. Bodies are cut
+    hard (ten comments of a debated pull request measured 72 KB, one review body 28 KB) and a review
+    keeps its verdict even when its body is empty. A discussion that cannot be read is None, not a
+    failure of the object read that succeeded."""
+    from valkeyrie.live_github import MAX_DISCUSSION_BODY_BYTES, MAX_DISCUSSION_ITEMS
+
+    def comment(login: str, body: str) -> dict[str, object]:
+        return {"user": {"login": login}, "created_at": TIMESTAMP, "body": body}
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        if "/comments?" in url:
+            assert f"per_page={MAX_DISCUSSION_ITEMS}" in url and "direction=desc" in url
+            return _response(
+                [comment("zuiderkwast", "x" * 5000)]
+                + [comment("madolson", "short") for _ in range(MAX_DISCUSSION_ITEMS + 4)]
+            )
+        if "/reviews?" in url:
+            return _response(
+                [
+                    {
+                        "user": {"login": "madolson"},
+                        "submitted_at": TIMESTAMP,
+                        "body": "",
+                        "state": "CHANGES_REQUESTED",
+                    }
+                ]
+            )
+        if url.endswith("/pulls/7"):
+            return _response(_pull_request(number=7))
+        if url.endswith("/issues/7"):
+            return _response(_issue(number=7))
+        raise AssertionError(url)
+
+    payload = json.loads(
+        read_live_github(PullRequestQuery("valkey", 7), fetch=fetch).canonical_payload
+    )
+    comments = cast(list[dict[str, object]], payload["recent_comments"])
+    assert len(comments) == MAX_DISCUSSION_ITEMS
+    assert len(cast(str, comments[0]["body"]).encode("utf-8")) == MAX_DISCUSSION_BODY_BYTES
+    assert comments[0]["body_truncated"] is True and comments[0]["author"] == "zuiderkwast"
+    reviews = cast(list[dict[str, object]], payload["recent_reviews"])
+    assert reviews == [
+        {
+            "author": "madolson",
+            "created_at": TIMESTAMP,
+            "body": "",
+            "body_truncated": False,
+            "state": "CHANGES_REQUESTED",
+        }
+    ]
+
+    # An issue has comments and no reviews.
+    payload = json.loads(read_live_github(IssueQuery("valkey", 7), fetch=fetch).canonical_payload)
+    assert payload["recent_comments"] and "recent_reviews" not in payload
+
+    # A discussion that cannot be read leaves the object's own evidence intact.
+    def partial(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        if "/comments?" in url or "/reviews?" in url:
+            raise GitHubReadError("GitHub returned HTTP 502")
+        return _response(_pull_request(number=7))
+
+    payload = json.loads(
+        read_live_github(PullRequestQuery("valkey", 7), fetch=partial).canonical_payload
+    )
+    assert payload["recent_comments"] is None and payload["recent_reviews"] is None
+    assert payload["number"] == 7
+
+
+def test_a_file_is_carried_whole_when_small_and_as_numbered_windows_when_large() -> None:
+    """A config default or a command's arity is an exact fact in one file, and retrieval returns
+    whichever chunks similarity picked. A small file is carried whole; valkey.conf is 143 KB, so a
+    large one is reduced to the numbered lines around the asked-for words, and the line numbers let
+    an answer say where a value is defined. A path may not traverse and the response must be the
+    file that was asked for."""
+    from valkeyrie.live_github import MAX_FILE_TEXT_BYTES, MAX_FILE_WINDOWS, FileQuery
+
+    def contents(path: str, body: str) -> dict[str, object]:
+        encoded = body.encode("utf-8")
+        return {
+            "type": "file",
+            "path": path,
+            "encoding": "base64",
+            "size": len(encoded),
+            "sha": "b" * 40,
+            "content": base64.b64encode(encoded).decode(),
+            "url": f"https://api.github.com/repos/valkey-io/valkey/contents/{path}?ref=abc",
+            "html_url": f"https://github.com/valkey-io/valkey/blob/abc/{path}",
+        }
+
+    small = contents("src/commands/hsetex.json", '{"HSETEX": {"arity": -6}}')
+    payload = json.loads(
+        read_live_github(
+            FileQuery("valkey", "src/commands/hsetex.json"), fetch=lambda *a: _response(small)
+        ).canonical_payload
+    )
+    assert payload["complete"] is True and payload["windows"] is None
+    assert payload["text"] == '{"HSETEX": {"arity": -6}}' and payload["total_lines"] == 1
+
+    lines = [f"line {index}" for index in range(4000)]
+    lines[1000] = "repl-compression no"
+    lines[3000] = "# repl-compression documentation"
+    big = contents("valkey.conf", "\n".join(lines))
+    seen: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        seen.append(url)
+        return _response(big)
+
+    payload = json.loads(
+        read_live_github(
+            FileQuery("valkey", "valkey.conf", around=("repl-compression",)), fetch=fetch
+        ).canonical_payload
+    )
+    windows = cast(list[dict[str, object]], payload["windows"])
+    assert payload["complete"] is False and payload["text"] is None
+    assert [w["first_line"] for w in windows] == [989, 2989]
+    assert "repl-compression no" in cast(str, windows[0]["text"])
+    assert sum(len(cast(str, w["text"]).encode("utf-8")) for w in windows) <= MAX_FILE_TEXT_BYTES
+    assert len(windows) <= MAX_FILE_WINDOWS
+    assert seen == ["https://api.github.com/repos/valkey-io/valkey/contents/valkey.conf"]
+
+    # A ref is a path segment of the URL, and the query's path must be the response's path.
+    seen.clear()
+    read_live_github(FileQuery("valkey", "valkey.conf", ref="9.1.0"), fetch=fetch)
+    assert seen == ["https://api.github.com/repos/valkey-io/valkey/contents/valkey.conf?ref=9.1.0"]
+    with pytest.raises(LiveGitHubError, match="path conflicts"):
+        read_live_github(FileQuery("valkey", "src/server.h"), fetch=lambda *a: _response(big))
+    for bad in ("../secrets", "/etc/passwd", "a/../../b", ""):
+        with pytest.raises(LiveGitHubError, match="file path is malformed"):
+            read_live_github(FileQuery("valkey", bad), fetch=fetch)
+    # Binary content is refused rather than presented as text.
+    binary = dict(small)
+    binary["content"] = base64.b64encode(b"\xff\xfe\x00").decode()
+    binary["size"] = 3
+    with pytest.raises(LiveGitHubError, match="not UTF-8"):
+        read_live_github(
+            FileQuery("valkey", "src/commands/hsetex.json"), fetch=lambda *a: _response(binary)
+        )
+
+
+def test_an_advisory_is_found_by_either_identifier_and_a_miss_is_a_finding() -> None:
+    """ "Which version fixed this CVE" is answered by the advisory's own patched_versions. An
+    identifier that matches nothing is not an error: no published advisory IS the answer to "is
+    Valkey affected", and the payload says how many were searched."""
+    from valkeyrie.live_github import AdvisoryQuery
+
+    def advisory(ghsa: str, cve: str | None) -> dict[str, object]:
+        return {
+            "ghsa_id": ghsa,
+            "cve_id": cve,
+            "severity": "high",
+            "summary": "Use-after-free in stream deserialization",
+            "description": "## Impact\nA crafted payload frees twice.",
+            "cwe_ids": ["CWE-416"],
+            "published_at": TIMESTAMP,
+            "withdrawn_at": None,
+            "vulnerabilities": [
+                {
+                    "package": {"ecosystem": "", "name": "valkey-server"},
+                    "vulnerable_version_range": "<= 9.1.0",
+                    "patched_versions": "9.1.1, 9.0.5",
+                }
+            ],
+            "html_url": f"https://github.com/valkey-io/valkey/security/advisories/{ghsa}",
+        }
+
+    listing = [
+        advisory("GHSA-mvcj-73cw-22m4", "CVE-2026-63639"),
+        advisory("GHSA-aaaa-bbbb-cccc", None),
+    ]
+    seen: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        seen.append(url)
+        return _response(listing)
+
+    for identifier in ("CVE-2026-63639", "cve-2026-63639", "GHSA-mvcj-73cw-22m4"):
+        payload = json.loads(
+            read_live_github(AdvisoryQuery("valkey", identifier), fetch=fetch).canonical_payload
+        )
+        matched = cast(list[dict[str, object]], payload["advisories"])
+        assert len(matched) == 1 and matched[0]["ghsa_id"] == "GHSA-mvcj-73cw-22m4"
+        assert matched[0]["affected"] == [
+            {
+                "package": "valkey-server",
+                "vulnerable_versions": "<= 9.1.0",
+                "patched_versions": "9.1.1, 9.0.5",
+            }
+        ]
+        assert payload["kind"] == "advisory" and payload["read_count"] == 2
+    assert "state=published" in seen[0]
+
+    payload = json.loads(
+        read_live_github(AdvisoryQuery("valkey", "CVE-1999-0001"), fetch=fetch).canonical_payload
+    )
+    assert payload["advisories"] == []
+    assert "No published advisory" in cast(str, payload["finding"])
+    assert "2 were read" in cast(str, payload["finding"])
+
+    payload = json.loads(read_live_github(AdvisoryQuery("valkey"), fetch=fetch).canonical_payload)
+    assert payload["kind"] == "advisory_list" and len(payload["advisories"]) == 2
+
+    for bad in ("CVE-99-1", "GHSA-short", "'; DROP", "CVE-2026-63639 OR 1=1"):
+        with pytest.raises(LiveGitHubError, match="GHSA or CVE"):
+            read_live_github(AdvisoryQuery("valkey", bad), fetch=fetch)

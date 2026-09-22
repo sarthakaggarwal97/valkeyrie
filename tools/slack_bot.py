@@ -55,6 +55,17 @@ lambda_client = boto3.client("lambda", region_name="us-east-1")
 
 def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
     """Answer one mention in a thread, or explain why it could not be answered."""
+    # Who may trigger an inference. Every mention delivered to this installation used to run one,
+    # including one posted by another app, which is a loop waiting to happen, and one from a
+    # workspace this bot was never meant to serve. EXPECTED_TEAM unset keeps the old behaviour so
+    # a local run needs no configuration.
+    if EXPECTED_TEAM and event.get("team") not in {EXPECTED_TEAM, None}:
+        log.warning("ignoring mention from unexpected team %s", event.get("team"))
+        return
+    if event.get("bot_id") or event.get("subtype"):
+        # A bot's own mention, or an edit/join/share event that is not a person asking.
+        return
+
     question = re.sub(r"<@[A-Z0-9]+>", "", event.get("text", "")).strip()
     # Keep the conversation in a thread so a busy channel stays readable.
     thread = event.get("thread_ts") or event["ts"]
@@ -133,6 +144,9 @@ def _ask(
 _answered: dict[str, bool] = {}
 _answered_lock = threading.Lock()
 MAX_ANSWERED_EVENTS = 4096
+# The workspace this bot serves. Set SLACK_TEAM_ID to enforce it; unset serves any team the app
+# is installed in, which is the behaviour a local run expects.
+EXPECTED_TEAM = os.environ.get("SLACK_TEAM_ID", "")
 
 
 def _event_key(event: dict[str, Any]) -> str:
@@ -166,13 +180,23 @@ def _thread_history(event: dict[str, Any], client: Any) -> list[dict[str, str]]:
             log.warning("thread history unavailable, answering without it: %s", error)
             _history_unavailable_logged = True
         return []
-    return _turns_before(replies.get("messages", []), event.get("ts", ""), _bot_user_id or "")
+    return _turns_before(
+        replies.get("messages", []),
+        event.get("ts", ""),
+        _bot_user_id or "",
+        asker=event.get("user") or "",
+    )
 
 
 def _turns_before(
-    messages: list[dict[str, Any]], current_ts: str, bot_user_id: str
+    messages: list[dict[str, Any]], current_ts: str, bot_user_id: str, *, asker: str = ""
 ) -> list[dict[str, str]]:
-    """Map thread messages to bounded user/assistant turns, excluding the current mention."""
+    """Map thread messages to bounded user/assistant turns, excluding the current mention.
+
+    Only the asker's own turns and this bot's replies are kept. A thread is a room: another
+    person's message is not context for this person's follow-up, and taking it as one let a
+    third party supply the subject that "is it released?" resolves against.
+    """
     turns: list[dict[str, str]] = []
     for message in messages:
         if message.get("ts") == current_ts:
@@ -186,6 +210,8 @@ def _turns_before(
         if message.get("user") == bot_user_id:
             role = "assistant"
         elif message.get("bot_id"):
+            continue
+        elif asker and message.get("user") != asker:
             continue
         else:
             role = "user"

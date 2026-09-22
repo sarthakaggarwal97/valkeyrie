@@ -47,6 +47,8 @@ from valkeyrie.prompts import load_prompt_package
 from valkeyrie.request_audit import LiveObservation, RequestAuditError, live_observation_value
 from valkeyrie.retrieval import (
     RetrievalError,
+    RetrievalIntent,
+    RetrievedChunk,
     derive_retrieval_intent,
     reviewed_source_authority,
     verify_retrieval_results,
@@ -210,6 +212,26 @@ _TIMESTAMP: Final = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
 )
 _MAX_QUESTION_BYTES: Final = 8 * 1024
+_REQUEST_RETENTION_DAYS: Final = 30
+# A bare greeting and nothing else: the whole message is one or two greeting words, optionally
+# addressed to the bot. "hi, what is the TSC?" is not a greeting, it is a question.
+_GREETING: Final = re.compile(
+    r"(?:hi|hey|hello|hiya|yo|greetings|good\s+(?:morning|afternoon|evening)|howdy|"
+    r"thanks|thank\s+you|ty)"
+    r"(?:\s+(?:there|all|team|folks|everyone|valkeyrie|bot))?[\s!.?,]*",
+    re.IGNORECASE,
+)
+# Credential shapes a person might paste into a Slack question. Deliberately narrow: each
+# alternative is a token format with a fixed prefix or an unmistakable PEM header, so an ordinary
+# question about a command or a hash is never refused.
+_CREDENTIAL: Final = re.compile(
+    r"(?:gh[pousr]_[A-Za-z0-9]{16,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}"
+    r"|ASIA[A-Z0-9]{16}|AKIA[A-Z0-9]{16}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})"
+)
 # Distinguishes "not yet looked up" from "looked up and absent", so an absent token is
 # not re-fetched on every question.
 _UNSET: Final = object()
@@ -259,6 +281,8 @@ _LIVE_KINDS: Final[Mapping[str, frozenset[str]]] = {
     "workflow_run": frozenset({"workflow_run"}),
     "check": frozenset({"check_run", "commit_checks", "commit_status"}),
     "controller_status": frozenset({"project"}),
+    "file": frozenset({"file"}),
+    "advisory": frozenset({"advisory", "advisory_list"}),
 }
 
 
@@ -423,6 +447,25 @@ def _answer(
     conversation = _conversation(event.get("conversation"))
     request_id = cast(str, event["request_id"])
     question = _bounded_text(event["question"], "question", _MAX_QUESTION_BYTES)
+    if _GREETING.fullmatch(question.strip()) is not None:
+        # A greeting carries no subject, so there is nothing to retrieve and nothing to ground.
+        # Asking back is the right reply and it is the same reply every time; leaving it to the
+        # model spent a routing call and an inference to sometimes answer "insufficient evidence"
+        # to "hi". Anything longer than a bare greeting still goes through the normal path.
+        return RuntimeResult(
+            "clarification",
+            request_id,
+            "Hello. What would you like to know about the Valkey project?",
+        )
+    if _CREDENTIAL.search(question) is not None:
+        # A pasted token must not reach a model, a search qualifier, or a persisted row. The
+        # refusal names the reason without echoing the value.
+        return RuntimeResult(
+            "abstention",
+            request_id,
+            "That question appears to contain a credential, so I did not process it. "
+            "Remove the secret and ask again, and rotate it if it was a real one.",
+        )
     requirement = event["version_requirement"]
     if requirement not in {"none", "required", "current_state"}:
         raise ApplicationRuntimeError("version requirement is unsupported")
@@ -650,6 +693,10 @@ def _answer(
     item = {
         "pk": f"request#{request_id}",
         "record_type": "request_audit",
+        # The table's TTL attribute, which nothing was setting: a request row holds the asker's
+        # question text and its evidence, and kept forever that is a growing store of content the
+        # audit no longer needs. Replay only has to outlive a redelivery, which is minutes.
+        "expires_at": _expiry_epoch(now, _REQUEST_RETENTION_DAYS),
         "revision": 1,
         "fence": 1,
         "owner": owner,
@@ -682,6 +729,11 @@ def _answer(
         completed_at=completed_at,
         completion_clock=completion_clock,
     )
+
+
+def _expiry_epoch(now: str, days: int) -> int:
+    """Unix seconds `days` after `now`, which is DynamoDB's TTL format."""
+    return int(_timestamp_value(now).timestamp()) + days * 86_400
 
 
 def _controls_enabled(services: RuntimeServices) -> bool:
@@ -1019,7 +1071,10 @@ def _routed_evidence(
             retrieved = services.retrieve(
                 knowledge_base_id=knowledge_base_id,
                 generation_id=generation_id,
-                question=question,
+                # The corpus is searched with the router's English restatement when there is one:
+                # a question in another language retrieves nothing from an English corpus. The
+                # model still answers the asker's own question, so the reply keeps its language.
+                question=plan.retrieval_query or question,
             )
             records.extend(_evidence(retrieved, generation_id))
         except Exception:
@@ -2218,6 +2273,14 @@ class AwsRuntimeServices:
             results = verify_retrieval_results(
                 response, generation_id, "generation_id", 10, intent.repositories
             )
+            # One OR-scoped call ranks purely by similarity, so all ten results can come from one
+            # named repository. A question comparing two of them, or asking what a client does
+            # about a server behaviour, then loses the side it did not favour. Each named
+            # repository gets its own call and a share of the ten, merged in the order named.
+            if len(intent.repositories) > 1:
+                results = self._quotaed(
+                    client, knowledge_base_id, generation_id, intent, generation_filter, results
+                )
             if not results:
                 response = _runtime_retrieve(
                     client, knowledge_base_id, intent.query, generation_filter
@@ -2236,6 +2299,86 @@ class AwsRuntimeServices:
             }
             for result in results
         )
+
+    def _quotaed(
+        self,
+        client: Any,
+        knowledge_base_id: str,
+        generation_id: str,
+        intent: RetrievalIntent,
+        generation_filter: Mapping[str, object],
+        combined: Sequence[RetrievedChunk],
+    ) -> tuple[RetrievedChunk, ...]:
+        """Retrieve per named repository and interleave, so every named side is represented.
+
+        The combined OR-scoped ranking stays as the order within each repository and as the
+        fallback: a repository whose own call fails or returns nothing contributes what the
+        combined call already gave it. Nothing is invented and nothing is re-ranked across
+        repositories.
+        """
+        share = max(1, 10 // len(intent.repositories))
+        by_repository: dict[str, list[RetrievedChunk]] = {r: [] for r in intent.repositories}
+        for result in combined:
+            repository = result.metadata.get("repository")
+            if isinstance(repository, str) and repository in by_repository:
+                by_repository[repository].append(result)
+        for repository in intent.repositories:
+            if len(by_repository[repository]) >= share:
+                continue
+            scoped: Mapping[str, object] = {
+                "andAll": [
+                    generation_filter,
+                    {"equals": {"key": "repository", "value": repository}},
+                ]
+            }
+            own = self._own_results(
+                client, knowledge_base_id, generation_id, intent, scoped, repository
+            )
+            seen = {result.text for result in by_repository[repository]}
+            by_repository[repository].extend(r for r in own if r.text not in seen)
+        merged: list[RetrievedChunk] = []
+        chosen: set[str] = set()
+        for position in range(10):
+            for repository in intent.repositories:
+                bucket = by_repository[repository]
+                if position < min(share, len(bucket)) and len(merged) < 10:
+                    candidate = bucket[position]
+                    # The same chunk can reach two buckets, since a per-repository call is scoped
+                    # by filter and not by what the text is about. One copy is evidence; two waste
+                    # a slot the other side of a comparison needed.
+                    if candidate.text in chosen:
+                        continue
+                    chosen.add(candidate.text)
+                    merged.append(candidate)
+        # Any remaining room goes to the combined ranking, so a scope with one rich repository is
+        # not left short because the other had little to say.
+        for result in combined:
+            if len(merged) >= 10:
+                break
+            if result.text not in chosen:
+                chosen.add(result.text)
+                merged.append(result)
+        return tuple(merged)
+
+    @staticmethod
+    def _own_results(
+        client: Any,
+        knowledge_base_id: str,
+        generation_id: str,
+        intent: RetrievalIntent,
+        scoped: Mapping[str, object],
+        repository: str,
+    ) -> tuple[RetrievedChunk, ...]:
+        """One repository's own results, or nothing. A per-repository call is an improvement on the
+        combined ranking, never a requirement: if it fails or returns something unverifiable, that
+        repository keeps whatever the combined call already gave it."""
+        try:
+            response = _runtime_retrieve(client, knowledge_base_id, intent.query, scoped)
+            return verify_retrieval_results(
+                response, generation_id, "generation_id", 10, (repository,)
+            )
+        except Exception:
+            return ()
 
     def read_structured_record(
         self, *, generation_id: str, record_id: str, expected_content_digest: str

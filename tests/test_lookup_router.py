@@ -459,3 +459,57 @@ def test_the_router_may_scope_a_search_to_an_author() -> None:
     ):
         with pytest.raises(LookupRouterError, match="author is malformed"):
             parse_lookup_plan(bad)
+
+
+def test_the_router_may_read_a_file_or_an_advisory() -> None:
+    """Both are bounded reads of one exact object. The path and the identifier are the model's free
+    text that reaches a URL, so their shapes are exact and traversal cannot pass."""
+    from valkeyrie.live_github import AdvisoryQuery, FileQuery
+
+    plan = parse_lookup_plan(
+        '{"lookups":[{"kind":"file","path":"valkey.conf","around":["repl-compression","lz4"]},'
+        '{"kind":"file","repository":"valkey","path":"src/commands/hsetex.json","ref":"9.1.0"},'
+        '{"kind":"advisory","identifier":"CVE-2026-63639"},'
+        '{"kind":"advisory"}]}'
+    )
+    assert plan.live == (
+        FileQuery("valkey", "valkey.conf", None, ("repl-compression", "lz4")),
+        FileQuery("valkey", "src/commands/hsetex.json", "9.1.0", ()),
+        AdvisoryQuery("valkey", "CVE-2026-63639"),
+        AdvisoryQuery("valkey", None),
+    )
+    for bad in (
+        '{"lookups":[{"kind":"file","path":"../../etc/passwd"}]}',
+        '{"lookups":[{"kind":"file","path":"a/../b"}]}',
+        '{"lookups":[{"kind":"file","path":"/etc/passwd"}]}',
+        '{"lookups":[{"kind":"file"}]}',
+        '{"lookups":[{"kind":"file","path":"valkey.conf","ref":"../main"}]}',
+        '{"lookups":[{"kind":"file","path":"valkey.conf","around":"repl"}]}',
+        '{"lookups":[{"kind":"file","path":"valkey.conf","around":["a","b","c","d","e"]}]}',
+        '{"lookups":[{"kind":"file","path":"valkey.conf","lines":10}]}',
+        '{"lookups":[{"kind":"advisory","identifier":"GHSA-nope"}]}',
+        '{"lookups":[{"kind":"advisory","identifier":["CVE-2026-63639"]}]}',
+    ):
+        with pytest.raises(LookupRouterError):
+            parse_lookup_plan(bad)
+
+
+def test_a_non_english_question_carries_an_english_retrieval_query() -> None:
+    """The corpus is English, so a question in another language retrieved nothing. The retrieval
+    query is for retrieval only; the answer still sees the asker's own question, so the reply stays
+    in their language."""
+    plan = parse_lookup_plan(
+        '{"lookups":[{"kind":"corpus_search"}],'
+        '"retrieval_query":"How does replication compression work in Valkey?"}'
+    )
+    assert plan.retrieval_query == "How does replication compression work in Valkey?"
+    assert plan.corpus_search is True and plan.question is None
+    assert parse_lookup_plan('{"lookups":[{"kind":"corpus_search"}]}').retrieval_query is None
+    for bad in (
+        '{"lookups":[{"kind":"corpus_search"}],"retrieval_query":""}',
+        '{"lookups":[{"kind":"corpus_search"}],"retrieval_query":"a\\nb"}',
+        '{"lookups":[{"kind":"corpus_search"}],"retrieval_query":123}',
+        '{"lookups":[{"kind":"corpus_search"}],"retrieval_query":"' + "x" * 3000 + '"}',
+    ):
+        with pytest.raises(LookupRouterError):
+            parse_lookup_plan(bad)
