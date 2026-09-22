@@ -111,6 +111,7 @@ def _search_item(
         "repository_url": f"https://api.github.com/repos/{OWNER}/{repository}",
         "number": number,
         "title": "Release status",
+        "user": {"login": "madolson"},
         "body": "Current status",
         "state": "closed",
         "labels": [{"name": "release-tracker", "color": "00ff00"}],
@@ -375,12 +376,14 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
     assert payload == {
         "api_version": "valkeyrie.io/live-github/1",
         "author": None,
+        "authors_of_listed": {"madolson": 2},
         "finding": (
             'The search found 2 issues in valkey-io/valkey matching "release" and "status".'
         ),
         "items": [
             {
                 "api_url": "https://api.github.com/repos/valkey-io/valkey/issues/8",
+                "author": "madolson",
                 "body": "Current status",
                 "body_truncated": False,
                 "closed_at": TIMESTAMP,
@@ -402,6 +405,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
             },
             {
                 "api_url": "https://api.github.com/repos/valkey-io/valkey/issues/9",
+                "author": "madolson",
                 "body": "Current status",
                 "body_truncated": False,
                 "closed_at": TIMESTAMP,
@@ -425,6 +429,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
         "kind": "issue_search",
         "owner": OWNER,
         "per_page": 20,
+        "query": "repo:valkey-io/valkey is:issue release status",
         "repositories": ["valkey"],
         "repository": "valkey",
         "since": None,
@@ -1718,3 +1723,91 @@ def test_an_author_search_carries_the_login_with_or_without_a_window() -> None:
     # No author and no window: the term minimum still holds.
     with pytest.raises(LiveGitHubError, match="requires from 2"):
         read_live_github(IssueSearchQuery((), repository="valkey", kind="issue"), fetch=fetch)
+
+
+def test_a_windowed_search_tallies_every_author_through_graphql_when_the_walk_is_complete() -> None:
+    """ "Who contributed the most this month" is a tally over the whole set; the REST page lists
+    twenty. The same qualifiers through GraphQL return logins only, walked in pages. The tally is
+    present only when the walk covered the set the REST request described; a cut-short walk, a
+    disagreeing count, or any failure omits it rather than counting part as whole."""
+    rest_item = _search_item("valkey-glide", number=4712, pull_request=True)
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        if "valkey-glide" not in url:
+            rest_item_core = _search_item(number=4712, pull_request=True)
+            return _response(
+                {"total_count": 3, "incomplete_results": False, "items": [rest_item_core]}
+            )
+        return _response({"total_count": 3, "incomplete_results": False, "items": [rest_item]})
+
+    seen: list[Mapping[str, object]] = []
+
+    def pages(*bodies: dict[str, object]) -> Any:
+        it = iter(bodies)
+
+        def graphql(
+            query: str, variables: Mapping[str, object], timeout_seconds: float, max_bytes: int
+        ) -> HttpResponse:
+            seen.append(dict(variables))
+            return _response(next(it))
+
+        return graphql
+
+    def page(
+        logins: list[str | None], has_next: bool, cursor: str | None, total: int = 3
+    ) -> dict[str, object]:
+        return {
+            "data": {
+                "search": {
+                    "issueCount": total,
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                    "nodes": [{"author": {"login": x}} if x else {"author": None} for x in logins],
+                }
+            }
+        }
+
+    query = IssueSearchQuery((), repository="valkey-glide", kind="pull-request", since="2026-09-01")
+    payload = json.loads(
+        read_live_github(
+            query,
+            fetch=fetch,
+            projects_fetch=pages(
+                page(["dependabot", "currantw"], True, "c1"), page([None], False, None)
+            ),
+        ).canonical_payload
+    )
+    assert payload["authors_of_all"] == {"(deleted)": 1, "currantw": 1, "dependabot": 1}
+    assert [v["after"] for v in seen] == [None, "c1"]
+    assert (
+        seen[0]["q"]
+        == payload["query"]
+        == ("repo:valkey-io/valkey-glide is:pull-request is:merged merged:>=2026-09-01")
+    )
+
+    # Incomplete: the count says 3, the walk delivered 2 and stopped. No tally.
+    payload = json.loads(
+        read_live_github(
+            query, fetch=fetch, projects_fetch=pages(page(["a", "b"], False, None))
+        ).canonical_payload
+    )
+    assert "authors_of_all" not in payload
+
+    # A failing GraphQL read leaves the REST result intact.
+    def broken(
+        query: str, variables: Mapping[str, object], timeout_seconds: float, max_bytes: int
+    ) -> HttpResponse:
+        raise GitHubReadError("boom")
+
+    payload = json.loads(
+        read_live_github(query, fetch=fetch, projects_fetch=broken).canonical_payload
+    )
+    assert "authors_of_all" not in payload and payload["total_count"] == 3
+    # A topic search without a window is not tallied at all.
+    payload = json.loads(
+        read_live_github(
+            IssueSearchQuery(("release", "status"), repository="valkey"),
+            fetch=fetch,
+            projects_fetch=broken,
+        ).canonical_payload
+    )
+    assert "authors_of_all" not in payload

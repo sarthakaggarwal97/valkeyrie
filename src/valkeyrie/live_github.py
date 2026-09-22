@@ -592,6 +592,12 @@ def read_live_github(
     payload = normalizer(value)
     if isinstance(query, PullRequestQuery) and payload.get("merged_at") is not None:
         payload = _with_release_membership(payload, query.repository, fetch or fetch_public_github)
+    if (
+        isinstance(query, IssueSearchQuery)
+        and query.since is not None
+        and projects_fetch is not None
+    ):
+        payload = _with_author_tally(payload, projects_fetch)
     return create_live_observation(
         observed_at=_observed_at(observed_clock),
         source_url=source_url,
@@ -609,6 +615,79 @@ MAX_RELEASE_MEMBERSHIP_CHECKS: Final = 8
 MEMBERSHIP_COMMIT_PAGE: Final = 50
 # Repositories one supplementary search may span; a question naming more is asking something else.
 MAX_SEARCH_REPOSITORIES: Final = 4
+
+
+AUTHOR_TALLY_QUERY: Final = """\
+query($q: String!, $first: Int!, $after: String) {
+  search(query: $q, type: ISSUE, first: $first, after: $after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest { author { login } }
+      ... on Issue { author { login } }
+    }
+  }
+}
+"""
+# Pages of 100 logins; a month of a busy repository is 150 to 250 items.
+MAX_AUTHOR_TALLY_PAGES: Final = 5
+
+
+def _with_author_tally(
+    payload: dict[str, object], projects_fetch: ProjectsGraphQLFetcher
+) -> dict[str, object]:
+    """Add who authored EVERY item a windowed search matched, not only the page it listed.
+
+    "Who contributed the most this month" is a tally over the whole set, and the REST listing
+    is bounded to twenty items with bodies. The same search through GraphQL returns logins only:
+    94 items measured 3.4 KB in one page. The tally is exact when the walk covered the set and
+    says so; if the walk was cut short or anything failed, the tally is omitted rather than
+    presented as a count of the whole. The qualifiers are the ones the REST request sent, so
+    the two describe the same set.
+    """
+    qualifiers = payload.get("query")
+    if not isinstance(qualifiers, str):
+        return payload
+    tally: dict[str, int] = {}
+    after: str | None = None
+    total: int | None = None
+    complete = False
+    try:
+        for _ in range(MAX_AUTHOR_TALLY_PAGES):
+            response = projects_fetch(
+                AUTHOR_TALLY_QUERY,
+                {"q": qualifiers, "first": MAX_COLLECTION_ITEMS, "after": after},
+                REQUEST_TIMEOUT_SECONDS,
+                MAX_RESPONSE_BYTES,
+            )
+            root = _response_object(response, source="GraphQL")
+            if "errors" in root:
+                return payload
+            search = _object(_object(root.get("data"), "search data").get("search"), "search")
+            page_total = _positive_or_zero_integer(search, "issueCount")
+            if total is None:
+                total = page_total
+            elif page_total != total:
+                return payload
+            for node in _list(search, "nodes"):
+                author = _object(node, "search node").get("author")
+                login = _text(author, "login", 255) if isinstance(author, Mapping) else "(deleted)"
+                tally[login] = tally.get(login, 0) + 1
+            has_next, cursor = _page_info(_object(search.get("pageInfo"), "search pageInfo"))
+            if not has_next:
+                complete = sum(tally.values()) == total
+                break
+            if cursor is None:
+                return payload
+            after = cursor
+    except (GitHubReadError, LiveGitHubError):
+        return payload
+    if not complete:
+        return payload
+    return {
+        **payload,
+        "authors_of_all": dict(sorted(tally.items(), key=lambda pair: (-pair[1], pair[0]))),
+    }
 
 
 def _with_release_membership(
@@ -801,13 +880,17 @@ def _project_page_info(value: Mapping[str, object]) -> tuple[bool, str | None]:
         raise LiveGitHubError("GitHub Projects response lacks page information") from error
     if items.get("pageInfo") is None:
         return False, None
-    info = _object(items.get("pageInfo"), "project pageInfo")
+    return _page_info(_object(items.get("pageInfo"), "project pageInfo"))
+
+
+def _page_info(info: Mapping[str, object]) -> tuple[bool, str | None]:
+    """(has_next_page, end_cursor) from a GraphQL pageInfo object, fail-closed on shape."""
     has_next = _boolean(info, "hasNextPage")
     if not has_next:
         return False, None
     cursor = info.get("endCursor")
     if not isinstance(cursor, str) or not cursor or len(cursor) > 512:
-        raise LiveGitHubError("GitHub Projects page cursor is malformed")
+        raise LiveGitHubError("GitHub page cursor is malformed")
     return True, cursor
 
 
@@ -873,9 +956,10 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
             parameters = {"sort": "updated", "order": "desc"}
         # Without a window, no sort parameter: GitHub has no value that names best match, it is
         # what you get by not asking for a sort. The payload records the ordering by name.
+        search_query = " ".join((*qualifiers, f"is:{query.kind}", *window, *terms))
         encoded_query = urlencode(
             {
-                "q": " ".join((*qualifiers, f"is:{query.kind}", *window, *terms)),
+                "q": search_query,
                 **parameters,
                 "per_page": str(per_page),
             }
@@ -893,6 +977,7 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
                 since=since,
                 until=until,
                 author=author,
+                search_query=search_query,
             ),
         )
     if isinstance(query, LatestReleaseQuery):
@@ -1065,6 +1150,7 @@ def _issue_search(
     since: str | None = None,
     until: str | None = None,
     author: str | None = None,
+    search_query: str | None = None,
 ) -> dict[str, object]:
     incomplete = _boolean(value, "incomplete_results")
     items = _list(value, "items")
@@ -1102,7 +1188,11 @@ def _issue_search(
         "author": author,
         "per_page": per_page,
         "total_count": total_count,
+        "query": search_query,
         "items": normalized,
+        # Authors of the LISTED items, most items first. Over a bounded page this is a tally of
+        # what was listed, not of the whole result set, and the finding says how many were.
+        "authors_of_listed": _author_tally(normalized),
         # The result in words. An empty list read as a gap rather than a finding: on a question
         # about a client library's support for a server feature, the search that showed the
         # library has nothing on it was the answer, and the model abstained for want of it two
@@ -1111,6 +1201,15 @@ def _issue_search(
             kind, terms, repositories, total_count, since, len(normalized), until, author
         ),
     }
+
+
+def _author_tally(items: Sequence[Mapping[str, object]]) -> dict[str, int]:
+    tally: dict[str, int] = {}
+    for item in items:
+        login = item.get("author")
+        if isinstance(login, str):
+            tally[login] = tally.get(login, 0) + 1
+    return dict(sorted(tally.items(), key=lambda pair: (-pair[1], pair[0])))
 
 
 def _search_finding(
@@ -1206,6 +1305,9 @@ def _search_item(
         "repository": repository,
         "number": number,
         "title": _text(value, "title", 1024),
+        # Who authored it. "Who contributed the most this month" is a tally over this field,
+        # which the listing could not support while items carried no author at all.
+        "author": _login(value),
         "body": body,
         "body_truncated": body_truncated,
         "state": _choice(value, "state", {"open", "closed"}),
