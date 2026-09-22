@@ -475,6 +475,7 @@ def _answer(
         requested=requested,
         knowledge_base_id=knowledge_base_id,
         conversation=conversation,
+        today=now[:10],
     )
     if routed is not None:
         evidence, generation_id, plan_knowledge_base_id, evidence_mode, question = routed
@@ -930,6 +931,7 @@ def _routed_evidence(
     requested: str | None,
     knowledge_base_id: str,
     conversation: tuple[ConversationTurn, ...] = (),
+    today: str | None = None,
 ) -> (
     tuple[tuple[RuntimeEvidence, ...], str | None, str | None, Literal["static", "live"], str]
     | None
@@ -948,6 +950,7 @@ def _routed_evidence(
         question,
         lambda system, prompt: services.route(system=system, question=prompt),
         conversation,
+        today=today,
     )
     if plan is None or (not plan.corpus_search and not plan.live):
         return None

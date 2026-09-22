@@ -427,7 +427,9 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
         "per_page": 20,
         "repositories": ["valkey"],
         "repository": "valkey",
+        "since": None,
         "sort": "best-match",
+        "until": None,
         "terms": ["release", "status"],
         "total_count": 2,
     }
@@ -1463,3 +1465,86 @@ def test_a_release_list_keeps_short_notes_for_the_newest_releases_only() -> None
     for release in releases[RELEASE_LIST_BODIES:]:
         assert release["body"] is None and release["body_truncated"] is True
     assert len(json.dumps(payload).encode("utf-8")) < 16 * 1024
+
+
+def test_a_date_window_search_lists_recent_items_with_short_bodies() -> None:
+    """ "What merged this week" is a window with no terms: merged pull requests on or after the
+    day, newest first, bodies cut short so twenty titles fit where five whole bodies did. An issue
+    window is by creation date. The day must be a real calendar day."""
+    from valkeyrie.live_github import MAX_WINDOW_BODY_BYTES
+
+    seen: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        seen.append(url)
+        item = _search_item(number=4747, pull_request=True)
+        item["body"] = "b" * 5000
+        return _response({"total_count": 36, "incomplete_results": False, "items": [item]})
+
+    payload = json.loads(
+        read_live_github(
+            IssueSearchQuery(
+                (), repository="valkey", per_page=20, kind="pull-request", since="2026-09-15"
+            ),
+            fetch=fetch,
+        ).canonical_payload
+    )
+    assert (
+        "q=repo%3Avalkey-io%2Fvalkey+is%3Apull-request+is%3Amerged+merged%3A%3E%3D2026-09-15"
+        in seen[0]
+    )
+    assert "sort=updated&order=desc&per_page=20" in seen[0]
+    assert (
+        payload["since"] == "2026-09-15" and payload["sort"] == "updated" and payload["terms"] == []
+    )
+    item = payload["items"][0]
+    assert (
+        len(item["body"].encode("utf-8")) == MAX_WINDOW_BODY_BYTES
+        and item["body_truncated"] is True
+    )
+    assert payload["finding"] == (
+        "The search found 36 pull requests merged on or after 2026-09-15 in valkey-io/valkey. "
+        "The 1 most recently updated are listed."
+    )
+
+    seen.clear()
+    read_live_github(
+        IssueSearchQuery(("cluster",), repository="valkey", kind="issue", since="2026-09-01"),
+        fetch=fetch,
+    )
+    assert "is%3Aissue+created%3A%3E%3D2026-09-01+cluster" in seen[0]
+
+    for since in ("2026-13-01", "last week", "2026-9-1", "2026-02-30"):
+        with pytest.raises(LiveGitHubError, match="search window"):
+            read_live_github(
+                IssueSearchQuery((), repository="valkey", kind="issue", since=since), fetch=fetch
+            )
+    # A closed window is inclusive on both ends and must be ordered.
+    seen.clear()
+    payload = json.loads(
+        read_live_github(
+            IssueSearchQuery(
+                (), repository="valkey", kind="pull-request", since="2026-08-01", until="2026-08-31"
+            ),
+            fetch=fetch,
+        ).canonical_payload
+    )
+    assert "merged%3A2026-08-01..2026-08-31" in seen[0]
+    assert payload["finding"].startswith(
+        "The search found 36 pull requests merged from 2026-08-01 through 2026-08-31"
+    )
+    with pytest.raises(LiveGitHubError, match="precedes"):
+        read_live_github(
+            IssueSearchQuery(
+                (), repository="valkey", kind="issue", since="2026-08-31", until="2026-08-01"
+            ),
+            fetch=fetch,
+        )
+    with pytest.raises(LiveGitHubError, match="requires a start"):
+        read_live_github(
+            IssueSearchQuery(("a", "b"), repository="valkey", kind="issue", until="2026-08-01"),
+            fetch=fetch,
+        )
+    # Without a window the term minimum still holds.
+    with pytest.raises(LiveGitHubError, match="requires from 2"):
+        read_live_github(IssueSearchQuery((), repository="valkey", kind="issue"), fetch=fetch)

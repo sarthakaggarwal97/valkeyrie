@@ -321,3 +321,63 @@ def test_the_router_may_choose_a_bounded_search() -> None:
         '{"kind":"search","terms":["vector","set"],"scope":"pull-request"}]}'
     )
     assert [q.kind for q in plan.live] == ["issue", "pull-request"]  # type: ignore[union-attr]
+
+
+def test_the_router_may_read_one_release_by_tag_and_search_a_date_window() -> None:
+    """A release list keeps notes for the newest three only, so "what was new in 9.1.0?" needs the
+    release itself. A tag is one path segment. A window is a calendar day and waives the term
+    minimum: "what merged this week" is a window with no terms."""
+    from valkeyrie.live_github import IssueSearchQuery, ReleaseByTagQuery
+
+    plan = parse_lookup_plan(
+        '{"lookups":[{"kind":"release_notes","repository":"valkey","tag":"9.1.0"},'
+        '{"kind":"release_notes","tag":"9.1.0-rc1"},'
+        '{"kind":"release_notes","tag":"9.1.0"},'
+        '{"kind":"search","since":"2026-09-15","scope":"pull-request"},'
+        '{"kind":"search","terms":["cluster"],"since":"2026-09-01","scope":"issue"},'
+        '{"kind":"search","since":"2026-08-01","until":"2026-08-31","scope":"pull-request"}]}'
+    )
+    assert plan.live == (
+        ReleaseByTagQuery("valkey", "9.1.0"),
+        ReleaseByTagQuery("valkey", "9.1.0-rc1"),
+        IssueSearchQuery(
+            (), repository="valkey", per_page=20, kind="pull-request", since="2026-09-15"
+        ),
+        IssueSearchQuery(
+            ("cluster",), repository="valkey", per_page=20, kind="issue", since="2026-09-01"
+        ),
+        IssueSearchQuery(
+            (),
+            repository="valkey",
+            per_page=20,
+            kind="pull-request",
+            since="2026-08-01",
+            until="2026-08-31",
+        ),
+    )
+    for bad in (
+        '{"lookups":[{"kind":"release_notes","tag":"../latest"}]}',
+        '{"lookups":[{"kind":"release_notes","tag":"9.1.0/notes"}]}',
+        '{"lookups":[{"kind":"release_notes","tag":""}]}',
+        '{"lookups":[{"kind":"release_notes","tag":"9.1.0","number":3}]}',
+        '{"lookups":[{"kind":"search","since":"last week"}]}',
+        '{"lookups":[{"kind":"search","until":"2026-09-15"}]}',
+        '{"lookups":[{"kind":"search","since":"2026-09-15","until":"2026-09-01"}]}',
+        '{"lookups":[{"kind":"search","since":"2026-09-15","scope":"pull-request","per_page":50}]}',
+    ):
+        with pytest.raises(LookupRouterError):
+            parse_lookup_plan(bad)
+    # Without a window, no terms is still nothing to search.
+    with pytest.raises(LookupRouterError, match="out of bounds"):
+        parse_lookup_plan('{"lookups":[{"kind":"search","terms":[]}]}')
+
+
+def test_the_router_prompt_carries_today_as_data() -> None:
+    from valkeyrie.lookup_router import ConversationTurn, _router_prompt
+
+    assert _router_prompt("what merged this week", (), today="2026-09-22") == (
+        "Today is 2026-09-22.\nwhat merged this week"
+    )
+    dated = _router_prompt("and last week?", (ConversationTurn("user", "hi"),), today="2026-09-22")
+    assert '"today": "2026-09-22"' in dated and '"current_question": "and last week?"' in dated
+    assert _router_prompt("plain", ()) == "plain"

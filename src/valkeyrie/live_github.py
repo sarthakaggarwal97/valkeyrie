@@ -38,6 +38,13 @@ class IssueSearchQuery:
     # Further repositories to search alongside ``repository``. A cross-repository question
     # ("does valkey-glide support X from valkey 9.2?") is searched in every repository it names.
     repositories: tuple[str, ...] = ()
+    # A date window: pull requests MERGED on or after this day (scope pull-request), or issues
+    # CREATED on or after it (scope issue). "What merged this week" is a window with no terms, so
+    # the term minimum is waived when a window is set; results are then ordered newest first and
+    # bodies cut short, since a period summary wants many titles rather than a few whole bodies.
+    since: str | None = None
+    # The window's last day, inclusive; None means through today. "In August" is since and until.
+    until: str | None = None
     # GitHub requires an explicit is:issue or is:pull-request on authenticated
     # search/issues requests and returns 422 without one. Anonymous requests are not yet
     # enforced, which is why this was invisible until the runtime started authenticating.
@@ -47,6 +54,18 @@ class IssueSearchQuery:
 @dataclass(frozen=True)
 class LatestReleaseQuery:
     repository: str
+
+
+@dataclass(frozen=True)
+class ReleaseByTagQuery:
+    """One release by its tag, with its notes whole.
+
+    A release LIST keeps notes for the newest three only, so anything older ("what was new in
+    9.1.0?") had nothing to answer from. This reads exactly the release the asker named.
+    """
+
+    repository: str
+    tag: str
 
 
 @dataclass(frozen=True)
@@ -84,6 +103,7 @@ LiveGitHubQuery: TypeAlias = (
     | IssueQuery
     | IssueSearchQuery
     | LatestReleaseQuery
+    | ReleaseByTagQuery
     | ReleaseListQuery
     | WorkflowRunQuery
     | CheckRunQuery
@@ -174,10 +194,17 @@ MAX_SEARCH_BODY_BYTES: Final = 16 * 1024
 # Per-release notes bound inside a release LIST; a single release keeps its full notes.
 MAX_RELEASE_LIST_BODY_BYTES: Final = 3 * 1024
 RELEASE_LIST_BODIES: Final = 3
+# Notes of one release read by tag: whole for every release measured (largest 22 KB).
+MAX_RELEASE_NOTES_BYTES: Final = 24 * 1024
+# Body bound per item in a date-window search: many titles, short bodies.
+MAX_WINDOW_BODY_BYTES: Final = 600
+_SEARCH_SINCE: Final = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MAX_SEARCH_PER_PAGE: Final = 20
 # Supplementary searches carry whole issue bodies, so they take a smaller page than
 # a routed search: twenty bodies exceed MAX_RESPONSE_BYTES.
 SUPPLEMENT_PER_PAGE: Final = 5
+# A date-window search lists more, shorter items: bodies are cut at MAX_WINDOW_BODY_BYTES.
+WINDOW_PER_PAGE: Final = 20
 # Best match, GitHub's default when no sort is sent. Ordering by recency ranked any issue that
 # mentioned both words anywhere in a long body above the one titled with them: "vector set"
 # returned a radix tree proposal and an SSCAN bug first, and the vector sets datatype issue not
@@ -769,7 +796,13 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         url = f"{_API_ROOT}/repos/{OWNER}/{repository}/issues/{number}"
         return url, "issue", lambda value: _issue(value, repository, number)
     if isinstance(query, IssueSearchQuery):
-        terms = _search_terms(query.terms)
+        since = _search_since(query.since)
+        until = _search_since(query.until)
+        if until is not None and since is None:
+            raise LiveGitHubError("search window end requires a start")
+        if until is not None and since is not None and until < since:
+            raise LiveGitHubError("search window end precedes its start")
+        terms = _search_terms(query.terms, minimum=0 if since else MIN_SEARCH_TERMS)
         search_repository = _optional_repository(query.repository)
         per_page = _search_per_page(query.per_page)
         scope: tuple[str, ...] = tuple(
@@ -790,11 +823,25 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         qualifiers = [f"repo:{OWNER}/{r}" for r in scope] or [f"org:{OWNER}"]
         if query.kind not in {"issue", "pull-request"}:
             raise LiveGitHubError("issue search kind must be issue or pull-request")
-        # No sort parameter: GitHub has no value that names best match, it is what you get by
-        # not asking for a sort. The payload records the ordering by name so a reader knows.
+        window: list[str] = []
+        parameters: dict[str, str] = {}
+        if since is not None:
+            # A merged window needs is:merged, or unmerged pull requests with a merged date of
+            # nothing would be excluded silently and the count would mislead. Newest first: a
+            # period summary wants the recent end, and best match has nothing to match on.
+            span = f"{since}..{until}" if until else f">={since}"
+            window = (
+                ["is:merged", f"merged:{span}"]
+                if query.kind == "pull-request"
+                else [f"created:{span}"]
+            )
+            parameters = {"sort": "updated", "order": "desc"}
+        # Without a window, no sort parameter: GitHub has no value that names best match, it is
+        # what you get by not asking for a sort. The payload records the ordering by name.
         encoded_query = urlencode(
             {
-                "q": " ".join((*qualifiers, f"is:{query.kind}", *terms)),
+                "q": " ".join((*qualifiers, f"is:{query.kind}", *window, *terms)),
+                **parameters,
                 "per_page": str(per_page),
             }
         )
@@ -802,12 +849,21 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer]:
         return (
             url,
             "issue",
-            lambda value: _issue_search(value, terms, scope or None, per_page, query.kind),
+            lambda value: _issue_search(
+                value, terms, scope or None, per_page, query.kind, since=since, until=until
+            ),
         )
     if isinstance(query, LatestReleaseQuery):
         repository = _repository(query.repository)
         url = f"{_API_ROOT}/repos/{OWNER}/{repository}/releases/latest"
         return url, "release", lambda value: _release(value, repository)
+    if isinstance(query, ReleaseByTagQuery):
+        repository = _repository(query.repository)
+        tag = _tag(query.tag)
+        if "/" in tag or ".." in tag:
+            raise LiveGitHubError("release tag is malformed")
+        url = f"{_API_ROOT}/repos/{OWNER}/{repository}/releases/tags/{quote(tag, safe='')}"
+        return url, "release", lambda value: _release_by_tag(value, repository, tag)
     if isinstance(query, ReleaseListQuery):
         repository = _repository(query.repository)
         per_page = query.per_page
@@ -954,6 +1010,9 @@ def _issue_search(
     repositories: tuple[str, ...] | None,
     per_page: int,
     kind: str = "issue",
+    *,
+    since: str | None = None,
+    until: str | None = None,
 ) -> dict[str, object]:
     incomplete = _boolean(value, "incomplete_results")
     items = _list(value, "items")
@@ -967,7 +1026,10 @@ def _issue_search(
         raise LiveGitHubError("GitHub issue search result is incomplete")
     if len(items) > per_page:
         raise LiveGitHubError("GitHub issue search items exceed the requested page bound")
-    normalized = [_search_item(_object(item, "search item"), repositories) for item in items]
+    normalized = [
+        _search_item(_object(item, "search item"), repositories, compact=since is not None)
+        for item in items
+    ]
     identities = [(item["repository"], item["number"]) for item in normalized]
     if len(identities) != len(set(identities)):
         raise LiveGitHubError("GitHub issue search contains duplicate items")
@@ -978,7 +1040,9 @@ def _issue_search(
         "repository": repositories[0] if repositories and len(repositories) == 1 else None,
         "repositories": list(repositories) if repositories else None,
         "terms": list(terms),
-        "sort": SEARCH_SORT,
+        "sort": "updated" if since else SEARCH_SORT,
+        "since": since,
+        "until": until,
         "per_page": per_page,
         "total_count": total_count,
         "items": normalized,
@@ -986,44 +1050,67 @@ def _issue_search(
         # about a client library's support for a server feature, the search that showed the
         # library has nothing on it was the answer, and the model abstained for want of it two
         # times in five. Every word here is derived from fields above; nothing is added.
-        "finding": _search_finding(kind, terms, repositories, total_count),
+        "finding": _search_finding(
+            kind, terms, repositories, total_count, since, len(normalized), until
+        ),
     }
 
 
 def _search_finding(
-    kind: str, terms: tuple[str, ...], repositories: tuple[str, ...] | None, total_count: int
+    kind: str,
+    terms: tuple[str, ...],
+    repositories: tuple[str, ...] | None,
+    total_count: int,
+    since: str | None = None,
+    shown: int = 0,
+    until: str | None = None,
 ) -> str:
-    what = "pull requests" if kind == "pull-request" else "issues"
+    span = f"from {since} through {until}" if until else f"on or after {since}"
+    if since is None:
+        what = "pull requests" if kind == "pull-request" else "issues"
+    elif kind == "pull-request":
+        what = f"pull requests merged {span}"
+    else:
+        what = f"issues opened {span}"
     where = (
         " or ".join(f"{OWNER}/{r}" for r in repositories)
         if repositories
         else f"the {OWNER} organization"
     )
-    words = " and ".join(f'"{term}"' for term in terms)
+    matching = (
+        " whose title or body contains " + " and ".join(f'"{term}"' for term in terms)
+        if terms
+        else ""
+    )
     if total_count == 0:
         return (
-            f"The search completed and found no {what} in {where} whose title or body contains "
-            f"{words}. This establishes that no such {what} existed there at observation time."
+            f"The search completed and found no {what} in {where}{matching}. This establishes "
+            f"that no such {what} existed there at observation time."
         )
-    return f"The search found {total_count} {what} in {where} whose title or body contains {words}."
+    listed = f" The {shown} most recently updated are listed." if shown < total_count else ""
+    return f"The search found {total_count} {what} in {where}{matching}.{listed}"
 
 
-def _search_body(value: Mapping[str, object]) -> tuple[str | None, bool]:
+def _search_body(value: Mapping[str, object], bound: int | None = None) -> tuple[str | None, bool]:
     """Return a search item body bounded to MAX_SEARCH_BODY_BYTES, and whether it was cut."""
+    limit = MAX_SEARCH_BODY_BYTES if bound is None else bound
     raw = value.get("body")
     if raw is None:
         return None, False
     if type(raw) is not str:
         raise LiveGitHubError("GitHub field body must be a string")
     encoded = raw.encode("utf-8")
-    if len(encoded) <= MAX_SEARCH_BODY_BYTES:
+    if len(encoded) <= limit:
         return raw, False
     # Cut on a character boundary so the retained text is always valid UTF-8.
-    return encoded[:MAX_SEARCH_BODY_BYTES].decode("utf-8", "ignore"), True
+    return encoded[:limit].decode("utf-8", "ignore"), True
 
 
 def _search_item(
-    value: Mapping[str, object], scoped_repositories: tuple[str, ...] | None
+    value: Mapping[str, object],
+    scoped_repositories: tuple[str, ...] | None,
+    *,
+    compact: bool = False,
 ) -> dict[str, object]:
     repository_url = _text(value, "repository_url", 512)
     repository_prefix = f"{_API_ROOT}/repos/{OWNER}/"
@@ -1037,7 +1124,7 @@ def _search_item(
     # 128 KiB the single-issue paths allow. A body over that bound is normal on a long
     # issue and must not discard the whole result set, so it is truncated and the item
     # says so. The observation stays complete: every matching item is still present.
-    body, body_truncated = _search_body(value)
+    body, body_truncated = _search_body(value, MAX_WINDOW_BODY_BYTES if compact else None)
 
     number = _entity_id(_integer(value, "number"), "GitHub search item number")
     api_url = f"{_API_ROOT}/repos/{OWNER}/{repository}/issues/{number}"
@@ -1116,6 +1203,21 @@ def _release(value: Mapping[str, object], repository: str) -> dict[str, object]:
         "api_url": _exact_url(value, "url", api_url),
         "url": _exact_url(value, "html_url", web_url),
     }
+
+
+def _release_by_tag(value: Mapping[str, object], repository: str, tag: str) -> dict[str, object]:
+    release = _release(value, repository)
+    if release["tag"] != tag:
+        raise LiveGitHubError("GitHub release tag conflicts with the query")
+    # Notes whole, within the evidence bound: a major rc's notes measured 22 KB, and the whole
+    # record must still leave room for the other releases a comparison names.
+    body = release.get("body")
+    if isinstance(body, str):
+        encoded = body.encode("utf-8")
+        if len(encoded) > MAX_RELEASE_NOTES_BYTES:
+            release["body"] = encoded[:MAX_RELEASE_NOTES_BYTES].decode("utf-8", "ignore")
+            release["body_truncated"] = True
+    return release
 
 
 def _release_list(value: Mapping[str, object], repository: str, per_page: int) -> dict[str, object]:
@@ -1380,14 +1482,25 @@ def _optional_repository(value: object) -> str | None:
     return _repository(value)
 
 
-def _search_terms(value: object) -> tuple[str, ...]:
+def _search_since(value: object) -> str | None:
+    """A calendar day as YYYY-MM-DD, or None. It is placed in a search qualifier verbatim."""
+    if value is None:
+        return None
+    if type(value) is not str or _SEARCH_SINCE.fullmatch(value) is None:
+        raise LiveGitHubError("search window must be a YYYY-MM-DD day")
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as error:
+        raise LiveGitHubError("search window must be a real calendar day") from error
+    return value
+
+
+def _search_terms(value: object, *, minimum: int = MIN_SEARCH_TERMS) -> tuple[str, ...]:
     if type(value) is not tuple:
         raise LiveGitHubError("search terms must be a tuple")
     raw_terms = cast(tuple[object, ...], value)
-    if not MIN_SEARCH_TERMS <= len(raw_terms) <= MAX_SEARCH_TERMS:
-        raise LiveGitHubError(
-            f"search requires from {MIN_SEARCH_TERMS} through {MAX_SEARCH_TERMS} terms"
-        )
+    if not minimum <= len(raw_terms) <= MAX_SEARCH_TERMS:
+        raise LiveGitHubError(f"search requires from {minimum} through {MAX_SEARCH_TERMS} terms")
     normalized: list[str] = []
     for raw_term in raw_terms:
         if type(raw_term) is not str:

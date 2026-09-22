@@ -1913,7 +1913,8 @@ def test_the_model_router_chooses_lookups_the_keyword_router_could_not(
         _event(question="did anything happen with number 8"), services, root=ROOT, manifest=manifest
     )
 
-    assert services.route_calls == ["did anything happen with number 8"]
+    # The router sees the event's day beside the question: a date window needs it.
+    assert services.route_calls == ["Today is 2026-08-19.\ndid anything happen with number 8"]
     assert services.live_calls == [IssueQuery("valkey", 8)]
     # The keyword path was never consulted: no retrieval happened.
     assert services.retrieve_calls == []
@@ -2095,7 +2096,7 @@ def test_conversation_is_optional_and_bounded_at_the_event_boundary(
     assert (
         run_runtime_event(_event(), services, root=ROOT, manifest=manifest)["outcome"] == "answer"
     )
-    assert services.route_calls[0] == _event()["question"]
+    assert services.route_calls[0] == "Today is 2026-08-19.\n" + str(_event()["question"])
 
     # Malformed history is refused at the boundary, not silently accepted.
     for bad in (
