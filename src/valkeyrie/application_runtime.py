@@ -553,6 +553,7 @@ def _answer(
     # router has nothing to add and could only replace it with semantic retrieval, which it did
     # when its plan was accepted first. The exact route is also never widened by the abstention
     # retry (see plan["route"]), since a searched-for record is not the record that was asked for.
+    resolved_questions: list[str] = []
     routed = (
         None
         if provisional.routes[0] == "exact_lookup"
@@ -563,6 +564,7 @@ def _answer(
             knowledge_base_id=knowledge_base_id,
             conversation=conversation,
             today=now[:10],
+            resolved_out=resolved_questions,
         )
     )
     # Resolved BEFORE the branch so that a live route with no usable query falls through to the
@@ -589,12 +591,15 @@ def _answer(
                     "I couldn’t identify a supported live GitHub query.", _LIVE_TARGET_GUIDANCE
                 ),
             )
-    resolved_from_followup = False
+    # A resolution outlives the lookups that were chosen with it: the keyword path below should
+    # search for the question the asker meant, not the fragment they typed.
+    if routed is None and resolved_questions:
+        question = resolved_questions[-1]
+    resolved_from_followup = bool(resolved_questions)
     if routed is not None:
         evidence, generation_id, plan_knowledge_base_id, evidence_mode, resolved = routed
         # The router returns the standalone form of an elliptical follow-up. A different string
         # here IS the resolution, so nothing new has to be threaded back from the router.
-        resolved_from_followup = resolved != question
         question = resolved
     elif query is not None:
         try:
@@ -1141,11 +1146,18 @@ def _routed_evidence(
     knowledge_base_id: str,
     conversation: tuple[ConversationTurn, ...] = (),
     today: str | None = None,
+    resolved_out: list[str] | None = None,
 ) -> (
     tuple[tuple[RuntimeEvidence, ...], str | None, str | None, Literal["static", "live"], str]
     | None
 ):
     """Let the model choose the lookups, then execute exactly those.
+
+    ``resolved_out`` receives the standalone form of an elliptical follow-up as soon as the router
+    produces it, so a resolution SURVIVES this function returning None. The two are independent:
+    "and what about for 8.1?" resolved correctly every draw and was then discarded together with a
+    corpus search that happened to retrieve nothing, leaving the keyword path to route a fragment
+    that means nothing on its own, which came back as a clarification.
 
     Returns None whenever the keyword path should run instead: the router failed, chose nothing,
     or every lookup it chose failed. The router adds phrasing coverage; it never removes a
@@ -1168,6 +1180,8 @@ def _routed_evidence(
     # of them sees the history. The audit keeps the original under request_digest.
     if plan.question is not None:
         question = _bounded_text(plan.question, "resolved question", _MAX_QUESTION_BYTES)
+        if resolved_out is not None:
+            resolved_out.append(question)
 
     records: list[RuntimeEvidence] = []
     generation_id: str | None = None

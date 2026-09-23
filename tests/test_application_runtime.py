@@ -3118,3 +3118,42 @@ def test_one_bad_claim_drops_itself_and_the_others_survive() -> None:
             ),
             evidence,
         )
+
+
+def test_a_resolved_follow_up_survives_lookups_that_find_nothing() -> None:
+    """The resolution and the lookups chosen with it are independent. A corpus search that
+    retrieved nothing used to discard the resolved question too, leaving the keyword path to route
+    a fragment that means nothing on its own."""
+    from typing import Any as _Any
+
+    from valkeyrie.application_runtime import _routed_evidence
+    from valkeyrie.lookup_router import ConversationTurn
+
+    class _NoGeneration:
+        def route(self, *, system: str, question: str) -> str:
+            return json.dumps(
+                {
+                    "question": "How are fixes backported to the 8.1 release branch?",
+                    "lookups": [{"kind": "corpus_search"}],
+                }
+            )
+
+        def read_generation(self, requested: str | None) -> None:
+            return None
+
+    resolved: list[str] = []
+    assert (
+        _routed_evidence(
+            cast(_Any, _NoGeneration()),
+            "and what about for 8.1?",
+            requested=None,
+            knowledge_base_id="kb",
+            conversation=(
+                ConversationTurn("user", "How are fixes backported to a release branch?"),
+                ConversationTurn("assistant", "They are cherry-picked from unstable."),
+            ),
+            resolved_out=resolved,
+        )
+        is None
+    ), "no generation means the keyword path runs"
+    assert resolved == ["How are fixes backported to the 8.1 release branch?"]
