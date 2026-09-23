@@ -223,20 +223,30 @@ _GREETING: Final = re.compile(
     r"(?:\s+(?:there|all|team|folks|everyone|valkeyrie|bot))?[\s!.?,]*",
     re.IGNORECASE,
 )
+# What a person writes INSTEAD of a secret. A question about configuring a client is the ordinary
+# reason to type "Authorization: Bearer <YOUR_TOKEN>", and refusing it withheld an answer to
+# protect a secret that was never there. Matched only where a value is expected.
+_PLACEHOLDER: Final = (
+    r"(?i:[<{\[](?:[^>}\]]{0,40})[>}\]]"
+    r"|(?:your|my|the)[-_]?(?:token|secret|password|key)[a-z0-9_-]*"
+    r"|x{6,}|\.{3,}|\*{6,}"
+    r"|(?:not[-_]a[-_]real|dummy|placeholder|example|redacted|changeme|todo)[a-z0-9_.-]*)"
+)
 # Credential shapes a person might paste into a Slack question. Deliberately narrow: each
 # alternative is a token format with a fixed prefix or an unmistakable PEM header, so an ordinary
-# question about a command or a hash is never refused.
+# question about a command or a hash is never refused. A bare AWS access-key ID is deliberately
+# NOT here: it identifies rather than authenticates, it cannot be used without its secret, and
+# AWS's own public example AKIAIOSFODNN7EXAMPLE appears in ordinary documentation questions.
 _CREDENTIAL: Final = re.compile(
     r"(?:gh[pousr]_[A-Za-z0-9]{16,}"
     r"|github_pat_[A-Za-z0-9_]{20,}"
     r"|xox[abprs]-[A-Za-z0-9-]{10,}"
-    r"|ASIA[A-Z0-9]{16}|AKIA[A-Z0-9]{16}"
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
     r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
     # A labelled secret: the name says what it is, so the value does not have to be recognisable.
     r"|(?i:(?:secret|token|password|passwd|api[_-]?key|access[_-]?key)"
-    r"(?:_?[a-z]+)?\s*[:=]\s*)\S{12,}"
-    r"|(?i:authorization\s*:\s*(?:bearer|basic)\s+)\S{12,})"
+    r"(?:_?[a-z]+)?\s*[:=]\s*)(?!" + _PLACEHOLDER + r")\S{12,}"
+    r"|(?i:authorization\s*:\s*(?:bearer|basic)\s+)(?!" + _PLACEHOLDER + r")\S{12,})"
 )
 # Distinguishes "not yet looked up" from "looked up and absent", so an absent token is
 # not re-fetched on every question.
@@ -453,7 +463,12 @@ def _answer(
     conversation = _conversation(event.get("conversation"))
     request_id = cast(str, event["request_id"])
     question = _bounded_text(event["question"], "question", _MAX_QUESTION_BYTES)
-    if _GREETING.fullmatch(question.strip()) is not None:
+    # HELLO is a Valkey command, and the greeting pattern is case-insensitive, so a user asking
+    # about the handshake command by name was greeted back. The command is always upper case, and
+    # a person greeting the bot does not shout one word in backticks.
+    asked = question.strip()
+    is_hello_command = asked.strip("`").strip() == "HELLO"
+    if not is_hello_command and _GREETING.fullmatch(asked) is not None:
         # A greeting carries no subject, so there is nothing to retrieve and nothing to ground.
         # Asking back is the right reply and it is the same reply every time; leaving it to the
         # model spent a routing call and an inference to sometimes answer "insufficient evidence"
@@ -945,6 +960,26 @@ def _execute_plan(
     )
 
 
+def _unfenced(response_text: str) -> str | None:
+    """The contents of a single Markdown code fence wrapping the whole response, or None."""
+    text = response_text.strip()
+    if not text.startswith("```") or not text.endswith("```"):
+        return None
+    body = text[3:-3]
+    newline = body.find("\n")
+    if newline == -1:
+        return None
+    # The fence's language tag, which must be a bare word: "json", or nothing at all.
+    tag = body[:newline].strip()
+    if tag and (not tag.isalnum() or len(tag) > 16):
+        return None
+    inner = body[newline + 1 :].strip()
+    # One fence only: a second fence means more than one block, so the response is not one object.
+    if "```" in inner:
+        return None
+    return inner
+
+
 def _accept_output(
     response_text: str,
     evidence: tuple[RuntimeEvidence, ...],
@@ -952,7 +987,17 @@ def _accept_output(
     try:
         value = json.loads(response_text, object_pairs_hook=_unique_object)
     except (UnicodeError, json.JSONDecodeError) as error:
-        raise ApplicationRuntimeError("normalized model response is invalid JSON") from error
+        # A whole answer was discarded for wearing a Markdown fence the prompt told it not to use.
+        # Exactly one fence around exactly one object, with nothing else outside it, is the same
+        # object; prose beside the JSON stays a rejection, because then the model said two things
+        # and there is no way to know which one it meant.
+        unfenced = _unfenced(response_text)
+        if unfenced is None:
+            raise ApplicationRuntimeError("normalized model response is invalid JSON") from error
+        try:
+            value = json.loads(unfenced, object_pairs_hook=_unique_object)
+        except (UnicodeError, json.JSONDecodeError):
+            raise ApplicationRuntimeError("normalized model response is invalid JSON") from error
     if not isinstance(value, Mapping) or set(value) not in (
         {"api_version", "kind", "outcome", "claims"},
         {"api_version", "kind", "outcome", "question"},

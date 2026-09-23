@@ -771,3 +771,56 @@ def test_content_and_marketing_questions_do_not_scope_to_the_code_repositories()
         "what is the content of an RDB file?",
     ):
         assert "valkey" in derive_retrieval_intent(technical).repositories, technical
+
+
+def test_indexed_sibling_repositories_are_reachable_by_their_natural_names() -> None:
+    """Every one of these is in the corpus, and a question that named it in ordinary words fell
+    through to the core/docs default and abstained while the repository sat unsearched."""
+    for query, expected in (
+        ("How do I configure the Valkey Helm chart?", "valkey-helm"),
+        ("Does the Valkey Operator support cluster mode?", "valkey-operator"),
+        ("How do I run the Valkey docker image?", "valkey-container"),
+        ("How do I run the fuzzer?", "valkey-fuzzer"),
+        ("How do I use Spring Data Valkey?", "spring-data-valkey"),
+        ("What does the test framework cover?", "valkey-test-framework"),
+    ):
+        assert expected in derive_retrieval_intent(query).repositories, query
+    # The default is unchanged for questions that name no sibling.
+    assert derive_retrieval_intent("how does HSET work?").repositories == ("valkey", "valkey-doc")
+
+
+def test_a_meeting_question_keeps_the_community_repository_across_a_clause() -> None:
+    """ "What did the TSC discuss in its September meeting?" put four words between the body and
+    the meeting word and lost the community repository entirely."""
+    for query in (
+        "What did the TSC discuss in its September meeting?",
+        "Where are the TSC meeting notes?",
+        "Where are governance meeting notes recorded?",
+        "Are there minutes from the last technical steering committee call and meeting?",
+    ):
+        assert "community" in derive_retrieval_intent(query).repositories, query
+    # A question about the body itself, with no meeting in it, still goes to the core repository.
+    assert derive_retrieval_intent("How does the Valkey TSC make decisions?").repositories == (
+        "valkey",
+    )
+    assert derive_retrieval_intent("How is Valkey governed?").repositories == (
+        "valkey",
+        "valkey-io.github.io",
+    )
+
+
+def test_core_server_commands_are_not_sent_to_module_or_client_repositories() -> None:
+    for query in ("How does MODULE LOAD work?", "How does CLIENT LIST report status?"):
+        assert derive_retrieval_intent(query).repositories == ("valkey", "valkey-doc"), query
+    assert derive_retrieval_intent("what does valkey-bloom provide?").repositories == (
+        "valkey-bloom",
+    )
+
+
+def test_the_event_loop_is_core_and_not_a_community_event() -> None:
+    assert derive_retrieval_intent(
+        "How does the Valkey event loop process callbacks?"
+    ).repositories == ("valkey", "valkey-doc")
+    assert (
+        "community" in derive_retrieval_intent("which upcoming Valkey events are on?").repositories
+    )

@@ -2683,8 +2683,8 @@ def test_a_question_carrying_a_credential_is_refused_before_anything_reads_it(
     for shape in (
         "xoxb-1234567890-abcdefghij",
         "github_pat_11ABCDEFG0aBcDeFgHiJkLmNoPqRsTuVwXyZ",
-        "AKIAIOSFODNN7EXAMPLE",
         "-----BEGIN RSA PRIVATE KEY-----",
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g",
     ):
         assert (
@@ -2712,6 +2712,24 @@ def test_a_question_carrying_a_credential_is_refused_before_anything_reads_it(
         manifest=manifest,
     )
     assert result["outcome"] == "answer", "an ordinary question must not be screened out"
+
+    # An identifier is not a secret, and a placeholder is what someone writes INSTEAD of one.
+    # Both were refused, which withheld an answer to protect a secret that was never present.
+    for allowed in (
+        "How do I store AKIAIOSFODNN7EXAMPLE as a hash field?",
+        "Is Authorization: Bearer <YOUR_TOKEN_HERE> valid in a client config?",
+        "Does valkey.conf accept password=not-a-real-password?",
+        "is my token: xxxxxxxxxxxxxx accepted",
+    ):
+        assert (
+            run_runtime_event(
+                _event(request_id=f"req_ok-{abs(hash(allowed)) % 9999}", question=allowed),
+                FakeServices(),
+                root=ROOT,
+                manifest=manifest,
+            )["outcome"]
+            == "answer"
+        ), allowed
 
 
 def test_every_request_row_carries_the_tables_ttl_attribute(manifest: dict[str, object]) -> None:
@@ -2974,3 +2992,37 @@ def test_the_clarification_note_reaches_the_model_payload() -> None:
         assert sent["question"] == "Content for social media and blogs"
         if expected:
             assert sent["clarification_already_asked"] == note
+
+
+def test_one_json_fence_around_the_whole_response_is_accepted() -> None:
+    """A whole grounded answer was discarded for wearing a Markdown fence the prompt told it not
+    to use. Prose beside the JSON is still a rejection: then the model said two things."""
+    from valkeyrie.application_runtime import _unfenced
+
+    assert _unfenced('```json\n{"a": 1}\n```') == '{"a": 1}'
+    assert _unfenced('```\n{"a": 1}\n```') == '{"a": 1}'
+    assert _unfenced('{"a": 1}') is None
+    assert _unfenced('Here you go:\n```json\n{"a": 1}\n```') is None
+    assert _unfenced('```json\n{"a": 1}\n``` and a second thought') is None
+    assert _unfenced('```json\n{"a": 1}\n```\n```json\n{"b": 2}\n```') is None
+
+
+def test_the_hello_command_is_not_treated_as_a_greeting(manifest: dict[str, object]) -> None:
+    """HELLO is a Valkey command and the greeting pattern is case-insensitive, so asking about the
+    handshake command by name was greeted back instead of answered."""
+    for greeted in ("hi", "hello", "Hello", "thanks", "hey there"):
+        result = run_runtime_event(
+            _event(request_id=f"req_g-{abs(hash(greeted)) % 9999}", question=greeted),
+            FakeServices(),
+            root=ROOT,
+            manifest=manifest,
+        )
+        assert result["outcome"] == "clarification", greeted
+    for asked in ("HELLO", "`HELLO`", "HELLO 3"):
+        result = run_runtime_event(
+            _event(request_id=f"req_h-{abs(hash(asked)) % 9999}", question=asked),
+            FakeServices(),
+            root=ROOT,
+            manifest=manifest,
+        )
+        assert result["outcome"] == "answer", asked

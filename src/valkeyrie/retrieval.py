@@ -192,9 +192,13 @@ _FEATURE_ALIASES: Final = (
     (
         re.compile(
             r"\b(?:workstream|working group"
-            # Meeting minutes and notes live in valkey-io/community, including the TSC's.
-            r"|(?:community|tsc|technical steering committee|governance)\s+"
-            r"(?:meeting|meetings|minutes|notes|agenda)"
+            # A meeting body and the meeting word only have to share a clause: "what did the TSC
+            # discuss in its September meeting?" put four words between them and lost the
+            # community repository entirely. Minutes are not published as files or issues
+            # anywhere in the org, so the valkey repository is in scope for GOVERNANCE.md and the
+            # website for the events calendar: a useful answer beats a bare negative finding.
+            r"|(?:community|tsc|technical steering committee|governance)\b[^.;:!?]*"
+            r"\b(?:meeting|meetings|minutes|agenda)"
             r"|meeting\s+(?:minutes|notes|agenda))\b",
             re.IGNORECASE,
         ),
@@ -218,14 +222,21 @@ _CATEGORY_SCOPES: Final = (
         # The TSC itself is documented in the core repository, but its MEETINGS are minuted in
         # valkey-io/community, so that wording is left to the meeting scope below.
         re.compile(
+            # Defers whenever the clause mentions a meeting at all, not only when the next word
+            # does: "what did the TSC discuss in its September meeting?" is a meeting question.
             r"\b(?:technical steering committee|tsc)\b"
-            r"(?!\s+(?:meeting|meetings|minutes|notes|agenda))",
+            r"(?![^.;:!?]*\b(?:meeting|meetings|minutes|agenda)\b)",
             re.IGNORECASE,
         ),
         ("valkey",),
     ),
     (
-        re.compile(r"\bgovern(?:ance|s|ed|ing)?\b", re.IGNORECASE),
+        # Same deferral: a governance MEETING is a meeting question first.
+        re.compile(
+            r"\bgovern(?:ance|s|ed|ing)?\b"
+            r"(?![^.;:!?]*\b(?:meeting|meetings|minutes|agenda)\b)",
+            re.IGNORECASE,
+        ),
         ("valkey", "valkey-io.github.io"),
     ),
     (
@@ -248,9 +259,13 @@ _CATEGORY_SCOPES: Final = (
     (
         re.compile(
             r"\b(?:workstream|working group"
-            # Meeting minutes and notes live in valkey-io/community, including the TSC's.
-            r"|(?:community|tsc|technical steering committee|governance)\s+"
-            r"(?:meeting|meetings|minutes|notes|agenda)"
+            # A meeting body and the meeting word only have to share a clause: "what did the TSC
+            # discuss in its September meeting?" put four words between them and lost the
+            # community repository entirely. Minutes are not published as files or issues
+            # anywhere in the org, so the valkey repository is in scope for GOVERNANCE.md and the
+            # website for the events calendar: a useful answer beats a bare negative finding.
+            r"|(?:community|tsc|technical steering committee|governance)\b[^.;:!?]*"
+            r"\b(?:meeting|meetings|minutes|agenda)"
             r"|meeting\s+(?:minutes|notes|agenda))\b",
             re.IGNORECASE,
         ),
@@ -296,6 +311,31 @@ _CLIENT_ALIASES: Final = MappingProxyType(
         "valkey-swift": ("swift client",),
     }
 )
+# What people call these repositories when they do not type the repository name. Every one of them
+# is indexed, and without an alias the question fell through to the core/docs default and abstained
+# with "no evidence about the Valkey Helm chart" while valkey-helm sat in the corpus unsearched.
+_SIBLING_ALIASES: Final[tuple[tuple[re.Pattern[str], tuple[str, ...]], ...]] = (
+    (re.compile(r"\bhelm\b", re.IGNORECASE), ("valkey-helm", "valkey-doc")),
+    (re.compile(r"\boperator\b", re.IGNORECASE), ("valkey-operator", "valkey-doc")),
+    (
+        re.compile(r"\b(?:docker|container|image|podman)\b", re.IGNORECASE),
+        ("valkey-container", "valkey-doc"),
+    ),
+    (re.compile(r"\bfuzz(?:er|ing)?\b", re.IGNORECASE), ("valkey-fuzzer",)),
+    (
+        re.compile(r"\b(?:test framework|tcl test|test suite)\b", re.IGNORECASE),
+        ("valkey-test-framework", "valkey"),
+    ),
+    (
+        re.compile(
+            r"\b(?:benchmark|benchmarking|valkey-benchmark|perf(?:ormance)? test)\b", re.IGNORECASE
+        ),
+        ("valkey-perf-benchmark", "valkey", "valkey-doc"),
+    ),
+    (re.compile(r"\bspring(?:\s+(?:boot|data))?\b", re.IGNORECASE), ("spring-data-valkey",)),
+    (re.compile(r"\bnamespac(?:e|ing|es)\b", re.IGNORECASE), ("valkey-namespace", "valkey")),
+    (re.compile(r"\bprovenance\b", re.IGNORECASE), ("verify-provenance", "valkey")),
+)
 _CORE_PRIORITY: Final = MappingProxyType({"valkey": 0, "valkey-doc": 1})
 
 
@@ -330,6 +370,10 @@ def _requested_repositories(query: str) -> tuple[str, ...]:
         if _contains_term(re.sub(r"valkey-[a-z0-9.-]+", " ", query, flags=re.IGNORECASE), "valkey"):
             return (*explicit, "valkey")
         return explicit
+
+    for pattern, repositories in _SIBLING_ALIASES:
+        if pattern.search(query):
+            return repositories
 
     if re.search(
         r"\bstart release\b|\brelease control\b|\b(?:build|package) publication\b",
