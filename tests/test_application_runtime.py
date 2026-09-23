@@ -237,6 +237,7 @@ class FakeServices:
         evidence: tuple[RuntimeEvidence, ...],
         maximum_output_tokens: int,
         reasoning_effort: str,
+        clarification_asked: str | None = None,
     ) -> BedrockTextResponse:
         self.model_calls.append(
             {
@@ -2894,3 +2895,82 @@ def test_an_extra_claim_field_is_ignored_and_a_missing_one_is_fatal(
         ]
         == "error"
     )
+
+
+def test_a_clarification_already_asked_is_shown_to_the_answer_turn() -> None:
+    """The answer turn sees the standalone question and no history, so the only way it can obey
+    the prompt's rule against asking a second clarification is to be told the first one."""
+    from valkeyrie.application_runtime import _clarification_already_asked, _conversation
+
+    asked = [
+        {"role": "user", "text": "how does the Valkey project handle content?"},
+        {"role": "assistant", "text": "Do you mean stored data, or project governance?"},
+    ]
+    assert (
+        _clarification_already_asked(_conversation(asked))
+        == "Do you mean stored data, or project governance?"
+    )
+    # An answered thread is not a pending clarification: the last assistant turn is a claim.
+    answered = [
+        {"role": "user", "text": "what is HSET?"},
+        {"role": "assistant", "text": "HSET sets field values in a hash."},
+    ]
+    assert _clarification_already_asked(_conversation(answered)) is None
+    # A first question in the thread has no prior clarification to suppress.
+    assert _clarification_already_asked(_conversation([{"role": "user", "text": "hi?"}])) is None
+    assert _clarification_already_asked(()) is None
+    # Only the MOST RECENT assistant turn decides: an older clarification that was answered and
+    # followed by a real answer must not keep suppressing clarification forever.
+    stale = [
+        {"role": "user", "text": "content?"},
+        {"role": "assistant", "text": "Which content did you mean?"},
+        {"role": "user", "text": "blogs"},
+        {"role": "assistant", "text": "Blog posts start with a GitHub issue."},
+    ]
+    assert _clarification_already_asked(_conversation(stale)) is None
+
+
+def test_the_clarification_note_reaches_the_model_payload() -> None:
+    """It travels as its own labelled field, never folded into the question: the question is what
+    the plan pins and what replay validates."""
+    import json as _json
+
+    from valkeyrie.application_runtime import AwsRuntimeServices
+
+    captured: dict[str, object] = {}
+
+    class _Client:
+        def converse(self, **kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return {
+                "output": {"message": {"content": [{"text": "{}"}]}},
+                "stopReason": "end_turn",
+            }
+
+    class _Boto3:
+        def client(self, name: str) -> _Client:
+            return _Client()
+
+    services = AwsRuntimeServices.__new__(AwsRuntimeServices)
+    object.__setattr__(services, "_model_id", "arn:model")
+    object.__setattr__(services, "_boto3", lambda: _Boto3())
+    for note, expected in ((None, False), ("Which guidelines did you mean?", True)):
+        captured.clear()
+        services.converse(
+            model_id="arn:model",
+            system=("rules",),
+            question="Content for social media and blogs",
+            evidence=(),
+            maximum_output_tokens=1000,
+            reasoning_effort="high",
+            clarification_asked=note,
+        )
+        sent = _json.loads(
+            cast(list[dict[str, list[dict[str, str]]]], captured["messages"])[0]["content"][0][
+                "text"
+            ]
+        )
+        assert ("clarification_already_asked" in sent) is expected
+        assert sent["question"] == "Content for social media and blogs"
+        if expected:
+            assert sent["clarification_already_asked"] == note

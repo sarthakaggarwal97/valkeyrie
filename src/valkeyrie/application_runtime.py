@@ -193,6 +193,7 @@ class RuntimeServices(Protocol):
         evidence: tuple[RuntimeEvidence, ...],
         maximum_output_tokens: int,
         reasoning_effort: str,
+        clarification_asked: str | None = None,
     ) -> BedrockTextResponse: ...
 
     def route(self, *, system: str, question: str) -> str:
@@ -680,6 +681,12 @@ def _answer(
         "question": question,
         "evidence_mode": evidence_mode,
         "route": "exact_lookup" if provisional.routes[0] == "exact_lookup" else "semantic",
+        # The clarification this conversation ALREADY asked, or None. The answer turn sees the
+        # standalone question and no history (see the note in _model_routed_evidence), so without
+        # this it cannot know the question in the thread was its own, and it asked a second
+        # clarification in 3 of 4 draws while holding the evidence for every reading. The answer
+        # prompt's rule about a clarification already asked had nothing to read.
+        "clarification_asked": _clarification_already_asked(conversation),
         # Set true by the one abstention retry, in the same revision that widens the evidence.
         "retry_attempted": False,
         "generation_id": generation_id,
@@ -824,6 +831,7 @@ def _execute_plan(
             evidence=evidence,
             maximum_output_tokens=cast(int, plan["maximum_output_tokens"]),
             reasoning_effort=cast(str, plan["reasoning_effort"]),
+            clarification_asked=_plan_clarification_asked(plan),
         )
     except Exception:
         return RuntimeResult(
@@ -1180,6 +1188,7 @@ def _retry_with_supplement(
             evidence=widened,
             maximum_output_tokens=cast(int, plan["maximum_output_tokens"]),
             reasoning_effort=cast(str, plan["reasoning_effort"]),
+            clarification_asked=_plan_clarification_asked(plan),
         )
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
         output = _accept_output(normalized.response_text, widened)
@@ -1672,6 +1681,7 @@ def _existing_plan(
         "question",
         "evidence_mode",
         "route",
+        "clarification_asked",
         "retry_attempted",
         "generation_id",
         "knowledge_base_id",
@@ -1693,6 +1703,31 @@ def _existing_plan(
         raise ApplicationRuntimeError("pinned execution route is unsupported")
     _plan_generation_id(plan)
     return plan, revision, fence
+
+
+def _clarification_already_asked(conversation: tuple[ConversationTurn, ...]) -> str | None:
+    """The most recent clarification this conversation asked, or None.
+
+    An assistant turn that ends in a question mark is one: every assistant turn is either a
+    clarification, an answer built from claims, or an abstention, and only the first ends that way.
+    """
+    for turn in reversed(conversation):
+        if turn.role != "assistant":
+            continue
+        text = turn.text.strip()
+        if text.endswith("?"):
+            return text
+        return None
+    return None
+
+
+def _plan_clarification_asked(plan: Mapping[str, object]) -> str | None:
+    value = plan.get("clarification_asked")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApplicationRuntimeError("pinned clarification is malformed")
+    return value
 
 
 def _plan_generation_id(plan: Mapping[str, object]) -> str | None:
@@ -2592,13 +2627,18 @@ class AwsRuntimeServices:
         evidence: tuple[RuntimeEvidence, ...],
         maximum_output_tokens: int,
         reasoning_effort: str,
+        clarification_asked: str | None = None,
     ) -> BedrockTextResponse:
         if model_id != self._model_id:
             raise ApplicationRuntimeError("pinned model target differs from deployed selection")
-        model_input = {
+        model_input: dict[str, object] = {
             "question": question,
             "evidence": [_evidence_value(item) for item in evidence],
         }
+        # Named for what the answer prompt already forbids: asking a second clarification once the
+        # user has answered the first. Its own earlier question, nothing else from the thread.
+        if clarification_asked is not None:
+            model_input["clarification_already_asked"] = clarification_asked
         response = (
             self._boto3()
             .client("bedrock-runtime")
