@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -847,7 +848,16 @@ def _execute_plan(
     try:
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
         outcome, claims, citations, message = _accept_output(normalized.response_text, evidence)
-    except (ApplicationRuntimeError, BedrockResponseError, DraftingError):
+    except (ApplicationRuntimeError, BedrockResponseError, DraftingError) as rejection:
+        # The asker gets one generic sentence, which is right: the reason names an internal screen.
+        # Nothing recorded it, so an error was unexplainable after the fact and a rare screen
+        # false positive could not be told from a malformed response. These messages are fixed
+        # strings plus a field name, never asker or evidence text.
+        print(
+            f"answer rejected: {type(rejection).__name__}: {rejection}",
+            file=sys.stderr,
+            flush=True,
+        )
         terminal_at = _completion_timestamp(completion_clock, completed_at)
         failed = RuntimeResult(
             "error",
