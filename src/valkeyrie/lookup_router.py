@@ -148,7 +148,10 @@ ROUTER_SYSTEM: Final = (
     "Use the vocabulary the project uses, not the asker's paraphrase. An optional "
     '"since":"YYYY-MM-DD" restricts a pull-request search to those MERGED on or after that day '
     'and an issue search to those OPENED on or after it; an optional "until":"YYYY-MM-DD" closes '
-    'the window on that day inclusive. With a window the terms may be empty, so "what merged '
+    "the window on that day inclusive. A window counts MERGED pull requests by default; add "
+    '"window":"created" for a question about pull requests OPENED or FILED in the period, since '
+    "answering that with merged ones answers a different question. With a window the terms may be "
+    'empty, so "what merged '
     'this week" is a search with since and no terms, and "what happened in August" is since the '
     'An optional "state" of "open" or "closed" and up to three "labels" filter by issue state and '
     'repository label, and both waive the terms: "how many open bugs are there" is state open '
@@ -319,7 +322,12 @@ _NEGATION: Final[frozenset[str]] = frozenset({"no", "not", "never", "without", "
 _STOP: Final[frozenset[str]] = frozenset(
     "a an and are be but can could did do does for from has have how in is it its of on or that "
     "the this those to was were what when where which who why will with would you your about "
-    "any yet not so if as at by up out then there here them they he she we i me my our us".split()
+    "any yet not so if as at by up out then there here them they he she we i me my our us "
+    # How the asker asked, not what they asked about. "Give me the exact command" resolves to a
+    # question that names the command, and "give" cannot survive into it, so requiring it threw
+    # the resolution away and left a fragment that retrieves nothing. Dropping these cannot let a
+    # poisoned history swap the subject: every subject word still has to survive.
+    "give show tell list explain provide send share get please thanks also again".split()
 )
 
 
@@ -445,6 +453,7 @@ def _live_lookup(kind: str, item: Mapping[str, object]) -> LiveGitHubQuery | Non
                 "scope",
                 "since",
                 "until",
+                "window",
                 "author",
                 "state",
                 "labels",
@@ -491,6 +500,14 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
     """
     since = _window_day(item.get("since"))
     until = _window_day(item.get("until"))
+    raw_window = item.get("window")
+    window: str | None = None
+    if raw_window is not None:
+        if raw_window not in ("merged", "created"):
+            raise LookupRouterError("search window field is unsupported")
+        if since is None:
+            raise LookupRouterError("search window field needs a window")
+        window = "created" if raw_window == "created" else "merged"
     if until is not None and (since is None or until < since):
         raise LookupRouterError("search window is malformed")
     author = item.get("author")
@@ -555,6 +572,7 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
         kind=scope,
         since=since,
         until=until,
+        window=window,
         author=author,
         state=state,
         labels=tuple(labels),

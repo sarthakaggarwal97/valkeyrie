@@ -142,10 +142,13 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     (
         "a link",
         re.compile(
-            # "Edit valkey.conf/foo" was read as a domain. Schemes, www., and the hosts an answer
-            # might actually link to; a file path with an extension is not a link.
+            # A scheme, www., or any host with a path. Slack auto-links a bare domain, so a
+            # model-authored one is as clickable as a real link and qualification counts it as a
+            # fabricated citation. The last label must be a plausible public suffix, so
+            # valkey.conf/foo stays a file path.
             r"\b(?:https?|ftp)://|\bwww\.|"
-            r"\b(?:github\.com|api\.github\.com|valkey\.io|[a-z0-9-]+\.github\.io)/",
+            r"\b[a-z0-9-]+(?:\.[a-z0-9-]+)*"
+            r"\.(?:com|org|net|io|dev|sh|app|co|ai|me|info|edu|gov|cloud|xyz)/[a-z0-9]",
             re.IGNORECASE,
         ),
     ),

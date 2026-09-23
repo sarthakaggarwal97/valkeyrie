@@ -48,6 +48,11 @@ class IssueSearchQuery:
     since: str | None = None
     # The window's last day, inclusive; None means through today. "In August" is since and until.
     until: str | None = None
+    # Which date the window applies to for a pull-request search: "merged" (the default, what
+    # "what shipped last week" means) or "created". A window always meant merged, so "which pull
+    # requests were OPENED this month" was answered with merged ones and then abstained because
+    # the evidence did not match the question. An issue search has only a creation date.
+    window: str | None = None
     # A GitHub login: only items this user authored. "What has madolson contributed" is an author
     # search with no terms; searching the login as a word finds mentions, not authorship.
     author: str | None = None
@@ -1329,11 +1334,8 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
             # nothing would be excluded silently and the count would mislead. Newest first: a
             # period summary wants the recent end, and best match has nothing to match on.
             span = f"{since}..{until}" if until else f">={since}"
-            window.extend(
-                ["is:merged", f"merged:{span}"]
-                if query.kind == "pull-request"
-                else [f"created:{span}"]
-            )
+            by_creation = query.window == "created" or query.kind != "pull-request"
+            window.extend([f"created:{span}"] if by_creation else ["is:merged", f"merged:{span}"])
             parameters = {"sort": "updated", "order": "desc"}
         # Without a window, no sort parameter: GitHub has no value that names best match, it is
         # what you get by not asking for a sort. The payload records the ordering by name.
@@ -1361,6 +1363,7 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
                 state=state,
                 labels=labels,
                 search_query=search_query,
+                window=query.window,
             ),
         )
     if isinstance(query, LatestReleaseQuery):
@@ -1565,6 +1568,7 @@ def _issue_search(
     state: str | None = None,
     labels: tuple[str, ...] = (),
     search_query: str | None = None,
+    window: str | None = None,
 ) -> dict[str, object]:
     incomplete = _boolean(value, "incomplete_results")
     items = _list(value, "items")
@@ -1624,6 +1628,7 @@ def _issue_search(
             author,
             state,
             labels,
+            window,
         ),
     }
 
@@ -1648,12 +1653,15 @@ def _search_finding(
     author: str | None = None,
     state: str | None = None,
     labels: tuple[str, ...] = (),
+    window: str | None = None,
 ) -> str:
     span = f"from {since} through {until}" if until else f"on or after {since}"
     if since is None:
         what = "pull requests" if kind == "pull-request" else "issues"
     elif kind == "pull-request":
-        what = f"pull requests merged {span}"
+        # The finding must name the date the window actually used, or the model reads a list of
+        # merged pull requests as an answer about opened ones.
+        what = f"pull requests {'opened' if window == 'created' else 'merged'} {span}"
     else:
         what = f"issues opened {span}"
     if state is not None:

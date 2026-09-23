@@ -5,7 +5,7 @@ revision:
   canonical_order: lexical_path
   newline_normalization: lf
   derived_field: prompt_revision
-  prompt_revision: sha256:b5a4b3c3aa5f8b26e747099546bd03412c00ea6ef8340104d3f20426baec8ed4
+  prompt_revision: sha256:8f22ff01135092d29318a0fd1d229266bd2a5e74b2aeac9ab5dca1b621357961
   prompt_revision_is_not_part_of_preimage: true
 output_contract: evidence_ids_only_for_citations
 prompts:

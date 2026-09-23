@@ -248,6 +248,10 @@ def _format(result: dict[str, Any]) -> str:
                 f"  <{c.split(': ', 1)[-1]}|{_plain(c.split(': ', 1)[0])}>" for c in citations
             )
             body += f"\n\n*Sources*\n{sources}"
+        if message:
+            # An answer may carry one limitation: the part of the question the evidence did not
+            # support. It is the difference between a useful partial answer and a silent gap.
+            body = f"{body}\n\n_{_plain(message)}_"
         return body
 
     # No claims is not one situation. A clarification is the assistant asking something

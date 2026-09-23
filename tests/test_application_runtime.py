@@ -238,6 +238,7 @@ class FakeServices:
         maximum_output_tokens: int,
         reasoning_effort: str,
         clarification_asked: str | None = None,
+        resolved_from_followup: bool = False,
     ) -> BedrockTextResponse:
         self.model_calls.append(
             {
@@ -3026,3 +3027,94 @@ def test_the_hello_command_is_not_treated_as_a_greeting(manifest: dict[str, obje
             manifest=manifest,
         )
         assert result["outcome"] == "answer", asked
+
+
+def test_an_answer_may_carry_one_limitation() -> None:
+    """A question with a grounded half and an unsupported half abstained whole. The limitation
+    names the gap so the supported half still reaches the user."""
+    from valkeyrie.application_runtime import _accept_output
+
+    evidence = (
+        StaticRuntimeEvidence(
+            "ev_a",
+            "Valkey is an in-memory data store.",
+            "gen",
+            "valkey",
+            "README.md",
+            "a" * 40,
+            "primary",
+            "none",
+            "sha256:" + "0" * 64,
+            "https://github.com/valkey-io/valkey/blob/a/README.md",
+        ),
+    )
+    body = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": "answer",
+        "claims": [
+            {
+                "claim_id": "c1",
+                "text": "Valkey is an in-memory data store.",
+                "evidence_ids": ["ev_a"],
+            }
+        ],
+        "limitation": "The evidence does not cover the 9.2 release date.",
+    }
+    outcome, claims, _citations, message = _accept_output(json.dumps(body), evidence)
+    assert (outcome, len(claims)) == ("answer", 1)
+    assert message == "The evidence does not cover the 9.2 release date."
+    # A limitation is screened like any other model text.
+    bad = {**body, "limitation": "See https://example.invalid/x for the rest."}
+    from valkeyrie.drafting import DraftingError as _DraftingError
+
+    with pytest.raises((ApplicationRuntimeError, _DraftingError)):
+        _accept_output(json.dumps(bad), evidence)
+
+
+def test_one_bad_claim_drops_itself_and_the_others_survive() -> None:
+    """A single claim that omitted a field turned a whole correct answer into the generic error."""
+    from valkeyrie.application_runtime import _accept_output
+
+    evidence = (
+        StaticRuntimeEvidence(
+            "ev_a",
+            "Valkey is an in-memory data store.",
+            "gen",
+            "valkey",
+            "README.md",
+            "b" * 40,
+            "primary",
+            "none",
+            "sha256:" + "0" * 64,
+            "https://github.com/valkey-io/valkey/blob/b/README.md",
+        ),
+    )
+    body = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": "answer",
+        "claims": [
+            {
+                "claim_id": "good",
+                "text": "Valkey is an in-memory data store.",
+                "evidence_ids": ["ev_a"],
+            },
+            {"claim_id": "no-evidence-field", "text": "Something else."},
+            {"claim_id": "unknown-id", "text": "Third.", "evidence_ids": ["ev_missing"]},
+            # The same id twice is the support set it already had, so the duplicate is removed.
+            {"claim_id": "dupe-ids", "text": "Fourth.", "evidence_ids": ["ev_a", "ev_a"]},
+        ],
+    }
+    outcome, claims, _citations, _message = _accept_output(json.dumps(body), evidence)
+    assert outcome == "answer"
+    assert [c["claim_id"] for c in claims] == ["good", "dupe-ids"]
+    assert claims[1]["evidence_ids"] == ["ev_a"]
+    # Every claim failing is still a failure: nothing ungrounded may be presented as an answer.
+    with pytest.raises(ApplicationRuntimeError):
+        _accept_output(
+            json.dumps(
+                {**body, "claims": [{"claim_id": "x", "text": "y", "evidence_ids": ["ev_nope"]}]}
+            ),
+            evidence,
+        )
