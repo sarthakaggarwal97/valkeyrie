@@ -1016,6 +1016,15 @@ def _accept_output(
         # and there is no way to know which one it meant.
         unfenced = _unfenced(response_text)
         if unfenced is None:
+            # The REASON alone could not distinguish a fence from prose from a truncated object, so
+            # this failure was unfixable after the fact: it is rare, and it never reproduced on
+            # demand. A bounded prefix of the model's own text names the shape. Model output about
+            # Valkey, capped, and only on the path that is already discarding it.
+            print(
+                f"unparseable model response: {response_text[:160]!r} (len {len(response_text)})",
+                file=sys.stderr,
+                flush=True,
+            )
             raise ApplicationRuntimeError("normalized model response is invalid JSON") from error
         try:
             value = json.loads(unfenced, object_pairs_hook=_unique_object)
