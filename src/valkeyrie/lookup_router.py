@@ -208,9 +208,15 @@ ROUTER_SYSTEM: Final = (
     "- WHO owns, maintains or should be asked about something: a file lookup for "
     '{"repository":"valkey","path":"MAINTAINERS.md"}, which lists the maintainers by area, '
     "alongside corpus_search for the governance and contribution material.\n"
-    "- A CODE EXAMPLE in a language: corpus_search plus a directory lookup in that language's "
-    "client repository to find where its examples or tests live, then a file lookup to read one. "
-    "Real code from the library beats prose describing it.\n"
+    "- A CODE EXAMPLE or a FULL PROGRAM in a language: a file lookup that READS the example, not "
+    "only a directory listing that shows it exists. A listing without the file gives the answer "
+    "a filename and no code, and it will rightly refuse to write a program it was not shown. The "
+    "GLIDE examples live at known paths, so read them directly: "
+    "valkey-glide examples/java/src/main/java/glide/examples/ClusterExample.java and "
+    "StandaloneExample.java; examples/python/cluster_example.py and standalone_example.py; "
+    "examples/node/cluster_example.ts and standalone_example.ts. For any other language or client, "
+    "use a directory lookup first to find the file, then read it. Real code from the library "
+    "beats prose describing it.\n"
     "\n"
     "When earlier turns of the conversation are supplied, the question may be a follow-up that "
     'only makes sense with them ("and what about failover?", "is that merged yet?", '

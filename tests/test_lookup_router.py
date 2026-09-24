@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -513,3 +514,18 @@ def test_a_non_english_question_carries_an_english_retrieval_query() -> None:
     ):
         with pytest.raises(LookupRouterError):
             parse_lookup_plan(bad)
+
+
+def test_every_example_path_the_router_is_told_about_is_one_that_was_verified() -> None:
+    """These paths are written into the router's instructions, so a wrong one sends every code
+    question to a 404. Each was read from valkey-glide before being listed; the Go paths I first
+    wrote down did not exist and were removed rather than guessed at again. Changing this list
+    means re-checking it against the repository, not editing the expectation."""
+    from valkeyrie.lookup_router import ROUTER_SYSTEM
+
+    named = set(re.findall(r"examples/[a-z]+/[A-Za-z0-9_/.]+\.(?:java|py|ts|go)", ROUTER_SYSTEM))
+    assert named == {
+        "examples/java/src/main/java/glide/examples/ClusterExample.java",
+        "examples/python/cluster_example.py",
+        "examples/node/cluster_example.ts",
+    }

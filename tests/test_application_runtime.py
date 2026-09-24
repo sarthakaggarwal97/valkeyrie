@@ -3299,3 +3299,55 @@ def test_the_retry_writes_one_terminal_result_when_both_draws_fail(
     assert len(services.model_calls) == 2, "one retry, not more"
     completions = [call for call in services.requests.values() if call.get("outcome") == "error"]
     assert len(completions) <= 1, "exactly one terminal write"
+
+
+def test_a_claim_carrying_a_program_may_exceed_the_prose_bound() -> None:
+    """At 4 KB the one claim that answered "give me a full java program" dropped itself, because
+    the GLIDE Java cluster example alone is 7 KB, and the reply was left with a filename."""
+    from valkeyrie.application_runtime import (
+        _MAX_CODE_CLAIM_BYTES,
+        _accept_output,
+        _has_code_block,
+    )
+
+    evidence = (
+        StaticRuntimeEvidence(
+            "ev_a",
+            "example",
+            "gen",
+            "valkey-glide",
+            "examples/java/ClusterExample.java",
+            "c" * 40,
+            "primary",
+            "none",
+            "sha256:" + "0" * 64,
+            "https://github.com/valkey-io/valkey-glide/blob/c/examples/java/ClusterExample.java",
+        ),
+    )
+
+    def output(text: str) -> str:
+        return json.dumps(
+            {
+                "api_version": "valkeyrie.io/model-output/1",
+                "kind": "ModelOutput",
+                "outcome": "answer",
+                "claims": [{"claim_id": "c1", "text": text, "evidence_ids": ["ev_a"]}],
+            }
+        )
+
+    program = "A complete program:\n```java\n" + 'client.set("k", "v").get();\n' * 300 + "```"
+    assert 4096 < len(program.encode()) < _MAX_CODE_CLAIM_BYTES
+    assert _has_code_block(program)
+    assert _accept_output(output(program), evidence)[0] == "answer"
+
+    # The same length of PROSE is still refused, so the larger bound buys code and nothing else.
+    prose = "Valkey is fast. " * 400
+    with pytest.raises(ApplicationRuntimeError):
+        _accept_output(output(prose), evidence)
+    # And code is still bounded.
+    huge = "x:\n```java\n" + "a" * (_MAX_CODE_CLAIM_BYTES + 10) + "\n```"
+    with pytest.raises(ApplicationRuntimeError):
+        _accept_output(output(huge), evidence)
+    # Two fences, or text after the fence, is not the one shape the prompt permits.
+    assert not _has_code_block("a\n```x```\n```y```")
+    assert not _has_code_block("a\n```x\n``` trailing prose")

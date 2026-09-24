@@ -1057,6 +1057,14 @@ class _UnparseableModelOutput(ApplicationRuntimeError):
     """
 
 
+_MAX_CODE_CLAIM_BYTES: Final = 16 * 1024
+
+
+def _has_code_block(value: object) -> bool:
+    """A claim ending in one complete fenced block, the only Markdown the answer prompt permits."""
+    return isinstance(value, str) and value.count("```") == 2 and value.rstrip().endswith("```")
+
+
 def _unfenced(response_text: str) -> str | None:
     """The contents of a single Markdown code fence wrapping the whole response, or None."""
     text = response_text.strip()
@@ -1148,7 +1156,12 @@ def _accept_output(
             if not isinstance(raw, Mapping) or not {"claim_id", "text", "evidence_ids"} <= set(raw):
                 raise ApplicationRuntimeError("model claim has a missing field")
             claim_id = raw["claim_id"]
-            text = _bounded_text(raw["text"], "claim text", 4096)
+            # A prose claim stays at 4 KB. A claim that carries a code block may be larger, because
+            # a complete example program is: the GLIDE Java cluster example alone is 7 KB, and at
+            # 4 KB the one claim that answered "give me a full java program" dropped itself and left
+            # a filename. Still bounded, so one claim cannot become the whole evidence budget.
+            limit = _MAX_CODE_CLAIM_BYTES if _has_code_block(raw["text"]) else 4096
+            text = _bounded_text(raw["text"], "claim text", limit)
             ids = raw["evidence_ids"]
             if not isinstance(claim_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", claim_id):
                 raise ApplicationRuntimeError("model claim ID is malformed")
@@ -1162,7 +1175,7 @@ def _accept_output(
                 or any(not isinstance(item, str) or item not in known for item in ids)
             ):
                 raise ApplicationRuntimeError("model claim evidence is unknown or missing")
-            _screened_model_text(text, "claim text", 4096)
+            _screened_model_text(text, "claim text", limit)
         except (ApplicationRuntimeError, DraftingError) as rejection:
             dropped.append(str(rejection))
             continue

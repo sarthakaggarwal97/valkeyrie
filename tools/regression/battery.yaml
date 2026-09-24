@@ -250,3 +250,8 @@
   question: we use Jedis, how do we move to Valkey?
   expect: answer
   because: The legacy client name has to select the Valkey library people are moving to.
+
+- id: copilot-full-program
+  question: give me a full java program to connect with valkey in cluster mode?
+  expect: answer
+  because: "Failed four ways: out of output tokens, a listing not a read, a 4 KB claim cap, and a code comment tripping a prose screen."

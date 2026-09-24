@@ -461,10 +461,34 @@ def _is_readiness_deferral(value: str) -> bool:
     return True
 
 
+# The screens that judge what the ASSISTANT asserts, as opposed to what text may contain at all.
+# Quoted source code is not the assistant speaking: GLIDE's cluster example carries the comment
+# "Send PING to all primaries (according to Valkey's PING request_policy)", and reading that as the
+# assistant claiming a source's authority dropped the only claim that answered "give me a full java
+# program". These three are applied to the prose around a code block and not to the code inside it.
+# Links, evidence IDs and citation labels are still checked everywhere, code included, because those
+# are about what the reader can click or be misled by rather than about whose voice it is.
+_VOICE_SCREENS: Final = frozenset(
+    {
+        "a source-authority declaration",
+        "a release-readiness decision",
+        "a completed project-state write",
+    }
+)
+_CODE_BLOCK: Final = re.compile(r"```[A-Za-z0-9+#-]{0,16}\n.*?```\s*$", re.DOTALL)
+
+
 def _screened_model_text(value: str, field: str, maximum: int) -> None:
     _bounded_text(value, field, maximum)
+    # The prose alone: everything before the single trailing fence, when there is exactly one.
+    prose = value
+    if value.count("```") == 2:
+        match = _CODE_BLOCK.search(value)
+        if match is not None:
+            prose = value[: match.start()]
     for label, pattern in _PROHIBITED_MODEL_TEXT:
-        if pattern.search(value) is None:
+        target = prose if label in _VOICE_SCREENS else value
+        if pattern.search(target) is None:
             continue
         # One exemption, for one rule. A readiness question may be answered with facts plus who
         # decides, and "whether X is ready to release is the maintainers' decision" is the

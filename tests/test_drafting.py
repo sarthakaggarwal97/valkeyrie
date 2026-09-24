@@ -796,3 +796,33 @@ def test_a_project_artifact_may_be_called_the_source_of_truth() -> None:
     ):
         with pytest.raises(DraftingError, match="source-authority declaration"):
             _screened_model_text(refused, "claim text", 4096)
+
+
+def test_quoted_code_is_not_the_assistant_speaking() -> None:
+    """GLIDE's cluster example carries "Send PING to all primaries (according to Valkey's PING
+    request_policy)", and reading that as the assistant claiming a source's authority dropped the
+    only claim that answered "give me a full java program"."""
+    from valkeyrie.drafting import _screened_model_text
+
+    program = (
+        "A complete program:\n```java\n"
+        "// Send PING to all primaries (according to Valkey's PING request_policy)\n"
+        "client.ping().get();\n```"
+    )
+    _screened_model_text(program, "claim text", 16384)
+
+    # The prose around the code is still the assistant speaking, and is still screened.
+    with pytest.raises(DraftingError):
+        _screened_model_text(
+            "According to the docs this is right.\n```java\nclient.ping();\n```",
+            "claim text",
+            16384,
+        )
+    # A link or an evidence ID is refused inside code too: those are about what a reader can
+    # click or be misled by, not about whose voice it is.
+    for leaking in (
+        "A program:\n```java\n// see https://evil.example/x\nclient.ping();\n```",
+        "A program:\n```java\n// cite ev_abc123\nclient.ping();\n```",
+    ):
+        with pytest.raises(DraftingError):
+            _screened_model_text(leaking, "claim text", 16384)
