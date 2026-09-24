@@ -884,3 +884,45 @@ def test_routing_and_migration_questions_reach_the_places_that_answer_them() -> 
         "is Valkey a drop-in replacement?",
     ):
         assert "valkey-io.github.io" in derive_retrieval_intent(query).repositories, query
+
+
+def test_a_client_migration_searches_the_client_people_are_moving_to() -> None:
+    """A client migration is the most common migration there is, and the work is in the client, so
+    scoping it to the server and its documentation answered a question nobody asked."""
+    for query, expected in (
+        ("how do I migrate from redis-py to valkey-py?", "valkey-py"),
+        ("we use Jedis, how do we move to Valkey?", "valkey-java"),
+        ("migrating an ioredis app to Valkey", "iovalkey"),
+        ("moving from go-redis, what changes?", "valkey-go"),
+        ("StackExchange.Redis migration to Valkey", "valkey-glide-csharp"),
+        ("does spring-data-redis work with Valkey?", "spring-data-valkey"),
+        ("migrating my Python app to Valkey", "valkey-py"),
+    ):
+        assert expected in derive_retrieval_intent(query).repositories, query
+
+    # "spring-data-redis" matched the bare word "spring" and was answered about spring-data-valkey
+    # alone, so the legacy-client names are resolved before the sibling aliases.
+    assert "valkey-java" in derive_retrieval_intent("does spring-data-redis work?").repositories
+
+    # An error from a legacy client is two questions: the client's behaviour and the server's error.
+    assert derive_retrieval_intent("redis-py throws WRONGTYPE against Valkey").repositories == (
+        "valkey-py",
+        "valkey-glide",
+        "valkey-doc",
+        "valkey",
+    )
+
+    # Two rules can both contribute the documentation, and it must appear once.
+    for query in (
+        "migrating my Python app to Valkey",
+        "how do I migrate from redis-py to valkey-py?",
+    ):
+        repositories = derive_retrieval_intent(query).repositories
+        assert len(repositories) == len(set(repositories)), query
+
+    # A server-to-server migration is unchanged.
+    assert derive_retrieval_intent("how do I migrate from Redis 7.2 to Valkey?").repositories == (
+        "valkey",
+        "valkey-doc",
+        "valkey-io.github.io",
+    )

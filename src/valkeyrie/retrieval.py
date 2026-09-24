@@ -252,7 +252,7 @@ _ROUTING: Final = re.compile(
 # repository and the documentation, and the website carries the migration guidance.
 _MIGRATION: Final = re.compile(
     r"\bmigrat(?:e|ing|ion)\b|\bupgrad(?:e|ing)\b|\bdowngrad(?:e|ing)\b"
-    r"|\b(?:moving|switch(?:ing)?|coming|port(?:ing)?)\s+(?:from|to)\s+(?:redis|valkey)\b"
+    r"|\b(?:mov(?:e|ing)|switch(?:ing)?|coming|port(?:ing)?)\s+(?:from|to)\s+(?:redis|valkey)\b"
     r"|\bdrop[- ]in\s+replacement\b|\bbackward[s]?\s+compatib\w*\b",
     re.IGNORECASE,
 )
@@ -290,6 +290,49 @@ _EXAMPLE_LANGUAGES: Final[tuple[tuple[re.Pattern[str], tuple[str, ...]], ...]] =
         ("libvalkey", "valkey", "valkey-doc"),
     ),
 )
+# The client someone is coming FROM, and the Valkey library that answers questions about coming to
+# it. A client migration is the most common migration there is, and scoping it to the server and its
+# documentation answered a question nobody asked: the work is in the client, so the client's own
+# repository has to be searched. GLIDE is included with each because it is the official client and
+# the usual destination.
+_LEGACY_CLIENTS: Final[tuple[tuple[re.Pattern[str], tuple[str, ...]], ...]] = (
+    (
+        re.compile(r"\bredis[-_ ]?py\b|\bpy-?redis\b", re.IGNORECASE),
+        ("valkey-py", "valkey-glide", "valkey-doc"),
+    ),
+    (
+        re.compile(r"\b(?:jedis|lettuce|redisson)\b", re.IGNORECASE),
+        ("valkey-java", "valkey-glide", "valkey-doc"),
+    ),
+    (
+        re.compile(r"\b(?:ioredis|node[-_ ]?redis)\b", re.IGNORECASE),
+        ("iovalkey", "valkey-glide", "valkey-doc"),
+    ),
+    (
+        re.compile(r"\b(?:go[-_ ]?redis|rueidis|redigo)\b", re.IGNORECASE),
+        ("valkey-go", "valkey-glide", "valkey-doc"),
+    ),
+    (
+        re.compile(r"\bstackexchange\.?redis\b|\bservicestack\.redis\b", re.IGNORECASE),
+        ("valkey-glide-csharp", "valkey-doc"),
+    ),
+    (
+        re.compile(r"\bhiredis\b|\bredis-plus-plus\b|\bredis\+\+\b", re.IGNORECASE),
+        ("libvalkey", "valkey-glide-cpp", "valkey-doc"),
+    ),
+    (
+        re.compile(r"\bredis[-_ ]?rb\b|\bruby[-_ ]?redis\b", re.IGNORECASE),
+        ("valkey-glide-ruby", "valkey-doc"),
+    ),
+    (
+        re.compile(r"\b(?:phpredis|predis)\b", re.IGNORECASE),
+        ("valkey-glide-php", "valkey-doc"),
+    ),
+    (
+        re.compile(r"\bspring[-_ ]data[-_ ]redis\b", re.IGNORECASE),
+        ("spring-data-valkey", "valkey-java", "valkey-doc"),
+    ),
+)
 _CATEGORY_SCOPES: Final = (
     (
         re.compile(r"\b(?:skills summary|valkey-skills)\b", re.IGNORECASE),
@@ -299,7 +342,10 @@ _CATEGORY_SCOPES: Final = (
     # client library name, because the error text is the subject.
     (_TROUBLESHOOTING, ("valkey", "valkey-doc")),
     (_ROUTING, ("community", "valkey", "valkey-doc")),
-    (_MIGRATION, ("valkey", "valkey-doc", "valkey-io.github.io")),
+    (
+        _MIGRATION,
+        ("valkey", "valkey-doc", "valkey-io.github.io"),
+    ),  # widened below when a client is named
     (
         # The TSC itself is documented in the core repository, but its MEETINGS are minuted in
         # valkey-io/community, so that wording is left to the meeting scope below.
@@ -434,6 +480,11 @@ def derive_retrieval_intent(query: str) -> RetrievalIntent:
     return RetrievalIntent(expanded, repositories)
 
 
+def _unique(repositories: tuple[str, ...]) -> tuple[str, ...]:
+    """Order-preserving deduplication: two rules can both contribute the documentation."""
+    return tuple(dict.fromkeys(repositories))
+
+
 def _requested_repositories(query: str) -> tuple[str, ...]:
     explicit = tuple(
         repository
@@ -454,8 +505,23 @@ def _requested_repositories(query: str) -> tuple[str, ...]:
         # "valkey-py throws WRONGTYPE" is two questions in one: what the client did, and what the
         # error means. The error is defined by the server, so both are in scope.
         if _TROUBLESHOOTING.search(query) is not None:
-            return (*explicit, "valkey", "valkey-doc")
+            return _unique((*explicit, "valkey", "valkey-doc"))
+        # "How do I migrate from redis-py to valkey-py?" names the destination, and the answer is
+        # partly the server's compatibility statement, so the documentation belongs in scope too.
+        if _MIGRATION.search(query) is not None:
+            return _unique((*explicit, "valkey", "valkey-doc"))
         return explicit
+
+    # The client someone is coming FROM, or reporting an error from, decides which library answers.
+    # Before the sibling aliases, because "spring-data-redis" matched the bare word "spring" and was
+    # answered about spring-data-valkey alone, and before the category scopes, so a client migration
+    # is not answered by the server by itself. Unioned with the core repository for a migration or a
+    # pasted error, since both are partly about server behaviour.
+    for pattern, repositories in _LEGACY_CLIENTS:
+        if pattern.search(query):
+            if _MIGRATION.search(query) is not None or _TROUBLESHOOTING.search(query) is not None:
+                return _unique((*repositories, "valkey", "valkey-doc"))
+            return repositories
 
     for pattern, repositories in _SIBLING_ALIASES:
         if pattern.search(query):
@@ -470,6 +536,11 @@ def _requested_repositories(query: str) -> tuple[str, ...]:
 
     for pattern, repositories in _CATEGORY_SCOPES:
         if pattern.search(query):
+            # A migration that names a language rather than a client still needs that library.
+            if pattern is _MIGRATION:
+                for language, libraries in _EXAMPLE_LANGUAGES:
+                    if language.search(query):
+                        return _unique((*libraries, *repositories))
             return repositories
 
     # A code example belongs to a client library, chosen by the language named. Without a language

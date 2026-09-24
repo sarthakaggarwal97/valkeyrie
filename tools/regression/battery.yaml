@@ -240,3 +240,13 @@
   question: upgrading from 8.1 to 9.0, what breaks?
   expect: answer
   because: Migration spans release notes, compatibility statements and the website guidance.
+
+- id: copilot-client-migration
+  question: how do I migrate from redis-py to valkey-py?
+  expect: answer
+  because: A client migration was scoped to the server, so the library that answers it was unsearched.
+
+- id: copilot-client-migration-java
+  question: we use Jedis, how do we move to Valkey?
+  expect: answer
+  because: The legacy client name has to select the Valkey library people are moving to.
