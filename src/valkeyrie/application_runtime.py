@@ -944,39 +944,47 @@ def _execute_plan(
     try:
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
         outcome, claims, citations, message = _accept_output(normalized.response_text, evidence)
+    except _UnparseableModelOutput as truncated:
+        # Nothing has been written at this point, so a second draw costs latency and nothing else.
+        # A response cut off mid-claim is the one failure a retry fixes, and it was the only
+        # remaining cause of "I couldn't produce a reliable answer" in the regression battery.
+        print(f"retrying after: {truncated}", file=sys.stderr, flush=True)
+        try:
+            response = services.converse(
+                model_id=cast(str, plan["model_id"]),
+                system=tuple(cast(list[str], plan["system"])),
+                question=cast(str, plan["question"]),
+                evidence=evidence,
+                maximum_output_tokens=cast(int, plan["maximum_output_tokens"]),
+                reasoning_effort=cast(str, plan["reasoning_effort"]),
+                clarification_asked=_plan_clarification_asked(plan),
+                resolved_from_followup=plan.get("resolved_from_followup") is True,
+                previous_answer=_plan_previous_answer(plan),
+            )
+            normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
+            outcome, claims, citations, message = _accept_output(normalized.response_text, evidence)
+        except (ApplicationRuntimeError, BedrockResponseError, DraftingError) as rejection:
+            return _failed_answer(
+                services,
+                rejection,
+                request_id=request_id,
+                generation_id=generation_id,
+                revision=revision,
+                fence=fence,
+                completion_clock=completion_clock,
+                completed_at=completed_at,
+            )
     except (ApplicationRuntimeError, BedrockResponseError, DraftingError) as rejection:
-        # The asker gets one generic sentence, which is right: the reason names an internal screen.
-        # Nothing recorded it, so an error was unexplainable after the fact and a rare screen
-        # false positive could not be told from a malformed response. These messages are fixed
-        # strings plus a field name, never asker or evidence text.
-        print(
-            f"answer rejected: {type(rejection).__name__}: {rejection}",
-            file=sys.stderr,
-            flush=True,
-        )
-        terminal_at = _completion_timestamp(completion_clock, completed_at)
-        failed = RuntimeResult(
-            "error",
-            request_id,
-            "I couldn’t produce a reliable answer. Please try again.",
-            generation_id=generation_id,
-            request_revision=revision + 1,
-            request_fence=fence,
-        )
-        if not services.complete_request(
+        return _failed_answer(
+            services,
+            rejection,
             request_id=request_id,
+            generation_id=generation_id,
             revision=revision,
             fence=fence,
-            outcome="error",
-            completed_at=terminal_at,
-            # Recorded like a success so a redelivery replays this message instead of hitting
-            # "already terminal", which surfaced to the asker as a lifecycle error.
-            result=_replayable_result(failed),
-        ):
-            return RuntimeResult(
-                "partial", request_id, "Request completion could not be confirmed."
-            )
-        return failed
+            completion_clock=completion_clock,
+            completed_at=completed_at,
+        )
     if (
         outcome == "abstention"
         and plan.get("evidence_mode") == "static"
@@ -1041,6 +1049,14 @@ def _execute_plan(
     )
 
 
+class _UnparseableModelOutput(ApplicationRuntimeError):
+    """The model's reply was not one JSON object: usually a response cut off mid-claim.
+
+    Distinct from every other rejection because it is the one a SECOND DRAW fixes. A screen
+    rejection or a schema violation would come back the same way; a truncated response is luck.
+    """
+
+
 def _unfenced(response_text: str) -> str | None:
     """The contents of a single Markdown code fence wrapping the whole response, or None."""
     text = response_text.strip()
@@ -1073,7 +1089,7 @@ def _accept_output(
         # object; prose beside the JSON stays a rejection, because then the model said two things
         # and there is no way to know which one it meant.
         unfenced = _unfenced(response_text)
-        if unfenced is None:
+        if unfenced is None:  # noqa: SIM102 - the diagnostic below belongs to this branch
             # The REASON alone could not distinguish a fence from prose from a truncated object, so
             # this failure was unfixable after the fact: it is rare, and it never reproduced on
             # demand. A bounded prefix of the model's own text names the shape. Model output about
@@ -1083,11 +1099,11 @@ def _accept_output(
                 file=sys.stderr,
                 flush=True,
             )
-            raise ApplicationRuntimeError("normalized model response is invalid JSON") from error
+            raise _UnparseableModelOutput("normalized model response is invalid JSON") from error
         try:
             value = json.loads(unfenced, object_pairs_hook=_unique_object)
         except (UnicodeError, json.JSONDecodeError):
-            raise ApplicationRuntimeError("normalized model response is invalid JSON") from error
+            raise _UnparseableModelOutput("normalized model response is invalid JSON") from error
     if not isinstance(value, Mapping) or set(value) not in (
         {"api_version", "kind", "outcome", "claims"},
         # An answer may carry ONE limitation: the part of the question its evidence does not
@@ -1181,6 +1197,55 @@ def _accept_output(
     text = _bounded_text(limitation, "answer limitation", 512)
     _screened_model_text(text, "answer limitation", 512)
     return "answer", tuple(claims), citations, text
+
+
+def _failed_answer(
+    services: RuntimeServices,
+    rejection: Exception,
+    *,
+    request_id: str,
+    generation_id: str | None,
+    revision: int,
+    fence: int,
+    completion_clock: Callable[[], str] | None,
+    completed_at: str,
+) -> RuntimeResult:
+    """One generic sentence to the asker, the real reason to the log, one terminal write.
+
+    Shared by the first attempt and the retry so both record the same way: the retry must not be
+    able to write a second terminal result, and the reason must not be lost because it was the
+    second failure rather than the first.
+    """
+    # The asker gets one generic sentence, which is right: the reason names an internal screen.
+    # Nothing recorded it, so an error was unexplainable after the fact and a rare screen false
+    # positive could not be told from a malformed response. These messages are fixed strings plus a
+    # field name, never asker or evidence text.
+    print(
+        f"answer rejected: {type(rejection).__name__}: {rejection}",
+        file=sys.stderr,
+        flush=True,
+    )
+    terminal_at = _completion_timestamp(completion_clock, completed_at)
+    failed = RuntimeResult(
+        "error",
+        request_id,
+        "I couldn’t produce a reliable answer. Please try again.",
+        generation_id=generation_id,
+        request_revision=revision + 1,
+        request_fence=fence,
+    )
+    if not services.complete_request(
+        request_id=request_id,
+        revision=revision,
+        fence=fence,
+        outcome="error",
+        completed_at=terminal_at,
+        # Recorded like a success so a redelivery replays this message instead of hitting
+        # "already terminal", which surfaced to the asker as a lifecycle error.
+        result=_replayable_result(failed),
+    ):
+        return RuntimeResult("partial", request_id, "Request completion could not be confirmed.")
+    return failed
 
 
 def _redacted(question: str) -> tuple[str, int]:

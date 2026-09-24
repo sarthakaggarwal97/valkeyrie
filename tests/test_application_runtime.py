@@ -3261,3 +3261,41 @@ def test_a_question_about_this_service_is_answered_by_the_application(
     # capability that disappears must fail here rather than quietly become a lie.
     for promise in ("cites them", "issues and pull requests", "directory", "act on your behalf"):
         assert promise in _CAPABILITY_REPLY
+
+
+def test_a_truncated_model_response_is_retried_once_and_written_once() -> None:
+    """A response cut off mid-claim is the one rejection a second draw fixes, and it was the only
+    remaining cause of "I couldn't produce a reliable answer" in the regression battery. A screen
+    rejection is NOT retried, because it would come back the same way."""
+    from valkeyrie.application_runtime import _accept_output, _UnparseableModelOutput
+
+    # The exception is raised for JSON that is not one object, which is what truncation produces.
+    with pytest.raises(_UnparseableModelOutput):
+        _accept_output('{"api_version":"valkeyrie.io/model-output/1","kind":"Mod', ())
+    with pytest.raises(_UnparseableModelOutput):
+        _accept_output("not json at all", ())
+    # A well-formed object with the wrong shape is a different failure and must not be retried.
+    wrong_shape = json.dumps({"api_version": "valkeyrie.io/model-output/1", "kind": "ModelOutput"})
+    with pytest.raises(ApplicationRuntimeError) as raised:
+        _accept_output(wrong_shape, ())
+    assert not isinstance(raised.value, _UnparseableModelOutput)
+
+
+def test_the_retry_writes_one_terminal_result_when_both_draws_fail(
+    manifest: dict[str, object],
+) -> None:
+    """The retry must not be able to write a second terminal result."""
+
+    class _AlwaysTruncated(FakeServices):
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            super().converse(**kwargs)  # type: ignore[arg-type]
+            return BedrockTextResponse('{"api_version":"valkeyrie.io/model-out', "end_turn")
+
+    services = _AlwaysTruncated()
+    result = run_runtime_event(
+        _event(request_id="req_trunc"), services, root=ROOT, manifest=manifest
+    )
+    assert result["outcome"] == "error"
+    assert len(services.model_calls) == 2, "one retry, not more"
+    completions = [call for call in services.requests.values() if call.get("outcome") == "error"]
+    assert len(completions) <= 1, "exactly one terminal write"
