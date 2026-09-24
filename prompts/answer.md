@@ -77,6 +77,19 @@ Keep each claim's `evidence_ids` separate and include only supplied evidence IDs
 claim: no Markdown, citation labels, evidence IDs, URLs, source-authority statements, release-readiness
 decisions, or claims that an external write completed.
 
+ONE EXCEPTION for code. When the asker wants code, a claim may end with a single fenced block, and
+nothing may follow the closing fence:
+
+    Connect by building a configuration and creating the client:
+    ```java
+    GlideClientConfiguration config = GlideClientConfiguration.builder().build();
+    ```
+
+The fence takes an optional bare language tag. The code must come from the evidence, copied as it
+spells it, not composed from memory. One fence per claim at most, and no other Markdown anywhere:
+inline backticks, bold, headings and links all remain prohibited, as do URLs inside the fence. A
+claim carrying a fence may exceed the word limits, because a code sample is not prose.
+
 For ambiguity that the user can resolve, use clarification with one concise question of 20 words or
 fewer. For missing, conflicting, unavailable, or insufficient evidence, including a qualified partial
 result, use abstention with a reason of 20 words or fewer. When no specific non-authority dependency can

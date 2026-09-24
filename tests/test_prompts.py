@@ -47,7 +47,7 @@ def test_reviewed_prompt_package_loads_as_exact_immutable_snapshot() -> None:
     assert package.kind == "PromptPackage"
     assert package.output_contract == "evidence_ids_only_for_citations"
     assert package.prompt_revision == (
-        "sha256:f3c202adc1eab1a2eb98ec769afff75fe681a3fd42cc3761c50f36e1d90b0633"
+        "sha256:7b9127bb5c1bf33c18dde9ca50e4d4de34a1ebb705d9d1898105c8e3eaa6e3a7"
     )
     assert len(package.prompt_revision) == 71
     assert tuple(template.name for template in package.templates) == (

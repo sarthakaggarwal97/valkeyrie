@@ -178,3 +178,50 @@ def test_feedback_is_recorded_only_for_this_bot_and_only_for_known_marks(
         ("unhelpful", "-1"),
     ]
     assert rows[0]["qualifier"] == slack_bot.QUALIFIER, "which version was judged"
+
+
+def test_a_source_is_labelled_by_what_it_is_and_the_commit_lives_in_the_link() -> None:
+    """Forty hex characters in the label push the filename off the line, and the link already pins
+    the commit. A live observation labelled only by a timestamp does not say WHICH release."""
+    commit = "11387e50c67ab22dce61f093be6c4af8087a189f"
+    file_url = f"https://github.com/valkey-io/valkey/blob/{commit}/CONTRIBUTING.md"
+    assert slack_bot._source_link(f"valkey/CONTRIBUTING.md@{commit}: {file_url}") == (
+        f"<{file_url}|valkey/CONTRIBUTING.md>"
+    )
+    for citation, expected in (
+        (
+            "live GitHub release observed 2026-09-24T15:25:25Z: "
+            "https://github.com/valkey-io/valkey/releases/tag/9.0.0",
+            "release (9.0.0)",
+        ),
+        (
+            "live GitHub pull_request observed 2026-09-24T15:26:53Z: "
+            "https://github.com/valkey-io/valkey/pull/3853",
+            "pull request (#3853)",
+        ),
+        (
+            "live GitHub issue_search observed 2026-09-24T15:26:53Z: "
+            "https://github.com/search?q=repo%3Avalkey-io%2Fvalkey+sigsegv",
+            "issue search",
+        ),
+    ):
+        assert slack_bot._source_link(citation).endswith(f"|{expected}>"), citation
+    # A citation with no URL is rendered as text rather than a broken link.
+    assert slack_bot._source_link("something unexpected") == "something unexpected"
+
+
+def test_an_answer_ends_by_saying_where_to_go_next() -> None:
+    """An answer with a stated limitation is the case where someone most needs somewhere else to
+    go, so that one names the human channels; the rest just say the thread is open."""
+    answered = slack_bot._format({"outcome": "answer", "claims": [{"text": "HSET sets fields."}]})
+    assert answered.endswith(f"_{slack_bot._FOLLOW_UP}_")
+    limited = slack_bot._format(
+        {
+            "outcome": "answer",
+            "claims": [{"text": "Upgrade replicas first."}],
+            "message": "The evidence does not list every breaking change.",
+        }
+    )
+    assert "does not list every breaking change" in limited
+    assert limited.endswith(f"_{slack_bot._MORE_HELP}_")
+    assert "Slack help channels" in slack_bot._MORE_HELP

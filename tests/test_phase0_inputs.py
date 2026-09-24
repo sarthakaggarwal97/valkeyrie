@@ -369,6 +369,8 @@ def test_each_active_prompt_owns_its_required_boundary() -> None:
             "the first claim answers the question directly",
             "draws a conclusion from the others",
             "keep a simple fact to 40 words or",
+            "one exception for code",
+            "one fence per claim at most",
             "do not restate the question",
             "answer directly",
             "choose the outcome in this order",

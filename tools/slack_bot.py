@@ -350,17 +350,18 @@ def _format(result: dict[str, Any]) -> str:
     if claims:
         body = "\n".join(f"• {_plain(c['text'])}" for c in claims if c.get("text"))
         if citations:
-            # Citations are application-authored from validated GitHub URLs, so the link markup
-            # is built here; the label is still escaped since it carries a path.
-            sources = "\n".join(
-                f"  <{c.split(': ', 1)[-1]}|{_plain(c.split(': ', 1)[0])}>" for c in citations
-            )
+            # Citations are application-authored from validated GitHub URLs, so the link markup is
+            # built here; the label is still escaped since it carries a path.
+            sources = "\n".join(f"  {_source_link(c)}" for c in citations)
             body += f"\n\n*Sources*\n{sources}"
         if message:
             # An answer may carry one limitation: the part of the question the evidence did not
             # support. It is the difference between a useful partial answer and a silent gap.
             body = f"{body}\n\n_{_plain(message)}_"
-        return body
+        # Where to go next. An answer with a stated limitation is the case where someone most needs
+        # somewhere else to go, so that one names the human channels; every other answer just says
+        # that the thread is open, which is the cheapest way to get a better second answer.
+        return f"{body}\n\n_{_MORE_HELP if message else _FOLLOW_UP}_"
 
     # No claims is not one situation. A clarification is the assistant asking something
     # back, a partial means evidence was reachable but incomplete, and an abstention is a
@@ -375,6 +376,53 @@ def _format(result: dict[str, Any]) -> str:
     if message:
         return _plain(message)
     return f"I don't have grounded evidence for that ({outcome})."
+
+
+# Closing pointers. Short by design: a paragraph of boilerplate under every answer trains people to
+# stop reading the part that matters.
+_FOLLOW_UP = "Ask a follow-up in this thread if you need more detail."
+_MORE_HELP = (
+    "For more than I can ground: ask in the Valkey Slack help channels, "
+    "open a GitHub Discussion in valkey-io, or read the topic pages on valkey.io."
+)
+
+
+def _names(url: str) -> str:
+    """What a GitHub URL is ABOUT, for a citation label: a tag, a number, or a file path."""
+    parts = [part for part in url.split("/") if part]
+    for marker, render in (
+        ("tag", lambda rest: rest[0] if rest else ""),
+        ("pull", lambda rest: f"#{rest[0]}" if rest else ""),
+        ("issues", lambda rest: f"#{rest[0]}" if rest else ""),
+        # A file URL carries the commit between blob and the path, which the link already pins.
+        ("blob", lambda rest: "/".join(rest[1:])),
+        ("tree", lambda rest: "/".join(rest[1:])),
+    ):
+        if marker in parts:
+            return render(parts[parts.index(marker) + 1 :])
+    return ""
+
+
+def _source_link(citation: str) -> str:
+    """One Slack link per citation, labelled by what it is rather than by its commit.
+
+    A citation arrives as "label: url". The commit belongs IN the link, which already pins it, not
+    in the label, where forty hex characters push the filename off the line. A live observation is
+    labelled by what was read, taken from the tail of its own URL, because "live GitHub release
+    observed 2026-09-24T15:25:25Z" does not say WHICH release.
+    """
+    label, separator, url = citation.rpartition(": ")
+    # rpartition puts the WHOLE string in the last field when the separator is absent, so a
+    # citation without one would otherwise become a link whose label is empty.
+    if not separator or not url.startswith("https://"):
+        return _plain(citation)
+    if label.startswith("live GitHub"):
+        kind = label.removeprefix("live GitHub").split(" observed ")[0].strip().replace("_", " ")
+        label = f"{kind} ({_names(url)})" if _names(url) else kind
+    else:
+        # repo/path@commit -> repo/path, since the link carries the commit already.
+        label = label.split("@", 1)[0]
+    return f"<{url}|{_plain(label)}>"
 
 
 def _plain(text: str) -> str:
