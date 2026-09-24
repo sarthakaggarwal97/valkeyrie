@@ -818,7 +818,10 @@ def test_observed_at_is_sampled_only_after_the_fetch_and_normalization() -> None
     assert events[-1] == "clock" and set(events[:-1]) == {"fetch"} and events.count("clock") == 1
 
 
-def test_transport_failure_is_not_retried_or_replaced_with_stale_data() -> None:
+def test_transport_failure_is_retried_a_bounded_number_of_times_and_never_faked() -> None:
+    """A transient failure is retried, because losing the whole reply to one blip is worse than
+    waiting a moment. What must never happen is a substitute: no stale data, no invented payload,
+    and the error still reaches the caller once the attempts are spent."""
     calls = 0
 
     def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
@@ -829,7 +832,7 @@ def test_transport_failure_is_not_retried_or_replaced_with_stale_data() -> None:
     with pytest.raises(LiveGitHubError, match="network unavailable"):
         read_live_github(PullRequestQuery("valkey", 7), fetch=fetch)
 
-    assert calls == 1
+    assert calls == 3, "bounded: a person is waiting on this reply"
 
 
 @pytest.mark.parametrize(
@@ -2154,3 +2157,63 @@ def test_a_code_search_hit_carries_its_matching_lines_and_stays_in_scope() -> No
     assert payload["exhaustive"] is True
     # A page that filled itself, or GitHub's own incomplete flag, is not evidence of a total.
     assert _code_search({**value, "incomplete_results": True}, "x", (), "q")["exhaustive"] is False
+
+
+def test_a_transient_github_failure_is_retried_and_a_real_answer_is_not() -> None:
+    """A 404 is an answer; a 429 or a 502 is the network being busy. Treating them alike turned a
+    blip into "live GitHub data is temporarily unavailable" and lost the whole reply."""
+    from valkeyrie.github import HttpResponse
+    from valkeyrie.live_github import _fetch_with_retry
+
+    slept: list[float] = []
+    calls: list[int] = []
+
+    def flaky(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(1)
+        if len(calls) < 3:
+            return HttpResponse(502, {}, b"")
+        return HttpResponse(200, {}, b"{}")
+
+    response = _fetch_with_retry(flaky, "https://api.github.com/x", 1024, sleep=slept.append)
+    assert (response.status, len(calls), len(slept)) == (200, 3, 2)
+
+    # Retry-After is honoured, because GitHub sends it on a secondary rate limit and ignoring it is
+    # how a retry becomes part of the problem.
+    slept.clear()
+    calls.clear()
+
+    def limited(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(1)
+        return HttpResponse(429, {"retry-after": "2"}, b"")
+
+    assert (
+        _fetch_with_retry(limited, "https://api.github.com/x", 1024, sleep=slept.append).status
+        == 429
+    )
+    assert slept == [2.0, 2.0], "waited exactly as long as GitHub asked, then gave up"
+
+    # A 404 is not retried: it is the answer, and asking again cannot change it.
+    calls.clear()
+    slept.clear()
+
+    def absent(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(1)
+        return HttpResponse(404, {}, b"")
+
+    assert (
+        _fetch_with_retry(absent, "https://api.github.com/x", 1024, sleep=slept.append).status
+        == 404
+    )
+    assert (len(calls), slept) == (1, [])
+
+    # A connection failure is the same class of problem as a 502, and is retried the same way.
+    calls.clear()
+    slept.clear()
+
+    def broken(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(1)
+        raise GitHubReadError("connection reset")
+
+    with pytest.raises(LiveGitHubError):
+        _fetch_with_retry(broken, "https://api.github.com/x", 1024, sleep=slept.append)
+    assert len(calls) == 3

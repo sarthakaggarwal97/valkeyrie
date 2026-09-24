@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import re
+import time
 from binascii import Error as BinasciiError
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -657,6 +659,71 @@ def _is_meaningful_search_term(term: str) -> bool:
     )
 
 
+# Statuses that mean "ask again", not "there is no such thing". A 404 is an answer; a 429 or a 502
+# is the network being busy, and treating them alike turned a transient blip into "live GitHub data
+# is temporarily unavailable" and lost the whole reply. Code search in particular allows only ten
+# requests a minute, so a second question in the same minute could refuse for no other reason.
+_RETRYABLE_STATUS: Final = frozenset({429, 500, 502, 503, 504})
+# Three attempts inside one request: the caller is a person waiting on a Slack reply, so the budget
+# is bounded by their patience rather than by how long GitHub might stay unhappy.
+_FETCH_ATTEMPTS: Final = 3
+_RETRY_BASE_SECONDS: Final = 0.5
+_RETRY_CAP_SECONDS: Final = 4.0
+
+
+def _retry_after_seconds(headers: Mapping[str, str], attempt: int) -> float:
+    """What GitHub asked us to wait, or jittered exponential backoff when it did not say.
+
+    Retry-After is honoured because GitHub sends it on a secondary rate limit and ignoring it is
+    how a retry becomes part of the problem. Jitter keeps two concurrent questions from retrying in
+    lockstep.
+    """
+    for name in ("retry-after", "x-ratelimit-reset"):
+        raw = headers.get(name)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if name == "retry-after" and 0 <= value <= _RETRY_CAP_SECONDS * 4:
+            return value
+    return random.uniform(0, min(_RETRY_CAP_SECONDS, _RETRY_BASE_SECONDS * (2**attempt)))
+
+
+def _fetch_with_retry(
+    fetch: GitHubFetcher,
+    url: str,
+    max_bytes: int,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> HttpResponse:
+    """One read, retried while the failure is transient and the attempts are not spent."""
+    last: Exception | None = None
+    for attempt in range(_FETCH_ATTEMPTS):
+        try:
+            response = fetch(url, REQUEST_TIMEOUT_SECONDS, max_bytes)
+        except GitHubReadError as error:
+            # A connection reset or a timeout is the same class of problem as a 502.
+            last = error
+        else:
+            # A fetcher that returned the wrong type at all is not a transient failure: hand it
+            # straight to the response validator, whose error names the real problem.
+            if not isinstance(response, HttpResponse) or type(response.status) is not int:
+                return response
+            status = response.status
+            if status not in _RETRYABLE_STATUS:
+                return response
+            last = LiveGitHubError(f"REST read returned HTTP {status}")
+            if attempt < _FETCH_ATTEMPTS - 1:
+                sleep(_retry_after_seconds(response.headers, attempt))
+                continue
+            return response
+        if attempt < _FETCH_ATTEMPTS - 1:
+            sleep(random.uniform(0, min(_RETRY_CAP_SECONDS, _RETRY_BASE_SECONDS * (2**attempt))))
+    raise LiveGitHubError(f"live GitHub read failed: {last}") from last
+
+
 def read_live_github(
     query: LiveGitHubQuery,
     *,
@@ -673,10 +740,7 @@ def read_live_github(
     # Most reads share one response bound; a file declares its own, because a 240 KB source file
     # arrives base64-encoded inside JSON.
     max_bytes = request[3] if len(request) == 4 else MAX_RESPONSE_BYTES
-    try:
-        response = (fetch or fetch_public_github)(source_url, REQUEST_TIMEOUT_SECONDS, max_bytes)
-    except GitHubReadError as error:
-        raise LiveGitHubError(f"live GitHub read failed: {error}") from error
+    response = _fetch_with_retry(fetch or fetch_public_github, source_url, max_bytes)
     value = _response_object(response, source="REST", maximum_bytes=max_bytes)
     payload = normalizer(value)
     if isinstance(query, (PullRequestQuery, IssueQuery)):
