@@ -34,7 +34,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 FUNCTION = "valkeyrie-development-application"
-# Version 51 is Fable, the model that passed qualification (requalified for the prompt that
+# Version 52 is Fable, the model that passed qualification (requalified for the prompt that
 # treats a completed empty search as evidence), with a 120s timeout. It carries whole board
 # reads totalled by status, release membership on merged pull requests, cross-repository
 # searches, a router-composed search with a date window, releases read by tag, one retry of a
@@ -42,7 +42,7 @@ FUNCTION = "valkeyrie-development-application"
 # discussion on an issue or pull request, files at a ref, security advisories, per-repository
 # retrieval quotas, and credential screening. Version 8 is Opus, which failed the
 # claim-to-evidence gate at 0.743.
-QUALIFIER = "51"
+QUALIFIER = "52"
 KNOWLEDGE_BASE_ID = "ONVASJDDNX"
 MAX_QUESTION_BYTES = 2048
 # Questions about present project state must route live; everything else answers
