@@ -170,3 +170,33 @@
     ACLs, Lua scripts and RDB compatibility keep working, and what should I test first?
   expect: answer
   because: A five-part question abstained whole rather than answering the parts it could support.
+
+- id: repo-directory
+  question: What is in the src/commands directory?
+  expect: answer
+  because: Nothing could list a path before; the corpus knew chunks, not the shape of the repository.
+
+- id: repo-largest-file
+  question: What is the largest source file in Valkey?
+  expect: answer
+  because: Needs a subtree ordered by size, and the payload must say the truncation kept the largest.
+
+- id: repo-tests-directory
+  question: Which test files cover cluster behaviour?
+  expect: answer
+  because: A listing question that used to abstain because only whole-file reads existed.
+
+- id: repo-symbol
+  question: Which file implements the SCAN cursor logic?
+  expect: answer
+  because: Embedding similarity over prose does not find a function; code search does.
+
+- id: repo-cross-repository-symbol
+  question: Which repositories implement HSETEX?
+  expect: answer
+  because: The cross-repository question the corpus could never answer, now one code search.
+
+- id: repo-cross-impact
+  question: If I add a new command to Valkey core, what else has to change?
+  expect: answer
+  because: Spans core, docs and the clients, which is the question only this project has.
