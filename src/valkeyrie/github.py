@@ -91,6 +91,11 @@ def fetch_public_github(
             raise GitHubReadError("GitHub POST is only permitted for a bounded GraphQL query")
         headers["Content-Type"] = "application/json"
     if api_request:
+        # Code search returns the MATCHING LINES only under its own media type. Without them a hit
+        # is just a path, which is a claim that a file is relevant rather than evidence of what it
+        # says. This is the documented type for that one endpoint.
+        if parsed.path == "/search/code":
+            headers["Accept"] = "application/vnd.github.text-match+json"
         headers["X-GitHub-Api-Version"] = "2022-11-28"
         if token:
             headers["Authorization"] = f"Bearer {token}"

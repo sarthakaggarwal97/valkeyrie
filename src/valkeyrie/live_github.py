@@ -100,6 +100,42 @@ class FileQuery:
 
 
 @dataclass(frozen=True)
+class DirectoryQuery:
+    """What is IN a path: the names, types and sizes of its entries, or a whole subtree.
+
+    A file read answers "what does this say" and needed the path already. This answers "what is
+    there", which is the question a contributor asks first: what is in src/commands, which test
+    files cover cluster, how big is server.c. Without it the assistant knew the corpus chunks and
+    nothing about the shape of the repository they came from.
+    """
+
+    repository: str
+    path: str = ""
+    ref: str | None = None
+    # A subtree rather than one level. Bounded hard: the valkey tree is thousands of entries, so a
+    # recursive listing is filtered to `path` and truncated with a flag rather than paged.
+    recursive: bool = False
+
+
+@dataclass(frozen=True)
+class CodeSearchQuery:
+    """Where a symbol or string appears in the source, with the matching lines.
+
+    "Where is expireIfNeeded called from" is not answerable from prose, and embedding similarity
+    over documentation chunks does not find a function name. GitHub's code search does, and it
+    returns the matching fragments, so each hit carries its own evidence rather than a promise
+    that the file is relevant.
+    """
+
+    # The literal symbol or string. One term: code search is not a natural-language question.
+    term: str
+    repositories: tuple[str, ...] = ()
+    # Restrict to a path prefix or an extension, the two filters that matter for C sources.
+    path: str | None = None
+    extension: str | None = None
+
+
+@dataclass(frozen=True)
 class ReleaseByTagQuery:
     """One release by its tag, with its notes whole.
 
@@ -149,6 +185,8 @@ LiveGitHubQuery: TypeAlias = (
     | ReleaseByTagQuery
     | ReleaseListQuery
     | FileQuery
+    | DirectoryQuery
+    | CodeSearchQuery
     | AdvisoryQuery
     | WorkflowRunQuery
     | CheckRunQuery
@@ -696,6 +734,15 @@ MAX_RELEASE_MEMBERSHIP_CHECKS: Final = 8
 MEMBERSHIP_COMMIT_PAGE: Final = 50
 # Repositories one supplementary search may span; a question naming more is asking something else.
 MAX_SEARCH_REPOSITORIES: Final = 4
+# Code search returns a fragment per hit, so ten hits is already a page of source. GitHub also
+# rate-limits this endpoint far harder than the others (ten requests a minute), which is a second
+# reason not to ask for more.
+CODE_SEARCH_PER_PAGE: Final = 10
+# A directory listing is names and sizes, so it stays small; a recursive tree does not, and the
+# valkey tree is thousands of entries. Both are truncated with a flag rather than paged.
+MAX_DIRECTORY_ENTRIES: Final = 200
+MAX_TREE_ENTRIES: Final = 400
+MAX_TREE_RESPONSE_BYTES: Final = 2 * 1024 * 1024
 
 
 AUTHOR_TALLY_QUERY: Final = """\
@@ -997,6 +1044,227 @@ def _github_api_url(value: Mapping[str, object], key: str, prefix: str) -> str:
     if not url.startswith(prefix):
         raise LiveGitHubError(f"GitHub field {key} is outside its expected location")
     return url
+
+
+def _search_repositories(value: object) -> tuple[str, ...]:
+    """A bounded, deduplicated, reviewed repository scope. Empty means the whole organization."""
+    if not isinstance(value, tuple):
+        raise LiveGitHubError("search repositories are malformed")
+    scope = tuple(dict.fromkeys(value))
+    if len(scope) > MAX_SEARCH_REPOSITORIES:
+        raise LiveGitHubError("code search names too many repositories")
+    for name in scope:
+        _repository(name)
+    return scope
+
+
+def _code_term(value: object) -> str:
+    """One literal symbol or string. Quoting happens at the call site, so a quote cannot be used
+    here to close the literal early and inject a qualifier of the caller's choosing."""
+    if type(value) is not str:
+        raise LiveGitHubError("code search term is malformed")
+    term = value.strip()
+    if not 2 <= len(term.encode("utf-8")) <= 128:
+        raise LiveGitHubError("code search term is malformed")
+    if any(character in term for character in '"\n\r\\') or ":" in term:
+        raise LiveGitHubError("code search term is malformed")
+    return term
+
+
+def _extension(value: object) -> str:
+    if type(value) is not str or re.fullmatch(r"[A-Za-z0-9]{1,8}", value) is None:
+        raise LiveGitHubError("code search extension is malformed")
+    return value
+
+
+def _directory(
+    value: Mapping[str, object] | Sequence[object],
+    repository: str,
+    path: str,
+    ref: str | None,
+) -> dict[str, object]:
+    """One level of a path: every entry's name, type and size.
+
+    The contents endpoint returns an ARRAY for a directory and an OBJECT for a file, so a path that
+    turns out to be a file is reported as exactly that rather than mis-parsed.
+    """
+    # The response layer wraps a bare array as {"items": [...]} so every normalizer sees one shape.
+    # A directory listing arrives that way; a path that is a FILE arrives as the file object, with
+    # no items key, and is reported as exactly that rather than mis-parsed as an empty directory.
+    if isinstance(value, Mapping) and isinstance(value.get("items"), list):
+        value = cast(Sequence[object], value["items"])
+    if isinstance(value, Mapping):
+        return {
+            "kind": "directory",
+            "api_version": _API_VERSION,
+            "repository": repository,
+            "path": path,
+            "ref": ref,
+            "is_file": True,
+            "entries": [],
+            "entry_count": 0,
+            "exhaustive": True,
+            "finding": (
+                f"{path or '/'} in {OWNER}/{repository} is a file, not a directory; "
+                "read it as a file to see its contents."
+            ),
+        }
+    items = list(value)
+    entries: list[dict[str, object]] = []
+    for item in items[:MAX_DIRECTORY_ENTRIES]:
+        entry = _object(item, "directory entry")
+        kind = _choice(entry, "type", {"file", "dir", "symlink", "submodule"})
+        entries.append(
+            {
+                "name": _text(entry, "name", 512),
+                "path": _text(entry, "path", 1024),
+                "type": kind,
+                # A directory entry reports size 0, which is the endpoint's own answer, not ours.
+                "size_bytes": _positive_or_zero_integer(entry, "size"),
+            }
+        )
+    exhaustive = len(items) <= MAX_DIRECTORY_ENTRIES
+    files = sum(1 for entry in entries if entry["type"] == "file")
+    directories = sum(1 for entry in entries if entry["type"] == "dir")
+    where = f"{path or '/'} in {OWNER}/{repository}" + (f" at {ref}" if ref else "")
+    return {
+        "kind": "directory",
+        "api_version": _API_VERSION,
+        "repository": repository,
+        "path": path,
+        "ref": ref,
+        "is_file": False,
+        "entries": entries,
+        "entry_count": len(items),
+        # Whether the listing is the WHOLE directory. A truncated listing that claimed to be
+        # complete would let an absence be read as a fact.
+        "exhaustive": exhaustive,
+        "finding": (
+            f"{where} contains {len(items)} entries ({files} files, {directories} directories)"
+            + ("." if exhaustive else f", of which the first {len(entries)} are listed.")
+        ),
+    }
+
+
+def _tree(
+    value: Mapping[str, object],
+    repository: str,
+    path: str,
+    ref: str | None,
+) -> dict[str, object]:
+    """A subtree, filtered to `path`. The endpoint takes no path, so the filter is applied here."""
+    raw = _list(value, "tree")
+    truncated_by_github = value.get("truncated") is True
+    prefix = f"{path}/" if path else ""
+    matched: list[dict[str, object]] = []
+    for item in raw:
+        entry = _object(item, "tree entry")
+        entry_path = _text(entry, "path", 1024)
+        if prefix and not entry_path.startswith(prefix):
+            continue
+        if _choice(entry, "type", {"blob", "tree", "commit"}) != "blob":
+            continue
+        matched.append(
+            {
+                "path": entry_path,
+                "size_bytes": _positive_or_zero_integer(entry, "size") if "size" in entry else 0,
+            }
+        )
+    largest = sorted(matched, key=lambda item: (-cast(int, item["size_bytes"]), item["path"]))
+    listed = largest[:MAX_TREE_ENTRIES]
+    exhaustive = len(matched) <= MAX_TREE_ENTRIES and not truncated_by_github
+    where = (path or "the repository root") + f" in {OWNER}/{repository}"
+    return {
+        "kind": "tree",
+        "api_version": _API_VERSION,
+        "repository": repository,
+        "path": path,
+        "ref": ref,
+        # Largest first, because "which file is biggest" and "what are the main files" are the two
+        # questions a subtree answers, and both want the same order.
+        "files": listed,
+        "listed_order": "largest_first",
+        "file_count": len(matched),
+        "total_size_bytes": sum(cast(int, item["size_bytes"]) for item in matched),
+        "exhaustive": exhaustive,
+        # The largest file is EXACT even when the listing is truncated, because the truncation
+        # keeps the largest entries. Without saying so the model read "incomplete listing" as "no
+        # maximum can be established" and abstained on a question its evidence answered.
+        "largest": listed[0] if listed else None,
+        "finding": (
+            f"{where} holds {len(matched)} files"
+            + (
+                "."
+                if exhaustive
+                else (
+                    f", of which the {len(listed)} largest are listed; the listing is ordered by "
+                    "size, so the first entry is the largest file in this subtree even though the "
+                    "rest of the listing is cut short."
+                )
+            )
+        ),
+    }
+
+
+def _code_search(
+    value: Mapping[str, object],
+    term: str,
+    repositories: tuple[str, ...],
+    search: str,
+) -> dict[str, object]:
+    """Where a term appears, with each hit's own matching fragments."""
+    total = _integer(value, "total_count")
+    incomplete = _boolean(value, "incomplete_results")
+    hits: list[dict[str, object]] = []
+    for item in _list(value, "items")[:CODE_SEARCH_PER_PAGE]:
+        hit = _object(item, "code search item")
+        repo = _object(hit.get("repository"), "code search item repository")
+        name = _text(repo, "name", 256)
+        # The same boundary the issue search enforces: a result from outside the reviewed scope is
+        # dropped rather than cited.
+        if name not in ALLOWED_REPOSITORIES:
+            continue
+        if repositories and name not in repositories:
+            continue
+        fragments = [
+            _text(_object(match, "code search match"), "fragment", 4096)
+            for match in _list(hit, "text_matches")[:3]
+            if isinstance(match, Mapping) and "fragment" in match
+        ]
+        hits.append(
+            {
+                "repository": name,
+                "path": _text(hit, "path", 1024),
+                "url": _text(hit, "html_url", 1024),
+                # The matching lines. Without them a hit is only a claim that a file is relevant.
+                "fragments": fragments,
+            }
+        )
+    where = (
+        ", ".join(f"{OWNER}/{name}" for name in repositories)
+        if repositories
+        else f"the {OWNER} organization"
+    )
+    return {
+        "kind": "code_search",
+        "api_version": _API_VERSION,
+        "term": term,
+        "search_query": search,
+        "repositories": list(repositories),
+        "total_count": total,
+        "items": hits,
+        # A page that filled itself is not evidence of a total, and GitHub's own incomplete flag
+        # means its index did not finish the query.
+        "exhaustive": not incomplete and total <= CODE_SEARCH_PER_PAGE,
+        "finding": (
+            f'A code search for "{term}" in {where} found {total} matching files'
+            + (
+                "."
+                if not incomplete and total <= CODE_SEARCH_PER_PAGE
+                else f", of which {len(hits)} are listed."
+            )
+        ),
+    }
 
 
 def _repository_path(value: object) -> str:
@@ -1399,6 +1667,55 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
             lambda value: _file(value, repository, path, ref, query.around),
             MAX_FILE_RESPONSE_BYTES,
         )
+    if isinstance(query, DirectoryQuery):
+        repository = _repository(query.repository)
+        # The root is a legitimate target ("what is in this repository"), so an empty path is not
+        # the malformed one that _repository_path rejects.
+        path = "" if query.path == "" else _repository_path(query.path)
+        ref = None if query.ref is None else _tag(query.ref)
+        if ref is not None and ("/" in ref or ".." in ref):
+            raise LiveGitHubError("directory ref is malformed")
+        if query.recursive:
+            # The tree endpoint returns the whole subtree in one response and is the only way to
+            # answer "which files are under this path" without a request per level. Filtering to
+            # the prefix happens after the read, since the endpoint takes no path argument.
+            url = (
+                f"{_API_ROOT}/repos/{OWNER}/{repository}/git/trees/{quote(ref or 'HEAD', safe='')}"
+            )
+            url += "?recursive=1"
+            return (
+                url,
+                "tree",
+                lambda value: _tree(value, repository, path, ref),
+                # The whole valkey tree in one response: about a thousand entries with a path and
+                # a sha each. It is read once and reduced to names and sizes immediately.
+                MAX_TREE_RESPONSE_BYTES,
+            )
+        segments = "/".join(quote(part, safe="") for part in path.split("/")) if path else ""
+        url = f"{_API_ROOT}/repos/{OWNER}/{repository}/contents/{segments}"
+        if ref is not None:
+            url += f"?ref={quote(ref, safe='')}"
+        # A listing carries an api_url, an html_url, a git_url and a download_url per entry, so
+        # src/commands is 380 KB of JSON for 250 files: the shared 256 KiB bound refused it.
+        return (
+            url,
+            "directory",
+            lambda value: _directory(value, repository, path, ref),
+            MAX_FILE_RESPONSE_BYTES,
+        )
+    if isinstance(query, CodeSearchQuery):
+        repositories = _search_repositories(query.repositories)
+        term = _code_term(query.term)
+        qualifiers = [f"repo:{OWNER}/{name}" for name in repositories]
+        if query.path is not None:
+            qualifiers.append(f"path:{_repository_path(query.path)}")
+        if query.extension is not None:
+            qualifiers.append(f"extension:{_extension(query.extension)}")
+        # Quoted so a symbol with underscores or a multi-word string is one term rather than a
+        # bag of words, which is what makes a code search precise enough to cite.
+        search = " ".join([f'"{term}"', *qualifiers])
+        url = f"{_API_ROOT}/search/code?q={quote(search, safe='')}&per_page={CODE_SEARCH_PER_PAGE}"
+        return url, "code_search", lambda value: _code_search(value, term, repositories, search)
     if isinstance(query, ReleaseByTagQuery):
         repository = _repository(query.repository)
         tag = _tag(query.tag)
@@ -2032,7 +2349,12 @@ def _response_object(
     if len(content_types) != 1:
         raise LiveGitHubError(f"{source} response has an invalid content type")
     media_type = content_types[0].split(";", 1)[0].strip().casefold()
-    if media_type not in {"application/json", "application/vnd.github+json"}:
+    if media_type not in {
+        "application/json",
+        "application/vnd.github+json",
+        # The code-search media type, which is JSON carrying the matching fragments.
+        "application/vnd.github.text-match+json",
+    }:
         raise LiveGitHubError(f"{source} response has an invalid content type")
     try:
         value = cast(
@@ -2049,7 +2371,10 @@ def _response_object(
         # A list endpoint (releases) returns a bare array. Wrapping it keeps one response
         # contract for every normalizer instead of two, and bounds the element count here so an
         # unexpectedly large page is refused before any element is parsed.
-        if len(value) > MAX_RELEASE_LIST:
+        # A directory listing is also a bare array, and src/commands alone holds far more entries
+        # than a release page, so the element bound is the larger of the two rather than the one
+        # that happened to be written first.
+        if len(value) > max(MAX_RELEASE_LIST, MAX_DIRECTORY_ENTRIES * 4):
             raise LiveGitHubError(f"{source} response array exceeds its bound")
         return {"items": value}
     return _object(value, f"{source} response")

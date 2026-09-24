@@ -299,6 +299,11 @@ _LIVE_KINDS: Final[Mapping[str, frozenset[str]]] = {
     "check": frozenset({"check_run", "commit_checks", "commit_status"}),
     "controller_status": frozenset({"project"}),
     "file": frozenset({"file"}),
+    # What is in a path, and where a symbol appears. Each payload declares its own kind, and the
+    # pairing is checked here so an observation cannot be presented as a different sort of thing.
+    "directory": frozenset({"directory"}),
+    "tree": frozenset({"tree"}),
+    "code_search": frozenset({"code_search"}),
     "advisory": frozenset({"advisory", "advisory_list"}),
 }
 

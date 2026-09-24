@@ -64,6 +64,12 @@ _OBSERVATION_TYPES: Final = frozenset(
         # of one exact object, like the rest, and both carry their own provenance in the payload.
         "file",
         "advisory",
+        # What is IN a path, one level or a whole subtree, and where a symbol appears in the
+        # source. Same contract as the rest: a bounded read of exact objects, provenance in the
+        # payload, and a flag saying whether the listing is complete.
+        "directory",
+        "tree",
+        "code_search",
     }
 )
 _MAX_URL_CHARACTERS: Final = 2_048
@@ -256,6 +262,9 @@ def _validated_https_url(value: object) -> str:
         allowed = (
             parts.path.startswith("/repos/valkey-io/")
             or parts.path == "/search/issues"
+            # Code search: the only way to find a symbol across the source, and scoped to
+            # valkey-io repositories by the repo: qualifiers in the query itself.
+            or parts.path == "/search/code"
             or parts.path == "/graphql"
         )
     elif parts.netloc == "github.com":

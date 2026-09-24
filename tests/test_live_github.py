@@ -11,9 +11,10 @@ from typing import Any, cast
 import pytest
 
 from valkeyrie.github import GitHubReadError, HttpResponse
-from valkeyrie.live_github import (
+from valkeyrie.live_github import (  # noqa: PLC2701
     ALLOWED_REPOSITORIES,
     MAX_COLLECTION_ITEMS,
+    MAX_DIRECTORY_ENTRIES,
     MAX_ENTITY_ID,
     MAX_RESPONSE_BYTES,
     MAX_SEARCH_BODY_BYTES,
@@ -32,6 +33,10 @@ from valkeyrie.live_github import (
     PullRequestQuery,
     ReleaseListQuery,
     WorkflowRunQuery,
+    _code_search,
+    _code_term,
+    _directory,
+    _tree,
     infer_live_query,
     infer_supplementary_search,
     normalize_project_response,
@@ -2053,3 +2058,99 @@ def test_an_advisory_is_found_by_either_identifier_and_a_miss_is_a_finding() -> 
     for bad in ("CVE-99-1", "GHSA-short", "'; DROP", "CVE-2026-63639 OR 1=1"):
         with pytest.raises(LiveGitHubError, match="GHSA or CVE"):
             read_live_github(AdvisoryQuery("valkey", bad), fetch=fetch)
+
+
+def test_a_directory_listing_reports_entries_and_whether_it_is_complete() -> None:
+    """A file read answers "what does this say" and needed the path already. This answers "what is
+    there", which is the question a contributor asks first."""
+    listing = [
+        {"name": "get.json", "path": "src/commands/get.json", "type": "file", "size": 1200},
+        {"name": "sub", "path": "src/commands/sub", "type": "dir", "size": 0},
+    ]
+    payload = _directory({"items": listing}, "valkey", "src/commands", None)
+    assert payload["kind"] == "directory"
+    assert payload["is_file"] is False
+    assert payload["entry_count"] == 2
+    assert payload["exhaustive"] is True
+    assert [entry["name"] for entry in cast(list[Any], payload["entries"])] == ["get.json", "sub"]
+    assert "1 files, 1 directories" in cast(str, payload["finding"])
+
+    # A path that is a FILE arrives as the file object, with no items key. Saying so beats
+    # reporting an empty directory, which would read as "the path holds nothing".
+    as_file = _directory({"name": "db.c", "type": "file"}, "valkey", "src/db.c", None)
+    assert as_file["is_file"] is True and as_file["entries"] == []
+    assert "is a file, not a directory" in cast(str, as_file["finding"])
+
+    # Truncation is never silent: an incomplete listing that claimed to be complete would let an
+    # absence be read as a fact.
+    many = [
+        {"name": f"f{i}.json", "path": f"src/commands/f{i}.json", "type": "file", "size": 10}
+        for i in range(MAX_DIRECTORY_ENTRIES + 5)
+    ]
+    truncated = _directory({"items": many}, "valkey", "src/commands", None)
+    assert truncated["exhaustive"] is False
+    assert len(cast(list[Any], truncated["entries"])) == MAX_DIRECTORY_ENTRIES
+    assert "first" in cast(str, truncated["finding"])
+
+
+def test_a_subtree_is_ordered_by_size_so_the_largest_stays_exact() -> None:
+    """The model read "incomplete listing" as "no maximum can be established" and abstained on a
+    question its evidence answered, so the payload states what the truncation preserved."""
+    tree = {
+        "tree": [
+            {"path": "src/small.c", "type": "blob", "size": 10},
+            {"path": "src/module.c", "type": "blob", "size": 684862},
+            {"path": "src/sub", "type": "tree"},
+            {"path": "tests/other.c", "type": "blob", "size": 999999},
+        ]
+    }
+    payload = _tree(tree, "valkey", "src", None)
+    files = cast(list[Any], payload["files"])
+    # Filtered to the path prefix: the bigger file outside src must not win.
+    assert [item["path"] for item in files] == ["src/module.c", "src/small.c"]
+    assert payload["listed_order"] == "largest_first"
+    assert cast(Any, payload["largest"])["path"] == "src/module.c"
+    assert payload["file_count"] == 2
+    assert payload["exhaustive"] is True
+    # GitHub's own truncation flag is honoured even when the filtered set is small.
+    assert _tree({**tree, "truncated": True}, "valkey", "src", None)["exhaustive"] is False
+
+
+def test_a_code_search_term_cannot_carry_a_qualifier() -> None:
+    """The term is quoted into the query, so a quote or a colon in it would let the caller close
+    the literal and choose their own scope."""
+    for refused in ('x" repo:evil/x', "a:b", "has\nnewline", "x", "a" * 200, "back\\slash"):
+        with pytest.raises(LiveGitHubError):
+            _code_term(refused)
+    assert _code_term("  expireIfNeeded  ") == "expireIfNeeded"
+    assert _code_term("REPL_STATE_CONNECTED") == "REPL_STATE_CONNECTED"
+
+
+def test_a_code_search_hit_carries_its_matching_lines_and_stays_in_scope() -> None:
+    value = {
+        "total_count": 2,
+        "incomplete_results": False,
+        "items": [
+            {
+                "path": "src/db.c",
+                "html_url": "https://github.com/valkey-io/valkey/blob/abc/src/db.c",
+                "repository": {"name": "valkey"},
+                "text_matches": [{"fragment": "int expireIfNeeded(serverDb *db"}],
+            },
+            {
+                "path": "evil.c",
+                "html_url": "https://github.com/someone/else/blob/abc/evil.c",
+                "repository": {"name": "not-a-valkey-repository"},
+                "text_matches": [{"fragment": "expireIfNeeded"}],
+            },
+        ],
+    }
+    payload = _code_search(value, "expireIfNeeded", ("valkey",), "q")
+    items = cast(list[Any], payload["items"])
+    # The same boundary the issue search enforces: a result from outside the reviewed scope is
+    # dropped rather than cited.
+    assert [item["path"] for item in items] == ["src/db.c"]
+    assert items[0]["fragments"] == ["int expireIfNeeded(serverDb *db"]
+    assert payload["exhaustive"] is True
+    # A page that filled itself, or GitHub's own incomplete flag, is not evidence of a total.
+    assert _code_search({**value, "incomplete_results": True}, "x", (), "q")["exhaustive"] is False

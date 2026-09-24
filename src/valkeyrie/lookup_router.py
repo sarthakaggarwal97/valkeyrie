@@ -35,6 +35,8 @@ from valkeyrie.live_github import (
     SUPPLEMENT_PER_PAGE,
     WINDOW_PER_PAGE,
     AdvisoryQuery,
+    CodeSearchQuery,
+    DirectoryQuery,
     FileQuery,
     IssueQuery,
     IssueSearchQuery,
@@ -49,6 +51,8 @@ from valkeyrie.live_github import (
 _KINDS: Final[frozenset[str]] = frozenset(
     {
         "file",
+        "directory",
+        "code_search",
         "advisory",
         "corpus_search",
         "pull_request",
@@ -128,6 +132,17 @@ ROUTER_SYSTEM: Final = (
     "arity, flags and arguments), or a function's code (src/<file>.c). A large file is returned as "
     'the numbered lines around the "around" words, so name the words that identify the part you '
     "need. Prefer this over corpus_search when the asker wants an exact value, flag or signature.\n"
+    '- {"kind":"directory","repository":"valkey","path":"src/commands"}: what is IN a path, as '
+    "names, types and sizes. Use for what exists rather than what a file says: which commands have "
+    'a definition, which test files cover a feature, what a directory holds. Omit "path" for the '
+    'repository root. Add "recursive":true for a whole subtree, which is returned largest file '
+    "first and is how to answer which file is biggest or what the main sources are.\n"
+    '- {"kind":"code_search","term":"expireIfNeeded","repositories":["valkey"],"extension":"c"}: '
+    "where a symbol or exact string appears in the source, with the matching lines. Use for where "
+    "a function is defined or called, which files mention a constant, or whether a command name "
+    "appears in a client library. One literal term, no question wording and no qualifiers in it. "
+    'Optional "path" prefix and "extension" narrow it. Follow a hit with a file lookup using '
+    '"around" when the answer needs more than the matching lines.\n'
     '- {"kind":"advisory","repository":"valkey","identifier":"CVE-2026-63639"}: a published '
     "security advisory by CVE or GHSA id, carrying its severity, description and the versions "
     "that fixed it. Omit the identifier to list the recent advisories. Use for any question about "
@@ -466,6 +481,41 @@ def _live_lookup(kind: str, item: Mapping[str, object]) -> LiveGitHubQuery | Non
     if kind == "file":
         _only_keys(item, {"kind", "repository", "path", "ref", "around"})
         return FileQuery(_repository(item), _file_path(item), _file_ref(item), _around_terms(item))
+    if kind == "directory":
+        _only_keys(item, {"kind", "repository", "path", "ref", "recursive"})
+        recursive = item.get("recursive", False)
+        if not isinstance(recursive, bool):
+            raise LookupRouterError("directory recursive flag is malformed")
+        path = item.get("path", "")
+        if path == "" or path is None:
+            resolved = ""
+        else:
+            resolved = _file_path(item)
+        return DirectoryQuery(_repository(item), resolved, _file_ref(item), recursive)
+    if kind == "code_search":
+        _only_keys(item, {"kind", "term", "repositories", "path", "extension"})
+        term = item.get("term")
+        if not isinstance(term, str):
+            raise LookupRouterError("code search term is malformed")
+        repositories_value = item.get("repositories", [_DEFAULT_REPOSITORY])
+        if not isinstance(repositories_value, Sequence) or isinstance(repositories_value, str):
+            raise LookupRouterError("code search repositories must be an array")
+        if not 1 <= len(repositories_value) <= MAX_SEARCH_REPOSITORIES:
+            raise LookupRouterError("code search repositories count is out of bounds")
+        repositories: list[str] = []
+        for candidate in repositories_value:
+            checked = _repository({"repository": candidate})
+            if checked not in repositories:
+                repositories.append(checked)
+        path = item.get("path")
+        if path is not None and not isinstance(path, str):
+            raise LookupRouterError("code search path is malformed")
+        extension = item.get("extension")
+        if extension is not None and not isinstance(extension, str):
+            raise LookupRouterError("code search extension is malformed")
+        # Every value is validated again inside the query's own execution, which is where the
+        # quoting and the qualifier boundary live; this is the shape check.
+        return CodeSearchQuery(term, tuple(repositories), path, extension)
     if kind == "advisory":
         _only_keys(item, {"kind", "repository", "identifier"})
         return AdvisoryQuery(_repository(item), _advisory_id(item))
