@@ -45,7 +45,11 @@ FUNCTION = "valkeyrie-development-application"
 # claim-to-evidence gate at 0.743.
 QUALIFIER = "58"
 KNOWLEDGE_BASE_ID = "ONVASJDDNX"
-MAX_QUESTION_BYTES = 2048
+# Matches the runtime's own bound. It was a quarter of that, which refused every pasted diagnostic:
+# INFO is four to nine kilobytes, and "here is my INFO output, why is used_memory climbing?" is the
+# question this assistant most wants to be asked. A paste larger than this is trimmed by the asker,
+# who knows which section matters, rather than silently truncated here.
+MAX_QUESTION_BYTES = 8 * 1024
 # Questions about present project state must route live; everything else answers
 # from the pinned corpus. Same list the HTTP adapter and tools/ask.py use.
 LIVE_HINTS = ("current", "currently", "latest", "right now", "upcoming", "recent", "status of")
@@ -169,7 +173,14 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
         say(text="Ask me a Valkey question, for example: what is the TSC?", thread_ts=thread)
         return
     if len(question.encode("utf-8")) > MAX_QUESTION_BYTES:
-        say(text=f"That question is over the {MAX_QUESTION_BYTES}-byte limit.", thread_ts=thread)
+        say(
+            text=(
+                f"That is over my {MAX_QUESTION_BYTES // 1024} KB limit for one message. "
+                "Paste the part that matters, for example the Memory or Clients section of INFO, "
+                "or the few SLOWLOG entries you are asking about."
+            ),
+            thread_ts=thread,
+        )
         return
 
     # Slack redelivers an event whose ack it did not see. The runtime already replays the same

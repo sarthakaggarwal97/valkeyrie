@@ -287,7 +287,14 @@ _CREDENTIAL: Final = re.compile(
     # A labelled secret: the name says what it is, so the value does not have to be recognisable.
     r"|(?i:(?:secret|token|password|passwd|api[_-]?key|access[_-]?key)"
     r"(?:_?[a-z]+)?\s*[:=]\s*)(?!" + _PLACEHOLDER + r")\S{12,}"
-    r"|(?i:authorization\s*:\s*(?:bearer|basic)\s+)(?!" + _PLACEHOLDER + r")\S{12,})"
+    r"|(?i:authorization\s*:\s*(?:bearer|basic)\s+)(?!" + _PLACEHOLDER + r")\S{12,}"
+    # Valkey's own secret-bearing directives, WITH a value. These were left alone while a match
+    # meant refusing the question, because "what does requirepass do?" must always answer. Now that
+    # a match redacts instead, a pasted config keeps its secret out of the model while still being
+    # answerable, and a question with no value after the directive is untouched.
+    r"|(?im:(?:^\s*|--)(?:requirepass|masterauth|masteruser|tls-key-file-pass"
+    r"|tls-client-key-file-pass)\s+)(?!" + _PLACEHOLDER + r")\S+"
+    r"|(?i:\bacl\s+setuser\s+\S+\s+(?:on\s+)?)>(?!" + _PLACEHOLDER + r")\S+)"
 )
 # Distinguishes "not yet looked up" from "looked up and absent", so an absent token is
 # not re-fetched on every question.
@@ -528,15 +535,14 @@ def _answer(
             request_id,
             "Hello. What would you like to know about the Valkey project?",
         )
-    if _CREDENTIAL.search(question) is not None:
-        # A pasted token must not reach a model, a search qualifier, or a persisted row. The
-        # refusal names the reason without echoing the value.
-        return RuntimeResult(
-            "abstention",
-            request_id,
-            "That question appears to contain a credential, so I did not process it. "
-            "Remove the secret and ask again, and rotate it if it was a real one.",
-        )
+    # A pasted secret must not reach a model, a search qualifier, or a persisted row. It used to
+    # take the QUESTION down with it, which is the wrong trade for an assistant whose main job is
+    # reading pasted configuration and logs: a config snippet with a requirepass line is exactly
+    # what someone needs help with. The secret is replaced before anything reads the text, so
+    # nothing downstream can see it, and the rest of the question is answered.
+    question, redactions = _redacted(question)
+    if redactions:
+        print(f"redacted {redactions} credential(s) from a question", file=sys.stderr, flush=True)
     requirement = event["version_requirement"]
     if requirement not in {"none", "required", "current_state"}:
         raise ApplicationRuntimeError("version requirement is unsupported")
@@ -1175,6 +1181,28 @@ def _accept_output(
     text = _bounded_text(limitation, "answer limitation", 512)
     _screened_model_text(text, "answer limitation", 512)
     return "answer", tuple(claims), citations, text
+
+
+def _redacted(question: str) -> tuple[str, int]:
+    """The question with every credential-shaped run replaced, and how many were replaced.
+
+    The replacement is fixed text, never a hint at the value, and it happens before validation so
+    the original never reaches retrieval, a model, an audit row or a reply.
+    """
+    redactions = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        text = match.group(0)
+        # Keep the part that says WHAT was redacted and drop only the value: "requirepass
+        # [redacted]" is a readable config line, while replacing the whole match leaves
+        # "AWS_SECRET_[redacted]" or a bare marker, which reads like the paste was mangled.
+        cut = max(text.rfind(character) for character in "=:> \t")
+        prefix = text[: cut + 1] if cut > 0 else ""
+        return f"{prefix}[redacted credential]"
+
+    return _CREDENTIAL.sub(replace, question), redactions
 
 
 def _conversation(value: object) -> tuple[ConversationTurn, ...]:

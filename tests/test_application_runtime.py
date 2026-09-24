@@ -2677,11 +2677,15 @@ def test_a_question_carrying_a_credential_is_refused_before_anything_reads_it(
         root=ROOT,
         manifest=manifest,
     )
-    assert result["outcome"] == "abstention"
-    assert "credential" in cast(str, result["message"])
+    # The secret is REDACTED and the question is answered: taking the whole question down is the
+    # wrong trade for an assistant whose main job is reading pasted configuration and logs.
+    assert result["outcome"] == "answer"
     assert "ghp_" not in json.dumps(result), "the value is never echoed"
-    assert services.requests == {} and services.model_calls == [] and services.retrieve_calls == []
+    assert "ghp_" not in json.dumps(services.model_calls, default=str), "never reaches a model"
+    assert "ghp_" not in json.dumps(services.retrieve_calls, default=str), "never reaches retrieval"
+    assert "ghp_" not in json.dumps(services.requests, default=str), "never reaches a stored row"
 
+    # Every shape is redacted rather than refused, and the value never appears anywhere.
     for shape in (
         "xoxb-1234567890-abcdefghij",
         "github_pat_11ABCDEFG0aBcDeFgHiJkLmNoPqRsTuVwXyZ",
@@ -2698,7 +2702,7 @@ def test_a_question_carrying_a_credential_is_refused_before_anything_reads_it(
                 root=ROOT,
                 manifest=manifest,
             )["outcome"]
-            == "abstention"
+            == "answer"
         )
 
     ordinary = FakeServices()
