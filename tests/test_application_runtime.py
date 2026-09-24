@@ -489,7 +489,7 @@ def test_runtime_answer_uses_pinned_generation_strict_output_and_app_citations(
     ]
     model = services.model_calls[0]
     assert model["model_id"] == manifest["selected_inference_profile_arn"]
-    assert model["maximum_output_tokens"] == 2048
+    assert model["maximum_output_tokens"] == 4096
     assert model["reasoning_effort"] == "low"
     # The model-visible fields contain no AWS, model, profile, report, or selection metadata.
     assert set(model) == {

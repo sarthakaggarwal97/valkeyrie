@@ -76,22 +76,30 @@ lambda_client = boto3.client("lambda", region_name="us-east-1")
 
 
 # A question takes twenty to forty seconds to answer, and for all that time the thread looked dead.
-# These say what is happening on the asker's own message: seen, then how it went.
+# :eyes: on the asker's message says it was seen, and it comes OFF when the reply lands. Nothing
+# replaces it: the reply itself is the outcome, and a tick or a cross added underneath read as the
+# bot grading its own work.
 _WORKING = "eyes"
-_OUTCOME_REACTION = {
-    "answer": "white_check_mark",
-    "clarification": "question",
-    "abstention": "warning",
-    "partial": "warning",
-    "error": "x",
-}
 # Reactions need the reactions:write scope. Without it every call fails the same way, so the miss
 # is logged ONCE and the bot carries on: an answer that arrives without a tick mark is still an
 # answer, and a bot that crashes over decoration is not.
 _reaction_scope_missing = False
 
 
-def _react(client: Any, event: dict[str, Any], name: str, *, remove: str | None = None) -> None:
+def _unreact(client: Any, event: dict[str, Any], name: str) -> None:
+    """Take a mark back off, best effort. The mark may never have landed."""
+    if _reaction_scope_missing:
+        return
+    channel, timestamp = event.get("channel"), event.get("ts")
+    if not channel or not timestamp:
+        return
+    try:
+        client.reactions_remove(channel=channel, timestamp=timestamp, name=name)
+    except Exception as error:  # noqa: BLE001 - removal failing is not a failure
+        log.debug("could not remove :%s: (%s)", name, error)
+
+
+def _react(client: Any, event: dict[str, Any], name: str) -> None:
     """Mark the asker's message, best effort. Never let decoration break an answer."""
     global _reaction_scope_missing
     if _reaction_scope_missing:
@@ -100,12 +108,6 @@ def _react(client: Any, event: dict[str, Any], name: str, *, remove: str | None 
     if not channel or not timestamp:
         return
     try:
-        if remove is not None:
-            # Best effort on its own: the working mark may never have landed.
-            try:
-                client.reactions_remove(channel=channel, timestamp=timestamp, name=remove)
-            except Exception as error:  # noqa: BLE001 - removal failing is not a failure
-                log.debug("could not remove :%s: (%s)", remove, error)
         client.reactions_add(channel=channel, timestamp=timestamp, name=name)
     except Exception as error:  # noqa: BLE001 - see _reaction_scope_missing
         text = str(error)
@@ -203,13 +205,12 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
     except Exception:
         # Log the detail, tell the channel only that it failed.
         log.exception("answer failed")
-        _react(client, event, _OUTCOME_REACTION["error"], remove=_WORKING)
+        _unreact(client, event, _WORKING)
         say(text="Something went wrong answering that. The failure is logged.", thread_ts=thread)
         return
 
     say(text=_format(result), thread_ts=thread, unfurl_links=False)
-    outcome = str(result.get("outcome", ""))
-    _react(client, event, _OUTCOME_REACTION.get(outcome, "warning"), remove=_WORKING)
+    _unreact(client, event, _WORKING)
 
 
 def _ask(

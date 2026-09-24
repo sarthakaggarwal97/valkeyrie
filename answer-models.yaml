@@ -11,7 +11,11 @@ kind: AnswerModelInventory
 candidates:
 - model_id: us.anthropic.claude-fable-5
   inference:
-    maximum_output_tokens: 2048
+    # Was 2048, set when an answer was a few atomic facts. A full program with its explanation ran
+    # out mid-answer ("give me a full java program to connect in cluster mode" stopped at
+    # max_tokens and the reply was lost), and the answer shape now allows longer claims and code.
+    # 4096 is the reviewed upper bound in answer_models.py; doubling to it rather than past it.
+    maximum_output_tokens: 4096
     temperature: null
     top_p: null
     reasoning_effort: low

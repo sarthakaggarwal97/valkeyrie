@@ -108,19 +108,12 @@ def _mention(ts: str) -> dict[str, object]:
     return {"text": "<@U_BOT> what is HSET?", "ts": ts, "channel": "C1", "user": "U_ME"}
 
 
-@pytest.mark.parametrize(
-    ("outcome", "mark"),
-    [
-        ("answer", "white_check_mark"),
-        ("abstention", "warning"),
-        ("clarification", "question"),
-        ("partial", "warning"),
-    ],
-)
-def test_the_asker_sees_work_start_and_how_it_went(
-    monkeypatch: pytest.MonkeyPatch, outcome: str, mark: str
+@pytest.mark.parametrize("outcome", ["answer", "abstention", "clarification", "partial"])
+def test_eyes_go_on_while_working_and_come_off_when_the_reply_lands(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
-    """An answer takes twenty to forty seconds, and for all that time the thread looked dead."""
+    """An answer takes twenty to forty seconds, and the thread looked dead for all of it. Nothing
+    replaces the mark: a tick or a cross underneath read as the bot grading its own work."""
     monkeypatch.setattr(slack_bot, "_reaction_scope_missing", False)
     monkeypatch.setattr(
         slack_bot, "_ask", lambda *a, **k: {"outcome": outcome, "claims": [{"text": "x"}]}
@@ -128,7 +121,20 @@ def test_the_asker_sees_work_start_and_how_it_went(
     slack_bot._answered.clear()
     client = _Client()
     slack_bot.answer_mention(_mention(f"{outcome}.0"), lambda **kwargs: None, client)
-    assert client.calls == [("add", "eyes"), ("remove", "eyes"), ("add", mark)]
+    assert client.calls == [("add", "eyes"), ("remove", "eyes")]
+
+
+def test_eyes_come_off_when_answering_fails_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(slack_bot, "_reaction_scope_missing", False)
+
+    def broken(*args: object, **kwargs: object) -> dict[str, object]:
+        raise RuntimeError("lambda unavailable")
+
+    monkeypatch.setattr(slack_bot, "_ask", broken)
+    slack_bot._answered.clear()
+    client = _Client()
+    slack_bot.answer_mention(_mention("broken.0"), lambda **kwargs: None, client)
+    assert client.calls == [("add", "eyes"), ("remove", "eyes")]
 
 
 def test_reactions_without_the_scope_are_given_up_on_rather_than_retried_forever(
