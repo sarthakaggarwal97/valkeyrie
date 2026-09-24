@@ -197,6 +197,21 @@ ROUTER_SYSTEM: Final = (
     "- If the question is not about Valkey at all, or is a greeting, reply "
     '{"lookups":[]}.\n'
     "\n"
+    "Questions that need more than one lookup to answer properly:\n"
+    "- A pasted ERROR or crash (MISCONF, CROSSSLOT, WRONGTYPE, a SIGSEGV report): corpus_search "
+    "for what it means, a code_search for the literal error name in valkey to show what raises "
+    "raises it, and an issue search for whether it is a known bug. Three lookups, because "
+    '"what does this mean", "why did it happen" and "is it known" are three questions.\n'
+    "- MIGRATING or UPGRADING between two versions: a release_notes lookup for EACH version "
+    "involved, since what breaks is in the notes for the target and the ones between. Saying "
+    '"review the release notes" is not an answer when they can be read.\n'
+    "- WHO owns, maintains or should be asked about something: a file lookup for "
+    '{"repository":"valkey","path":"MAINTAINERS.md"}, which lists the maintainers by area, '
+    "alongside corpus_search for the governance and contribution material.\n"
+    "- A CODE EXAMPLE in a language: corpus_search plus a directory lookup in that language's "
+    "client repository to find where its examples or tests live, then a file lookup to read one. "
+    "Real code from the library beats prose describing it.\n"
+    "\n"
     "When earlier turns of the conversation are supplied, the question may be a follow-up that "
     'only makes sense with them ("and what about failover?", "is that merged yet?", '
     '"how do I configure it"). Rewrite it as one standalone question that names its subject '
