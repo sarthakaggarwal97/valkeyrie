@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -79,3 +80,101 @@ def test_blank_and_mention_only_messages_are_skipped() -> None:
     assert slack_bot._turns_before(messages, current_ts="4.0", bot_user_id="UBOT") == [
         {"role": "user", "text": "real question"}
     ]
+
+
+class _Client:
+    """A Slack client that records reaction calls and can fail like a missing scope."""
+
+    def __init__(self, failure: str | None = None) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.failure = failure
+
+    def auth_test(self) -> dict[str, str]:
+        return {"user_id": "U_BOT"}
+
+    def conversations_replies(self, **kwargs: object) -> dict[str, list[object]]:
+        return {"messages": []}
+
+    def reactions_add(self, **kwargs: object) -> None:
+        self.calls.append(("add", str(kwargs["name"])))
+        if self.failure:
+            raise RuntimeError(self.failure)
+
+    def reactions_remove(self, **kwargs: object) -> None:
+        self.calls.append(("remove", str(kwargs["name"])))
+
+
+def _mention(ts: str) -> dict[str, object]:
+    return {"text": "<@U_BOT> what is HSET?", "ts": ts, "channel": "C1", "user": "U_ME"}
+
+
+@pytest.mark.parametrize(
+    ("outcome", "mark"),
+    [
+        ("answer", "white_check_mark"),
+        ("abstention", "warning"),
+        ("clarification", "question"),
+        ("partial", "warning"),
+    ],
+)
+def test_the_asker_sees_work_start_and_how_it_went(
+    monkeypatch: pytest.MonkeyPatch, outcome: str, mark: str
+) -> None:
+    """An answer takes twenty to forty seconds, and for all that time the thread looked dead."""
+    monkeypatch.setattr(slack_bot, "_reaction_scope_missing", False)
+    monkeypatch.setattr(
+        slack_bot, "_ask", lambda *a, **k: {"outcome": outcome, "claims": [{"text": "x"}]}
+    )
+    slack_bot._answered.clear()
+    client = _Client()
+    slack_bot.answer_mention(_mention(f"{outcome}.0"), lambda **kwargs: None, client)
+    assert client.calls == [("add", "eyes"), ("remove", "eyes"), ("add", mark)]
+
+
+def test_reactions_without_the_scope_are_given_up_on_rather_than_retried_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An answer that arrives without a tick mark is still an answer, and a bot that crashes over
+    decoration is not."""
+    monkeypatch.setattr(slack_bot, "_reaction_scope_missing", False)
+    monkeypatch.setattr(
+        slack_bot, "_ask", lambda *a, **k: {"outcome": "answer", "claims": [{"text": "x"}]}
+    )
+    said: list[dict[str, object]] = []
+    client = _Client(failure="missing_scope")
+    for index in range(2):
+        slack_bot._answered.clear()
+        slack_bot.answer_mention(_mention(f"scope.{index}"), lambda **kw: said.append(kw), client)
+    assert client.calls == [("add", "eyes")], "one attempt, then quiet"
+    assert len(said) == 2, "both questions still answered"
+
+
+def test_feedback_is_recorded_only_for_this_bot_and_only_for_known_marks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The battery measures answers against expectations someone wrote. This measures them against
+    the people asking, which is the only source that can say an answer was correct but useless."""
+    path = tmp_path / "feedback.jsonl"
+    monkeypatch.setattr(slack_bot, "FEEDBACK_PATH", path)
+    monkeypatch.setattr(slack_bot, "_bot_user_id", "U_BOT")
+    for reaction, item_user in (
+        ("+1", "U_BOT"),
+        ("-1", "U_BOT"),
+        ("eyes", "U_BOT"),  # not a verdict
+        ("+1", "U_SOMEONE_ELSE"),  # not this bot's answer
+    ):
+        slack_bot.record_feedback(
+            {
+                "reaction": reaction,
+                "item_user": item_user,
+                "user": "U_ME",
+                "item": {"type": "message", "channel": "C1", "ts": "9.9"},
+            },
+            _Client(),
+        )
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [(row["verdict"], row["reaction"]) for row in rows] == [
+        ("helpful", "+1"),
+        ("unhelpful", "-1"),
+    ]
+    assert rows[0]["qualifier"] == slack_bot.QUALIFIER, "which version was judged"

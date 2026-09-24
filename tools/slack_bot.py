@@ -27,6 +27,7 @@ import os
 import re
 import threading
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import boto3
@@ -49,10 +50,102 @@ MAX_QUESTION_BYTES = 2048
 # from the pinned corpus. Same list the HTTP adapter and tools/ask.py use.
 LIVE_HINTS = ("current", "currently", "latest", "right now", "upcoming", "recent", "status of")
 
+# What a reaction on one of the bot's own answers means. Deliberately small: these are the marks
+# people already use, and anything else is left unread rather than guessed at.
+_FEEDBACK = {
+    "+1": "helpful",
+    "thumbsup": "helpful",
+    "white_check_mark": "helpful",
+    "tada": "helpful",
+    "heavy_check_mark": "helpful",
+    "-1": "unhelpful",
+    "thumbsdown": "unhelpful",
+    "x": "unhelpful",
+    "confused": "unhelpful",
+}
+FEEDBACK_PATH = Path(os.environ.get("VALKEYRIE_FEEDBACK_PATH", "/tmp/valkeyrie-feedback.jsonl"))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("valkeyrie-slack")
 
 lambda_client = boto3.client("lambda", region_name="us-east-1")
+
+
+# A question takes twenty to forty seconds to answer, and for all that time the thread looked dead.
+# These say what is happening on the asker's own message: seen, then how it went.
+_WORKING = "eyes"
+_OUTCOME_REACTION = {
+    "answer": "white_check_mark",
+    "clarification": "question",
+    "abstention": "warning",
+    "partial": "warning",
+    "error": "x",
+}
+# Reactions need the reactions:write scope. Without it every call fails the same way, so the miss
+# is logged ONCE and the bot carries on: an answer that arrives without a tick mark is still an
+# answer, and a bot that crashes over decoration is not.
+_reaction_scope_missing = False
+
+
+def _react(client: Any, event: dict[str, Any], name: str, *, remove: str | None = None) -> None:
+    """Mark the asker's message, best effort. Never let decoration break an answer."""
+    global _reaction_scope_missing
+    if _reaction_scope_missing:
+        return
+    channel, timestamp = event.get("channel"), event.get("ts")
+    if not channel or not timestamp:
+        return
+    try:
+        if remove is not None:
+            # Best effort on its own: the working mark may never have landed.
+            try:
+                client.reactions_remove(channel=channel, timestamp=timestamp, name=remove)
+            except Exception as error:  # noqa: BLE001 - removal failing is not a failure
+                log.debug("could not remove :%s: (%s)", remove, error)
+        client.reactions_add(channel=channel, timestamp=timestamp, name=name)
+    except Exception as error:  # noqa: BLE001 - see _reaction_scope_missing
+        text = str(error)
+        if "missing_scope" in text or "not_allowed_token_type" in text:
+            _reaction_scope_missing = True
+            log.warning(
+                "reactions are disabled: the Slack app needs the reactions:write scope (%s)", error
+            )
+            return
+        # already_reacted is the common one and means the mark is already there.
+        log.debug("could not add :%s: (%s)", name, error)
+
+
+def record_feedback(event: dict[str, Any], client: Any) -> None:
+    """Record a person's reaction to one of this bot's answers.
+
+    The battery measures answers against expectations I wrote. This measures them against the
+    people asking, which is the only source that can tell us an answer was correct but useless.
+    Written to a local file rather than a service: it is a signal to read, not state to depend on.
+    """
+    if event.get("item_user") != _bot_user_id:
+        return
+    item = event.get("item") or {}
+    if item.get("type") != "message":
+        return
+    verdict = _FEEDBACK.get(event.get("reaction", ""))
+    if verdict is None:
+        return
+    row = {
+        "at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "verdict": verdict,
+        "reaction": event.get("reaction"),
+        "channel": item.get("channel"),
+        "answer_ts": item.get("ts"),
+        "by": event.get("user"),
+        "qualifier": QUALIFIER,
+    }
+    try:
+        with FEEDBACK_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row) + "\n")
+    except OSError as error:  # noqa: BLE001 - feedback is a nicety, never a failure
+        log.debug("could not record feedback (%s)", error)
+        return
+    log.info("feedback %s on %s by %s", verdict, item.get("ts"), event.get("user"))
 
 
 def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
@@ -92,16 +185,20 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
         while len(_answered) > MAX_ANSWERED_EVENTS:
             _answered.pop(next(iter(_answered)))
 
+    _react(client, event, _WORKING)
     conversation = _thread_history(event, client)
     try:
         result = _ask(question, event, conversation)
     except Exception:
         # Log the detail, tell the channel only that it failed.
         log.exception("answer failed")
+        _react(client, event, _OUTCOME_REACTION["error"], remove=_WORKING)
         say(text="Something went wrong answering that. The failure is logged.", thread_ts=thread)
         return
 
     say(text=_format(result), thread_ts=thread, unfurl_links=False)
+    outcome = str(result.get("outcome", ""))
+    _react(client, event, _OUTCOME_REACTION.get(outcome, "warning"), remove=_WORKING)
 
 
 def _ask(
@@ -288,6 +385,17 @@ def main() -> None:
     # bot token fails at startup rather than on the first mention.
     app = App(token=os.environ["SLACK_BOT_TOKEN"], request_verification_enabled=False)
     app.event("app_mention")(answer_mention)
+    # A reaction on one of the bot's own answers is the only quality signal that comes from the
+    # people asking rather than from expectations someone wrote down. Needs the reactions:read
+    # scope and the reaction_added event subscription; without them no event arrives and nothing
+    # here runs, which is why it is registered unconditionally and never asserted.
+    app.event("reaction_added")(record_feedback)
+    # Resolved once here so the feedback handler can tell this bot's messages from anyone else's.
+    global _bot_user_id
+    try:
+        _bot_user_id = app.client.auth_test()["user_id"]
+    except Exception as error:  # noqa: BLE001 - the answer path does not need this
+        log.warning("could not resolve the bot user id, feedback will be ignored (%s)", error)
     log.info("connecting to Slack in Socket Mode, serving %s:%s", FUNCTION, QUALIFIER)
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
 
