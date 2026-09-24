@@ -234,6 +234,45 @@ _PLACEHOLDER: Final = (
     r"|x{6,}|\.{3,}|\*{6,}"
     r"|(?:not[-_]a[-_]real|dummy|placeholder|example|redacted|changeme|todo)[a-z0-9_.-]*)"
 )
+# "What can you do?" asked in the ways people actually ask it. A maintainer asked "what level of
+# support can you provide?" and got a generic deflection, which is a poor first impression and also
+# untrue: the answer is specific and knowable. It is answered HERE rather than by the model because
+# the model has no evidence about this service and must not invent any, and because a capability
+# list that drifts from the code is worse than none.
+_CAPABILITY: Final = re.compile(
+    r"^[^?.!]*\b(?:"
+    r"what\s+(?:can|could)\s+you\s+(?:do|help|answer|tell)"
+    r"|what\s+(?:level\s+of\s+)?(?:support|help|assistance)\s+(?:can|do|could)\s+you"
+    r"|what\s+(?:are|is)\s+your\s+(?:capabilit|skill|limit|scope|purpose)"
+    r"|what\s+(?:do|are)\s+you\s+(?:know|good\s+at|for)"
+    r"|what\s+kind\s+of\s+questions"
+    r"|how\s+(?:can|do)\s+you\s+help"
+    r"|who\s+(?:are|r)\s+(?:you|u)\b"
+    r"|what\s+are\s+you\b"
+    r")",
+    re.IGNORECASE,
+)
+# Kept deliberately concrete: every line names something the code actually does, so when a lookup
+# is added or removed this text is the place that has to change with it.
+_CAPABILITY_REPLY: Final = (
+    "I answer questions about the Valkey project from its own sources, and every answer"
+    " cites them.\n"
+    "\u2022 Documentation, code and community material indexed from the valkey-io"
+    " repositories: the server, valkey-doc, the website, community, the client libraries"
+    " and the modules.\n"
+    "\u2022 Present state read from GitHub when you ask for it: issues and pull requests"
+    " with their comments and reviews, releases and what a tag contains, project boards,"
+    " published security advisories.\n"
+    "\u2022 The repositories themselves: what is in a directory, a file at a tag, and where"
+    " a symbol appears in the source.\n"
+    '\u2022 Follow-ups in a thread, so you can ask "and in a cluster?" without repeating'
+    " yourself, in whichever language you ask in.\n"
+    "What I will not do: act on your behalf, so no merging, commenting, deploying or"
+    " triggering; read anything private; judge whether a release is ready; or answer from"
+    " outside the project public sources.\n"
+    "Naming a repository, version or command gets you a sharper answer, and if the evidence"
+    " does not support something I say so instead of guessing."
+)
 # Credential shapes a person might paste into a Slack question. Deliberately narrow: each
 # alternative is a token format with a fixed prefix or an unmistakable PEM header, so an ordinary
 # question about a command or a hash is never refused. A bare AWS access-key ID is deliberately
@@ -475,6 +514,10 @@ def _answer(
     # a person greeting the bot does not shout one word in backticks.
     asked = question.strip()
     is_hello_command = asked.strip("`").strip() == "HELLO"
+    # Before the greeting check, because "hi, what can you do?" is a capability question with a
+    # greeting attached, and before retrieval, because no corpus evidence describes this service.
+    if _CAPABILITY.search(asked) is not None:
+        return RuntimeResult("clarification", request_id, _CAPABILITY_REPLY)
     if not is_hello_command and _GREETING.fullmatch(asked) is not None:
         # A greeting carries no subject, so there is nothing to retrieve and nothing to ground.
         # Asking back is the right reply and it is the same reply every time; leaving it to the

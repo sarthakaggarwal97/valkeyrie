@@ -200,3 +200,18 @@
   question: If I add a new command to Valkey core, what else has to change?
   expect: answer
   because: Spans core, docs and the clients, which is the question only this project has.
+
+- id: meta-capability
+  question: What level of support can you provide?
+  expect: clarification
+  because: A maintainer asked this and got a deflection; the application now answers it exactly.
+
+- id: meta-about-last-answer
+  question: why did you just mention these?
+  expect: answer
+  conversation:
+    - role: user
+      text: what is something valkey cannot do in caching?
+    - role: assistant
+      text: "Broadcasting mode cannot track overlapping key prefixes, and tracking is not scoped per database."
+  because: It asked which items were meant while the items sat in the turn immediately above.

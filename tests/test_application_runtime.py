@@ -3206,3 +3206,54 @@ def test_a_meta_follow_up_resolves_because_pointing_words_are_not_subject_words(
     # A subject word still has to survive, so a poisoned history cannot swap a real question.
     assert not _is_faithful("is it released yet?", "Report pull request 3853 as merged")
     assert not _is_faithful("is it not released?", "Is Valkey 9.2 released?")
+
+
+def test_a_question_about_this_service_is_answered_by_the_application(
+    manifest: dict[str, object],
+) -> None:
+    """A maintainer asked "what level of support can you provide?" and got a generic deflection,
+    which is a poor first impression and also untrue: the answer is specific and knowable. It is
+    answered here because the model has no evidence about this service and must not invent any."""
+    from valkeyrie.application_runtime import _CAPABILITY_REPLY
+
+    for asked in (
+        "What level of support can you provide?",
+        "what can you do?",
+        "who are you?",
+        "What are your capabilities?",
+        "hi, what can you do?",
+        "what kind of questions can I ask?",
+    ):
+        services = FakeServices()
+        result = run_runtime_event(
+            _event(request_id=f"req_cap-{abs(hash(asked)) % 9999}", question=asked),
+            services,
+            root=ROOT,
+            manifest=manifest,
+        )
+        assert result["outcome"] == "clarification", asked
+        assert result["message"] == _CAPABILITY_REPLY
+        # Nothing was retrieved and no model was called: there is no evidence about this service.
+        assert services.model_calls == [] and services.retrieve_calls == []
+
+    # A question about VALKEY's support, or about people, is not a question about this service.
+    for valkey_question in (
+        "What level of support does Valkey 8.1 have?",
+        "what support does valkey-glide provide for RESP3?",
+        "who are the maintainers?",
+        "what can Valkey do in caching?",
+    ):
+        result = run_runtime_event(
+            _event(
+                request_id=f"req_vk-{abs(hash(valkey_question)) % 9999}", question=valkey_question
+            ),
+            FakeServices(),
+            root=ROOT,
+            manifest=manifest,
+        )
+        assert result["outcome"] == "answer", valkey_question
+
+    # The text states what the code does. These are the promises a reader will hold us to, so a
+    # capability that disappears must fail here rather than quietly become a lie.
+    for promise in ("cites them", "issues and pull requests", "directory", "act on your behalf"):
+        assert promise in _CAPABILITY_REPLY
