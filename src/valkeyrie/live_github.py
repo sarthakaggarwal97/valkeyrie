@@ -669,6 +669,9 @@ _RETRYABLE_STATUS: Final = frozenset({429, 500, 502, 503, 504})
 _FETCH_ATTEMPTS: Final = 3
 _RETRY_BASE_SECONDS: Final = 0.5
 _RETRY_CAP_SECONDS: Final = 4.0
+# The system source, not the default generator: jitter is not a secret, but the default generator is
+# refused outright by the security scan and arguing with it costs more than using the right one.
+_JITTER: Final = random.SystemRandom()
 
 
 def _retry_after_seconds(headers: Mapping[str, str], attempt: int) -> float:
@@ -688,7 +691,7 @@ def _retry_after_seconds(headers: Mapping[str, str], attempt: int) -> float:
             continue
         if name == "retry-after" and 0 <= value <= _RETRY_CAP_SECONDS * 4:
             return value
-    return random.uniform(0, min(_RETRY_CAP_SECONDS, _RETRY_BASE_SECONDS * (2**attempt)))
+    return _JITTER.uniform(0, min(_RETRY_CAP_SECONDS, _RETRY_BASE_SECONDS * (2**attempt)))
 
 
 def _fetch_with_retry(
@@ -720,7 +723,7 @@ def _fetch_with_retry(
                 continue
             return response
         if attempt < _FETCH_ATTEMPTS - 1:
-            sleep(random.uniform(0, min(_RETRY_CAP_SECONDS, _RETRY_BASE_SECONDS * (2**attempt))))
+            sleep(_JITTER.uniform(0, min(_RETRY_CAP_SECONDS, _RETRY_BASE_SECONDS * (2**attempt))))
     raise LiveGitHubError(f"live GitHub read failed: {last}") from last
 
 
