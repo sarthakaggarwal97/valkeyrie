@@ -196,6 +196,7 @@ class RuntimeServices(Protocol):
         reasoning_effort: str,
         clarification_asked: str | None = None,
         resolved_from_followup: bool = False,
+        previous_answer: str | None = None,
     ) -> BedrockTextResponse: ...
 
     def route(self, *, system: str, question: str) -> str:
@@ -730,6 +731,8 @@ def _answer(
         # as a fresh ambiguous one and asked which subject was meant: "and what about for 8.1?"
         # resolved correctly and was still handed back as a clarification.
         "resolved_from_followup": resolved_from_followup,
+        # This bot's own last reply, so a question about it can be answered instead of handed back.
+        "previous_answer": _previous_answer(conversation),
         # Set true by the one abstention retry, in the same revision that widens the evidence.
         "retry_attempted": False,
         "generation_id": generation_id,
@@ -876,6 +879,7 @@ def _execute_plan(
             reasoning_effort=cast(str, plan["reasoning_effort"]),
             clarification_asked=_plan_clarification_asked(plan),
             resolved_from_followup=plan.get("resolved_from_followup") is True,
+            previous_answer=_plan_previous_answer(plan),
         )
     except Exception:
         return RuntimeResult(
@@ -1312,6 +1316,7 @@ def _retry_with_supplement(
             reasoning_effort=cast(str, plan["reasoning_effort"]),
             clarification_asked=_plan_clarification_asked(plan),
             resolved_from_followup=plan.get("resolved_from_followup") is True,
+            previous_answer=_plan_previous_answer(plan),
         )
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
         output = _accept_output(normalized.response_text, widened)
@@ -1806,6 +1811,7 @@ def _existing_plan(
         "route",
         "clarification_asked",
         "resolved_from_followup",
+        "previous_answer",
         "retry_attempted",
         "generation_id",
         "knowledge_base_id",
@@ -1845,12 +1851,45 @@ def _clarification_already_asked(conversation: tuple[ConversationTurn, ...]) -> 
     return None
 
 
+# Enough to identify what "these" refers to, not enough to re-answer from. The reply itself is not
+# evidence, and a claim still has to cite evidence supplied with THIS request.
+_MAX_PREVIOUS_ANSWER_BYTES: Final = 1500
+
+
+def _previous_answer(conversation: tuple[ConversationTurn, ...]) -> str | None:
+    """This bot's own last reply, when that reply was an answer rather than a question.
+
+    A question ABOUT the last answer ("why did you just mention these?") is unanswerable without
+    it: the answer turn sees a standalone question and no history, so it asked which items were
+    meant while the items sat in the turn immediately above.
+    """
+    for turn in reversed(conversation):
+        if turn.role != "assistant":
+            continue
+        text = turn.text.strip()
+        # A question back is a clarification, which _clarification_already_asked carries instead.
+        if not text or text.endswith("?"):
+            return None
+        encoded = text.encode("utf-8")[:_MAX_PREVIOUS_ANSWER_BYTES]
+        return encoded.decode("utf-8", "ignore")
+    return None
+
+
 def _plan_clarification_asked(plan: Mapping[str, object]) -> str | None:
     value = plan.get("clarification_asked")
     if value is None:
         return None
     if not isinstance(value, str):
         raise ApplicationRuntimeError("pinned clarification is malformed")
+    return value
+
+
+def _plan_previous_answer(plan: Mapping[str, object]) -> str | None:
+    value = plan.get("previous_answer")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApplicationRuntimeError("pinned previous answer is malformed")
     return value
 
 
@@ -2753,6 +2792,7 @@ class AwsRuntimeServices:
         reasoning_effort: str,
         clarification_asked: str | None = None,
         resolved_from_followup: bool = False,
+        previous_answer: str | None = None,
     ) -> BedrockTextResponse:
         if model_id != self._model_id:
             raise ApplicationRuntimeError("pinned model target differs from deployed selection")
@@ -2766,6 +2806,10 @@ class AwsRuntimeServices:
             model_input["clarification_already_asked"] = clarification_asked
         if resolved_from_followup:
             model_input["resolved_from_followup"] = True
+        # Named for what it is so it cannot be mistaken for evidence: it is this assistant's own
+        # earlier words, and a claim still has to cite evidence supplied with this request.
+        if previous_answer is not None:
+            model_input["your_previous_reply_not_evidence"] = previous_answer
         response = (
             self._boto3()
             .client("bedrock-runtime")

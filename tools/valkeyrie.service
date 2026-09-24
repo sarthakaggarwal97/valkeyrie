@@ -1,0 +1,50 @@
+# Supervisor for the Slack bot. Install with:
+#
+#     mkdir -p ~/.config/systemd/user
+#     cp tools/valkeyrie.service ~/.config/systemd/user/
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now valkeyrie
+#
+# WHY THIS EXISTS. The bot used to run as a foreground process inside a tmux session, which made a
+# restart a matter of typing Ctrl-C into whatever that pane happened to be doing and hoping the
+# next line landed in a shell. Nothing restarted it when it died, so a broken Socket Mode
+# connection left it flapping for seven hours, and nothing recorded which version was serving.
+# Restarting is now one idempotent command and the answer to "is it running" is a question rather
+# than an inspection of a pane.
+#
+# Credentials live in ~/.config/valkeyrie/env (mode 0600), NOT here: this file is in the
+# repository. That file needs SLACK_BOT_TOKEN and SLACK_APP_TOKEN, and optionally SLACK_TEAM_ID
+# and AWS_PROFILE.
+
+[Unit]
+Description=Valkeyrie Slack bot
+# Socket Mode needs the network; a restart loop against a down interface is pointless noise.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspaces/valkey-meta/valkeyrie
+EnvironmentFile=%h/.config/valkeyrie/env
+# Pinned exactly as the manual command pinned them, so the supervised process and a hand-run one
+# are the same process. uv resolves these from its cache, so a restart does not hit the network.
+# Absolute path: a user service starts with a minimal PATH that does not include ~/.local/bin, and
+# "uv" alone exits 127. PATH is still set because uv resolves its own managed Python through it.
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/uv run --with boto3==1.40.21 --with slack-bolt==1.21.2 python tools/slack_bot.py
+# The failure that actually happened: the Slack websocket broke and the process stayed up retrying
+# forever without serving. Always-restart covers both a crash and a clean exit.
+Restart=always
+RestartSec=5
+# A crash loop must not hide itself by restarting faster than anyone can read the log.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# One bot per workspace: two processes would both answer the same mention.
+KillMode=mixed
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=valkeyrie
+
+[Install]
+WantedBy=default.target

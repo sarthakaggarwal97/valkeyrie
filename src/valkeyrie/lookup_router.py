@@ -342,7 +342,14 @@ _STOP: Final[frozenset[str]] = frozenset(
     # question that names the command, and "give" cannot survive into it, so requiring it threw
     # the resolution away and left a fragment that retrieves nothing. Dropping these cannot let a
     # poisoned history swap the subject: every subject word still has to survive.
-    "give show tell list explain provide send share get please thanks also again".split()
+    "give show tell list explain provide send share get please thanks also again "
+    # Words that POINT at the antecedent instead of naming it. A resolution of "why did you just
+    # mention these?" names the subject the pointer stood for, so it cannot keep "mention" or
+    # "these", and requiring them threw the resolution away and left a fragment that retrieves
+    # nothing. The subject words of the fragment must still survive, so a poisoned history still
+    # cannot swap the question.
+    "just mention mentioned these those them that this said says above earlier previous "
+    "before first second third last one".split()
 )
 
 

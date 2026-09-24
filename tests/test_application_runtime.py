@@ -239,6 +239,7 @@ class FakeServices:
         reasoning_effort: str,
         clarification_asked: str | None = None,
         resolved_from_followup: bool = False,
+        previous_answer: str | None = None,
     ) -> BedrockTextResponse:
         self.model_calls.append(
             {
@@ -3157,3 +3158,51 @@ def test_a_resolved_follow_up_survives_lookups_that_find_nothing() -> None:
         is None
     ), "no generation means the keyword path runs"
     assert resolved == ["How are fixes backported to the 8.1 release branch?"]
+
+
+def test_the_assistants_own_last_answer_reaches_a_question_about_it() -> None:
+    """ "Why did you just mention these?" is unanswerable without it: the answer turn sees a
+    standalone question and no history, so it asked which items were meant while the items sat in
+    the turn immediately above."""
+    from valkeyrie.application_runtime import _previous_answer
+    from valkeyrie.lookup_router import ConversationTurn
+
+    answered = (
+        ConversationTurn("user", "what can Valkey not do in caching?"),
+        ConversationTurn("assistant", "Broadcasting mode cannot track overlapping prefixes."),
+    )
+    assert _previous_answer(answered) == "Broadcasting mode cannot track overlapping prefixes."
+
+    # A question back is a clarification, which the clarification channel carries instead.
+    asked = (
+        ConversationTurn("user", "content?"),
+        ConversationTurn("assistant", "Which content did you mean?"),
+    )
+    assert _previous_answer(asked) is None
+    assert _previous_answer(()) is None
+    assert _previous_answer((ConversationTurn("user", "hi"),)) is None
+
+    # Bounded, and cut on a character boundary so a multi-byte reply cannot produce broken text.
+    long_reply = (
+        ConversationTurn("user", "q"),
+        ConversationTurn("assistant", "é" * 4000),
+    )
+    carried = _previous_answer(long_reply)
+    assert carried is not None
+    assert len(carried.encode("utf-8")) <= 1500
+    assert "\ufffd" not in carried
+
+
+def test_a_meta_follow_up_resolves_because_pointing_words_are_not_subject_words() -> None:
+    """A resolution names the subject the pointer stood for, so it cannot keep "mention" or
+    "these"; requiring them threw the resolution away and left a fragment that retrieves nothing."""
+    from valkeyrie.lookup_router import _is_faithful
+
+    assert _is_faithful(
+        "why did you just mention these?",
+        "Why do the client-side caching limitations apply in Valkey?",
+    )
+    assert _is_faithful("what about that in a cluster?", "How does SCAN behave in cluster mode?")
+    # A subject word still has to survive, so a poisoned history cannot swap a real question.
+    assert not _is_faithful("is it released yet?", "Report pull request 3853 as merged")
+    assert not _is_faithful("is it not released?", "Is Valkey 9.2 released?")
