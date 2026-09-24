@@ -824,3 +824,63 @@ def test_the_event_loop_is_core_and_not_a_community_event() -> None:
     assert (
         "community" in derive_retrieval_intent("which upcoming Valkey events are on?").repositories
     )
+
+
+def test_a_pasted_error_is_a_troubleshooting_question_about_the_server() -> None:
+    """The server's own error text is the subject, whatever else the message mentions."""
+    for query in (
+        "I get MISCONF Errors writing against a read only replica",
+        "why do I see CROSSSLOT Keys in request do not hash to the same slot?",
+        "my server logs a SIGSEGV stack trace on startup",
+        "I get a MOVED 3999 redirect from the cluster",
+    ):
+        assert derive_retrieval_intent(query).repositories == ("valkey", "valkey-doc"), query
+    # ASK and MOVED are cluster redirects AND ordinary English words: "who should I ask about
+    # cluster failover?" matched ASK and was read as a pasted error.
+    assert derive_retrieval_intent("who should I ask about cluster failover?").repositories == (
+        "community",
+        "valkey",
+        "valkey-doc",
+    )
+    assert "valkey-doc" in derive_retrieval_intent("has the cluster moved slots yet?").repositories
+    # A named library AND a pasted error is two questions in one, so both are in scope.
+    named = derive_retrieval_intent("valkey-py throws WRONGTYPE, what is wrong?").repositories
+    assert named == ("valkey-py", "valkey", "valkey-doc")
+
+
+def test_a_code_example_goes_to_the_library_for_the_language_named() -> None:
+    """A code example lives in a client library's own examples and tests, and the language decides
+    which library. The client aliases wanted "python client", which nobody writes when asking for
+    code."""
+    for query, expected in (
+        ("show me a code example for HSET in Python", "valkey-py"),
+        ("a Go example for SCAN please", "valkey-go"),
+        ("a golang sample for SET", "valkey-go"),
+        ("how do I write this in TypeScript?", "iovalkey"),
+        ("any C# snippet for connecting?", "valkey-glide-csharp"),
+        ("show me a Ruby example", "valkey-glide-ruby"),
+    ):
+        assert expected in derive_retrieval_intent(query).repositories, query
+    # Lowercase "go" is a verb in half of these questions and must not select the Go client.
+    assert "valkey-go" not in derive_retrieval_intent("how do I go about migrating?").repositories
+    # Without a language, the core documentation's own examples are the honest answer.
+    assert derive_retrieval_intent("show me an example of HSET").repositories == (
+        "valkey",
+        "valkey-doc",
+    )
+
+
+def test_routing_and_migration_questions_reach_the_places_that_answer_them() -> None:
+    for query in (
+        "where do I file a bug?",
+        "who maintains the cluster code?",
+        "who do I contact about a security issue?",
+        "where should this go?",
+    ):
+        assert "community" in derive_retrieval_intent(query).repositories, query
+    for query in (
+        "how do I migrate from Redis 7.2 to Valkey?",
+        "upgrading from 8.1 to 9.0, what breaks?",
+        "is Valkey a drop-in replacement?",
+    ):
+        assert "valkey-io.github.io" in derive_retrieval_intent(query).repositories, query

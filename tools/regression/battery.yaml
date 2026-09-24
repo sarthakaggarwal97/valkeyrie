@@ -215,3 +215,28 @@
     - role: assistant
       text: "Broadcasting mode cannot track overlapping key prefixes, and tracking is not scoped per database."
   because: It asked which items were meant while the items sat in the turn immediately above.
+
+- id: copilot-troubleshooting
+  question: I get MISCONF Errors writing against a read only replica, what now?
+  expect: answer
+  because: A pasted error is the subject of the message, whatever library it also mentions.
+
+- id: copilot-troubleshooting-known
+  question: my valkey server keeps crashing with SIGSEGV on startup, is this known?
+  expect: answer
+  because: Half of troubleshooting is whether someone already hit it, which only issues can answer.
+
+- id: copilot-code-example
+  question: show me a code example for HSET in Python
+  expect: answer
+  because: Examples live in the client libraries, and a bare language name has to select one.
+
+- id: copilot-routing
+  question: where do I file a bug for the Helm chart?
+  expect: answer
+  because: Routing a person to the right repository is its own question.
+
+- id: copilot-migration
+  question: upgrading from 8.1 to 9.0, what breaks?
+  expect: answer
+  because: Migration spans release notes, compatibility statements and the website guidance.

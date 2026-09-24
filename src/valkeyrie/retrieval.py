@@ -213,11 +213,93 @@ _FEATURE_ALIASES: Final = (
         ("sorted sets", "ZADD", "ZINCRBY", "ZRANGE", "ZREVRANK"),
     ),
 )
+# An error string or a log line pasted into Slack. These are the server's own words, so they are
+# unambiguous: the person is troubleshooting, and the answer is in the core sources and the
+# documentation rather than in a client library or the website. The live supplement adds known
+# issues for the same token, because "is this a known bug" is half the question.
+_TROUBLESHOOTING: Final = re.compile(
+    # NOT case-insensitive overall. Some error names are ordinary English words: ASK and MOVED are
+    # cluster redirects, LOADING and READONLY are error prefixes, and "who should I ask about
+    # cluster failover?" matched ASK and was read as a pasted error. Those need their upper-case
+    # error form. The rest are unmistakable in any case, so they carry a scoped (?i:) group.
+    r"(?i:wrongtype|crossslot|clusterdown|masterdown|misconf|noauth|noperm|busygroup|noscript"
+    r"|noreplicas|execabort|sigsegv|sigbus|sigabrt|segmentation\s+fault|stack\s+trace"
+    r"|protocol\s+error|bad\s+message\s+length|maxmemory\s+limit)"
+    r"|\b(?:ASK|MOVED|LOADING|READONLY|ERR|OOM|=== VALKEY BUG REPORT)\b"
+)
+# "Show me how to do X in <language>". A code example lives in a client library's own examples and
+# tests, not in the server documentation, and the language decides which library.
+_CODE_EXAMPLE: Final = re.compile(
+    r"\b(?:code\s+)?(?:example|examples|sample|samples|snippet|snippets|boilerplate)\b"
+    r"|\bhow\s+(?:do|would)\s+(?:i|you|we)\s+(?:write|code|call|connect|use)\b"
+    r"|\bshow\s+me\s+(?:the\s+)?(?:code|how)\b",
+    re.IGNORECASE,
+)
+# "Where does this belong, who owns it, where do I file it." Routing a person to the right place is
+# its own question, and the answer is the repository taxonomy and the ownership files.
+_ROUTING: Final = re.compile(
+    r"\b(?:where\s+(?:do|should|can)\s+(?:i|we)\s+(?:file|report|open|raise|ask|post|start)"
+    r"|which\s+repo(?:sitory)?\s+(?:does|should|do)"
+    # Not "who reviews X": "who reviews blog content?" is an editorial question, and the
+    # ownership words below already cover the routing sense.
+    r"|who\s+(?:owns|maintains|should\s+(?:i|we)\s+(?:ask|contact))"
+    r"|who\s+do\s+(?:i|we)\s+(?:ask|contact|talk\s+to)"
+    r"|where\s+(?:does|should)\s+(?:this|that|it)\s+(?:go|belong)"
+    r"|how\s+do\s+(?:i|we)\s+(?:get|find)\s+help)\b",
+    re.IGNORECASE,
+)
+# Redis to Valkey, or one Valkey version to another. Compatibility statements live in the core
+# repository and the documentation, and the website carries the migration guidance.
+_MIGRATION: Final = re.compile(
+    r"\bmigrat(?:e|ing|ion)\b|\bupgrad(?:e|ing)\b|\bdowngrad(?:e|ing)\b"
+    r"|\b(?:moving|switch(?:ing)?|coming|port(?:ing)?)\s+(?:from|to)\s+(?:redis|valkey)\b"
+    r"|\bdrop[- ]in\s+replacement\b|\bbackward[s]?\s+compatib\w*\b",
+    re.IGNORECASE,
+)
+# The language a code example is wanted in, and where that library's own examples live.
+_EXAMPLE_LANGUAGES: Final[tuple[tuple[re.Pattern[str], tuple[str, ...]], ...]] = (
+    (re.compile(r"\bpython\b", re.IGNORECASE), ("valkey-py", "valkey-glide", "valkey-doc")),
+    (
+        re.compile(r"\b(?:java|kotlin)\b", re.IGNORECASE),
+        ("valkey-java", "valkey-glide", "valkey-doc"),
+    ),
+    (
+        re.compile(r"\b(?:node|nodejs|node\.js|javascript|typescript|ts)\b", re.IGNORECASE),
+        ("iovalkey", "valkey-glide", "valkey-doc"),
+    ),
+    # Case-sensitive "Go", because lowercase "go" is a verb in half of these questions.
+    (
+        re.compile(r"\bGo\b|\bgolang\b|\bgo\s+(?:example|client|code|snippet)\b"),
+        ("valkey-go", "valkey-glide", "valkey-doc"),
+    ),
+    # "C++" and "C#" END in non-word characters, so a trailing \b after them never matches.
+    (
+        re.compile(r"\bc\+\+|\bcpp\b", re.IGNORECASE),
+        ("valkey-glide-cpp", "libvalkey", "valkey-doc"),
+    ),
+    (
+        re.compile(r"\bc#|\bcsharp\b|\.net\b|\bdotnet\b", re.IGNORECASE),
+        ("valkey-glide-csharp", "valkey-doc"),
+    ),
+    (re.compile(r"\bphp\b", re.IGNORECASE), ("valkey-glide-php", "valkey-doc")),
+    (re.compile(r"\bruby\b", re.IGNORECASE), ("valkey-glide-ruby", "valkey-doc")),
+    (re.compile(r"\bswift\b", re.IGNORECASE), ("valkey-swift", "valkey-doc")),
+    (re.compile(r"\brust\b", re.IGNORECASE), ("valkey-glide", "valkeymodule-rs", "valkey-doc")),
+    (
+        re.compile(r"\b(?:bare\s+)?c\b(?!\+\+|#)", re.IGNORECASE),
+        ("libvalkey", "valkey", "valkey-doc"),
+    ),
+)
 _CATEGORY_SCOPES: Final = (
     (
         re.compile(r"\b(?:skills summary|valkey-skills)\b", re.IGNORECASE),
         ("valkey-doc", "valkey-skills"),
     ),
+    # Troubleshooting first: a pasted error outranks every other word in the message, including a
+    # client library name, because the error text is the subject.
+    (_TROUBLESHOOTING, ("valkey", "valkey-doc")),
+    (_ROUTING, ("community", "valkey", "valkey-doc")),
+    (_MIGRATION, ("valkey", "valkey-doc", "valkey-io.github.io")),
     (
         # The TSC itself is documented in the core repository, but its MEETINGS are minuted in
         # valkey-io/community, so that wording is left to the meeting scope below.
@@ -369,6 +451,10 @@ def _requested_repositories(query: str) -> tuple[str, ...]:
         # on its own it means the project, and the category scopes below handle that.
         if _contains_term(re.sub(r"valkey-[a-z0-9.-]+", " ", query, flags=re.IGNORECASE), "valkey"):
             return (*explicit, "valkey")
+        # "valkey-py throws WRONGTYPE" is two questions in one: what the client did, and what the
+        # error means. The error is defined by the server, so both are in scope.
+        if _TROUBLESHOOTING.search(query) is not None:
+            return (*explicit, "valkey", "valkey-doc")
         return explicit
 
     for pattern, repositories in _SIBLING_ALIASES:
@@ -385,6 +471,20 @@ def _requested_repositories(query: str) -> tuple[str, ...]:
     for pattern, repositories in _CATEGORY_SCOPES:
         if pattern.search(query):
             return repositories
+
+    # A code example belongs to a client library, chosen by the language named. Without a language
+    # the core documentation's own examples are the honest answer.
+    if _CODE_EXAMPLE.search(query) is not None:
+        for_language = _repositories_for_aliases(query, _CLIENT_ALIASES, ())
+        if for_language:
+            return (*for_language, "valkey-doc")
+        if _contains_term(query, "glide"):
+            return ("valkey-glide", "valkey-glide-docs")
+        # A bare language name is how people ask: "an example for HSET in Python". The client
+        # aliases need "python client", which nobody writes when they are asking for code.
+        for pattern, repositories in _EXAMPLE_LANGUAGES:
+            if pattern.search(query):
+                return repositories
 
     # MODULE LOAD and CLIENT LIST are core server commands. Matching the bare words "module" and
     # "client" sent them to the eight module repositories and the sixteen client libraries, where

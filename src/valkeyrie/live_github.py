@@ -494,6 +494,25 @@ def infer_live_query(question: str) -> LiveGitHubQuery | None:
 # compression question scoring HIGHER than the documentation questions that need no supplement.
 _SUPPLEMENT_INTENT_TERMS: Final = frozenset(
     {
+        # A pasted error name. "Is this a known bug" is half of every troubleshooting question, and
+        # only the issue tracker can answer it: the documentation says what the error means, never
+        # whether someone has already hit it.
+        "wrongtype",
+        "crossslot",
+        "clusterdown",
+        "misconf",
+        "busygroup",
+        "execabort",
+        "noreplicas",
+        "sigsegv",
+        "sigabrt",
+        "crash",
+        "crashes",
+        "crashing",
+        "panic",
+        "hang",
+        "hangs",
+        "leak",
         "available",
         "design",
         "designed",
