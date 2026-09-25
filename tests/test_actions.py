@@ -10,7 +10,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
-import actions
+# The same pattern test_slack_bot.py uses for the same reason: the module lives beside the bot
+# script rather than in the package, so mypy has no stub for it and pytest resolves it by path.
+actions = pytest.importorskip("actions")
 
 OPERATOR = "U08UZUQ790R"
 
@@ -94,7 +96,7 @@ def test_a_dispatch_is_audited_before_it_is_sent(
     """A crash mid-send must leave a record of intent rather than a mystery run."""
     monkeypatch.setattr(actions, "AUDIT_PATH", tmp_path / "audit.jsonl")
 
-    def boom(request, timeout):  # noqa: ANN001, ANN202
+    def boom(request: object, timeout: float) -> None:
         raise AssertionError("sent")
 
     monkeypatch.setattr(actions.urllib.request, "urlopen", boom)
