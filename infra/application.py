@@ -771,11 +771,20 @@ def _runtime_statements(stack: Stack, artifact: ApplicationArtifact) -> list[dic
             "Resource": kb,
         },
         {
-            # Reranking the wide retrieval. bedrock:Rerank is authorized on the reranker model,
-            # and the model is also invoked, so both actions name the one exact model ARN.
-            "Sid": "RerankWithExactModel",
+            # bedrock:Rerank is authorized against "*", not the model: scoped to the model ARN it
+            # is denied, proven with a federation-token probe. The wildcard grants nothing on its
+            # own, because the reranker also needs InvokeModel on the model it uses, and THAT is
+            # pinned to one exact ARN in the next statement. Proven the same way: Rerank on "*"
+            # without the InvokeModel pin is denied.
+            "Sid": "RerankRetrievalCandidates",
             "Effect": "Allow",
-            "Action": ["bedrock:Rerank", "bedrock:InvokeModel"],
+            "Action": "bedrock:Rerank",
+            "Resource": "*",
+        },
+        {
+            "Sid": "InvokeExactRerankerModel",
+            "Effect": "Allow",
+            "Action": "bedrock:InvokeModel",
             "Resource": "arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0",
         },
         {
