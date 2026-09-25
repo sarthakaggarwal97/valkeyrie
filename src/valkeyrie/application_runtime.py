@@ -14,7 +14,7 @@ import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
@@ -911,6 +911,9 @@ def _execute_plan(
     completion_clock: Callable[[], str] | None = None,
 ) -> RuntimeResult:
     generation_id = _plan_generation_id(plan)
+    # The date the retry's router sees. From the trusted clock when there is one, else the
+    # caller's completion timestamp, which is what the first router saw too.
+    today = (completion_clock() if completion_clock is not None else completed_at)[:10]
     if not _controls_enabled(services):
         return RuntimeResult(
             "partial",
@@ -1010,7 +1013,8 @@ def _execute_plan(
             request_id=request_id,
             revision=revision,
             fence=fence,
-            shortfall=message,
+            shortfall=message or "",
+            today=today,
         )
         if retried is not None:
             if retried.lost:
@@ -1416,7 +1420,8 @@ def _retry_with_supplement(
     request_id: str,
     revision: int,
     fence: int,
-    shortfall: str | None = None,
+    shortfall: str,
+    today: str,
 ) -> _Retry | None:
     """Ask once more with the GitHub supplement forced on. None means keep the abstention as is.
 
@@ -1425,12 +1430,14 @@ def _retry_with_supplement(
     not "no live evidence yet": a plan whose live records did not help can still be rescued by
     different ones, and a plan that already holds what the supplement would add cannot.
 
-    Two sources widen the package. The forced generic supplement, as before. And, when the
-    abstention named what was missing, the router is asked once more with that shortfall as data
-    and its chosen lookups run: the file that holds the option, the release notes for the version,
-    the listing where the path was unknown. This is the evidence-sufficiency pass: the first answer
-    is the sufficiency judge, the router turns its verdict into exactly the lookups that would
-    satisfy it, and both stay inside the same closed catalog and the same evidence bounds.
+    The evidence-sufficiency pass. The first answer is the sufficiency judge: its own reason for
+    abstaining travels to the router as data, and the router turns it into exactly the lookups
+    that would satisfy it, the file that holds the option, the release notes for the version, the
+    listing where the path was unknown. The generic forced issue/PR search stays as insurance for
+    a router that chose something unhelpful, but the two are merged and deduplicated by canonical
+    query identity before ONE fetch: reproduced, running them as two fetches searched the same
+    terms twice in a different order. Everything stays inside the closed catalog and the evidence
+    bounds.
 
     The widened package is persisted as a plan revision BEFORE the second model call. Any
     failure inside the retry itself (a fetch, the model, the parse) leaves the abstention in
@@ -1440,12 +1447,14 @@ def _retry_with_supplement(
     if plan.get("retry_attempted") is True:
         return None
     question = cast(str, plan["question"])
+    queries = _shortfall_lookups(services, question, shortfall, today=today)
+    queries = _merged_queries(queries, _supplement_queries(question, force=True))
+    if not queries:
+        return None
     try:
-        supplement = _forced_supplementary_live_evidence(services, question)
+        supplement = tuple(_live_records(services, queries))
     except Exception:
-        supplement = ()
-    if shortfall:
-        supplement = (*supplement, *_shortfall_lookups(services, question, shortfall))
+        return None
     if not supplement:
         return None
     known = {item.evidence_id for item in evidence}
@@ -1493,28 +1502,48 @@ def _retry_with_supplement(
 
 
 def _shortfall_lookups(
-    services: RuntimeServices, question: str, shortfall: str
-) -> tuple[RuntimeEvidence, ...]:
-    """Live records for the lookups the router chooses given the first answer's shortfall.
+    services: RuntimeServices, question: str, shortfall: str, *, today: str
+) -> tuple[LiveGitHubQuery, ...]:
+    """The live lookups the router chooses given the first answer's shortfall.
 
-    Best-effort in every part: a router failure, an empty plan, or a failed read yields no
-    records, and the retry then rests on the generic supplement alone. Only live lookups are
-    taken; the corpus search already ran once for this question.
+    Best-effort: a router failure or an empty plan yields no lookups, and the retry then rests on
+    the generic supplement. Only live lookups are taken; the corpus search already ran once for
+    this question. The plan's resolved question and retrieval query are ignored: the pinned
+    question is settled.
     """
     try:
         plan = route_lookups(
             question,
             lambda system, prompt: services.route(system=system, question=prompt),
+            today=today,
             shortfall=shortfall,
         )
     except Exception:
         return ()
-    if plan is None or not plan.live:
+    if plan is None:
         return ()
-    try:
-        return tuple(_live_records(services, plan.live))
-    except Exception:
-        return ()
+    return plan.live
+
+
+def _merged_queries(
+    first: tuple[LiveGitHubQuery, ...], second: tuple[LiveGitHubQuery, ...]
+) -> tuple[LiveGitHubQuery, ...]:
+    """Both sets in order, each distinct query once, distinctness judged on canonical content:
+    a search for the same terms in another order, or the same repositories listed differently,
+    is the same search and is fetched once."""
+    seen: set[str] = set()
+    merged: list[LiveGitHubQuery] = []
+    for query in (*first, *second):
+        fields = {
+            key: sorted(value) if isinstance(value, (tuple, list)) else value
+            for key, value in asdict(query).items()
+        }
+        key = type(query).__name__ + json.dumps(fields, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(query)
+    return tuple(merged)
 
 
 def _forced_supplementary_live_evidence(
@@ -2553,16 +2582,31 @@ def _runtime_retrieval_metadata(metadata: object, text: str = "") -> Mapping[str
 # corpus: reranking the top 20 changed 4 to 5 of the top 10 on three of five questions and moved
 # the correct document to rank 1 on two of them ("event loop" -> src/ae.c). Anthropic's contextual
 # retrieval work puts reranking at the largest single retrieval lever they measured. The reranker
-# is best-effort: any failure returns the first ten of the wide set, which is exactly today's
-# result, so a Bedrock hiccup can never cost an answer.
+# is best-effort: any failure keeps the first ten of the wide retrieval in Bedrock's order, which
+# is the ten the previous implementation asked for, so a Bedrock hiccup can never cost an answer.
 _RETRIEVE_WIDE: Final = 20
 _RETRIEVE_KEEP: Final = 10
 _RERANKER_MODEL_ARN: Final = "arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0"
+# Whole hierarchical parents (measured mean 4,893 bytes) go to the reranker; a 2,000-character
+# prefix hid the query-bearing part of a parent and let a decoy win. The cap is a safety bound for
+# a pathological chunk, not a budget.
+_RERANK_TEXT_CHARS: Final = 8000
 
 
 def _runtime_retrieve(
-    client: Any, knowledge_base_id: str, query: str, retrieval_filter: Mapping[str, object]
+    client: Any,
+    knowledge_base_id: str,
+    query: str,
+    retrieval_filter: Mapping[str, object],
+    *,
+    rerank: bool = True,
 ) -> Mapping[str, object]:
+    """The wide retrieval, reranked to ten unless ``rerank`` is False, then the first ten.
+
+    The per-repository quota calls pass ``rerank=False``: they fill a share of one to three
+    results each, and reranking twenty candidates for that share would multiply the reranker's
+    cost by the number of repositories named for no ordering the merge respects.
+    """
     try:
         response = client.retrieve(
             knowledgeBaseId=knowledge_base_id,
@@ -2579,12 +2623,23 @@ def _runtime_retrieve(
         raise ApplicationRuntimeError(f"static retrieval intent is invalid: {error}") from error
     if not isinstance(response, Mapping):
         raise ApplicationRuntimeError("Bedrock retrieval response is malformed")
+    if not rerank:
+        results = response.get("retrievalResults")
+        if isinstance(results, list) and len(results) > _RETRIEVE_KEEP:
+            return {**response, "retrievalResults": results[:_RETRIEVE_KEEP]}
+        return response
     return _reranked(client, query, response)
 
 
 def _reranked(client: Any, query: str, response: Mapping[str, object]) -> Mapping[str, object]:
     """The wide retrieval reordered by a reranker and cut to the evidence budget, or the first
-    ten of it unchanged when reranking is unavailable."""
+    ten of it unchanged when reranking is unavailable.
+
+    Each kept item's ``score`` becomes the reranker's relevance score. The verifier downstream
+    sorts within an authority bucket by score, so leaving Bedrock's similarity score in place
+    would have let it silently undo the reranking: reproduced, the verifier reversed a perfectly
+    reranked ten. The score IS the relevance the reranker assigned, so nothing is invented.
+    """
     results = response.get("retrievalResults")
     if not isinstance(results, list) or len(results) <= _RETRIEVE_KEEP:
         return response
@@ -2598,9 +2653,7 @@ def _reranked(client: Any, query: str, response: Mapping[str, object]) -> Mappin
                     "type": "INLINE",
                     "inlineDocumentSource": {
                         "type": "TEXT",
-                        # Bounded: the reranker prices by input, and the first part of a chunk is
-                        # what carries its subject.
-                        "textDocument": {"text": str(text)[:2000] or " "},
+                        "textDocument": {"text": str(text)[:_RERANK_TEXT_CHARS] or " "},
                     },
                 }
             )
@@ -2615,18 +2668,30 @@ def _reranked(client: Any, query: str, response: Mapping[str, object]) -> Mappin
                 },
             },
         )
-        order = [
-            int(entry["index"])
-            for entry in ranked.get("results", [])
-            if isinstance(entry, Mapping) and isinstance(entry.get("index"), int)
+        entries = ranked.get("results") if isinstance(ranked, Mapping) else None
+        # Exactly ten, each a real int (a JSON boolean is an int to Python and would select
+        # document 1), distinct, in range, with a numeric relevance. Anything else is a failure,
+        # never a shorter package: one valid index must not shrink twenty candidates to one.
+        if not isinstance(entries, list) or len(entries) != _RETRIEVE_KEEP:
+            raise ValueError("reranker returned the wrong number of results")
+        order: list[tuple[int, float]] = []
+        for entry in entries:
+            index = entry.get("index") if isinstance(entry, Mapping) else None
+            relevance = entry.get("relevanceScore") if isinstance(entry, Mapping) else None
+            if type(index) is not int or not 0 <= index < len(results):
+                raise ValueError("reranker returned an unusable index")
+            if not isinstance(relevance, (int, float)) or isinstance(relevance, bool):
+                raise ValueError("reranker returned an unusable relevance")
+            score = float(relevance)
+            if not 0.0 <= score <= 1.0:
+                raise ValueError("reranker returned an unusable relevance")
+            order.append((index, score))
+        if len({index for index, _ in order}) != len(order):
+            raise ValueError("reranker returned a duplicate index")
+        reordered = [
+            {**cast(Mapping[str, object], results[index]), "score": relevance}
+            for index, relevance in order
         ]
-        if (
-            not order
-            or len(set(order)) != len(order)
-            or any(i < 0 or i >= len(results) for i in order)
-        ):
-            raise ValueError("reranker returned an unusable ordering")
-        reordered = [results[i] for i in order[:_RETRIEVE_KEEP]]
     except Exception as error:  # noqa: BLE001 - a rerank failure is a degradation, not a loss
         _LOG.warning("reranking unavailable, keeping retrieval order: %s", error)
         reordered = results[:_RETRIEVE_KEEP]
@@ -2851,7 +2916,9 @@ class AwsRuntimeServices:
         combined ranking, never a requirement: if it fails or returns something unverifiable, that
         repository keeps whatever the combined call already gave it."""
         try:
-            response = _runtime_retrieve(client, knowledge_base_id, intent.query, scoped)
+            response = _runtime_retrieve(
+                client, knowledge_base_id, intent.query, scoped, rerank=False
+            )
             results = verify_retrieval_results(
                 response, generation_id, "generation_id", 10, (repository,)
             )

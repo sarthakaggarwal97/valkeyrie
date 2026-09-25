@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Final, Literal
 
 from valkeyrie.live_github import (
+    ALLOWED_REPOSITORIES,
     MAX_SEARCH_LABELS,
     MAX_SEARCH_REPOSITORIES,
     MAX_SEARCH_TERMS,
@@ -761,6 +762,11 @@ def _repository(item: Mapping[str, object]) -> str:
         raise LookupRouterError("lookup repository is malformed")
     if repository.startswith(".") or ".." in repository:
         raise LookupRouterError("lookup repository is malformed")
+    # The parser is the boundary, so it refuses what the transport would refuse anyway. A
+    # syntactically valid name outside the reviewed inventory used to parse into a typed query and
+    # fail only at fetch time; now the plan is refused before anything is scheduled.
+    if repository not in ALLOWED_REPOSITORIES:
+        raise LookupRouterError("lookup repository is not in the reviewed inventory")
     return repository
 
 

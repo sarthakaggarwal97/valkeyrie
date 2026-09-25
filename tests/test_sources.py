@@ -36,6 +36,13 @@ def test_reviewed_inventory_loads_and_classifies_fail_closed() -> None:
     assert len(_repositories(document)) == 46
     assert classify_path(document, "valkey", "src/server.c") == "include"
     assert classify_path(document, "valkey", "src/generated/server.c") == "exclude"
+    # The two configuration references document every option with its default and the prose
+    # explaining it; they were missing from the corpus for weeks and every configuration
+    # question answered from test files by luck. Exactly these two, not any .conf.
+    assert classify_path(document, "valkey", "valkey.conf") == "include"
+    assert classify_path(document, "valkey", "sentinel.conf") == "include"
+    assert classify_path(document, "valkey", "unreviewed.conf") == "exclude"
+    assert classify_path(document, "valkey", "tests/assets/valkey.conf") == "exclude"
     assert classify_path(document, "valkey", "unreviewed/source.c") == "exclude"
     assert (
         classify_path(

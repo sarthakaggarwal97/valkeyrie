@@ -12,11 +12,13 @@ decides whether its evidence is enough. One pass tells you whether a question CA
 tell you whether it RELIABLY is. A question that answers two draws in three is not passing, it is
 flaking, and a single pass hides exactly the failure that took four draws to see in production.
 
-TWO AXES. A RAG answer can fail in two independent places, and one pass/fail hides which. An entry
-may name `cites` (a path fragment), and the run then reports separately whether the answer CITED a
-source containing that fragment. An answer that is correct but cited the wrong document is a
-retrieval problem; an answer that cited the right document and still went wrong is a drafting
-problem. The evaluation literature is unanimous that conflating the two makes both unfixable.
+TWO AXES. A RAG answer can fail in two independent places, and one pass/fail hides which. Axis one
+is the answer SHAPE: the outcome the entry expects, with at least one claim for an answer. Axis two,
+for an entry that names `cites` (a substring of a citation), is whether the answer CITED a source
+matching it. Neither axis judges the claims' truth; a wrong claim citing the right file passes both.
+What the second axis buys is attribution: an answer with the right shape that did not cite the
+expected source is a RETRIEVAL problem and is marked so, and it FAILS the draw, because the answer
+was drawn from somewhere other than where the truth lives.
 
 Exit status is 0 only when every question matched its expectation on every draw, so this is usable
 as a gate. Failures print the outcome and the message so the reason is in the output, not in a
@@ -139,7 +141,8 @@ def main() -> int:
             "seconds": round(time.monotonic() - started, 1),
             "cites": wanted,
             "cited_ok": cited_ok,
-            "passed": _outcome_matches(case["expect"], str(result.get("outcome")), len(claims)),
+            "passed": _outcome_matches(case["expect"], str(result.get("outcome")), len(claims))
+            and cited_ok is not False,
         }
 
     work = [(case, draw) for case in cases for draw in range(1, args.draws + 1)]

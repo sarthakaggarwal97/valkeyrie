@@ -556,3 +556,22 @@ def test_a_shortfall_rides_as_bounded_data_beside_the_question() -> None:
 
     # Without a shortfall or history the prompt is the bare dated question, as before.
     assert _router_prompt("q", (), today="2026-09-25") == "Today is 2026-09-25.\nq"
+    # The bound is reviewed policy, not whatever the constant happens to say.
+    assert MAX_SHORTFALL_BYTES == 600
+
+
+def test_the_parser_refuses_a_repository_outside_the_reviewed_inventory() -> None:
+    """The parser is the boundary. A syntactically valid name the transport would refuse anyway
+    is refused HERE, before anything is scheduled, so a shortfall or history that steers the router
+    toward an unreviewed repository never produces a typed query."""
+    from valkeyrie.lookup_router import LookupRouterError, parse_lookup_plan
+
+    with pytest.raises(LookupRouterError, match="reviewed inventory"):
+        parse_lookup_plan('{"lookups":[{"kind":"issue","repository":"valkey-private","number":1}]}')
+    with pytest.raises(LookupRouterError, match="reviewed inventory"):
+        parse_lookup_plan(
+            '{"lookups":[{"kind":"search","terms":["replication","compression"],"scope":"issue",'
+            '"repositories":["valkey","valkey-private"]}]}'
+        )
+    accepted = parse_lookup_plan('{"lookups":[{"kind":"issue","repository":"valkey","number":1}]}')
+    assert len(accepted.live) == 1

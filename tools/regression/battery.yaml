@@ -70,8 +70,10 @@
 - id: governance-meeting
   question: What did the TSC discuss in its September meeting?
   expect: answer
-  cites: GOVERNANCE.md
-  because: The meeting word had to follow the body immediately, so this lost the community scope.
+  because: |
+    The meeting word had to follow the body immediately, so this lost the community scope. No
+    `cites` on purpose: TSC minutes are not published anywhere in the org, so a correct answer draws
+    on GOVERNANCE.md on one draw and a live TSC issue on another, and neither is wrong.
 
 - id: docs-download
   question: Where do I download Valkey binaries?

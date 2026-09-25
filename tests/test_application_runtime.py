@@ -3362,52 +3362,149 @@ def test_a_claim_carrying_a_program_may_exceed_the_prose_bound() -> None:
 
 
 def test_wide_retrieval_is_reranked_and_a_rerank_failure_keeps_retrieval_order() -> None:
-    """Reranking is best-effort: any failure returns the first ten of the wide set, which is
-    exactly the previous behaviour, so a Bedrock hiccup can never cost an answer."""
-    from valkeyrie.application_runtime import _RETRIEVE_KEEP, _RETRIEVE_WIDE, _reranked
+    """Reranking is best-effort: any failure keeps the first ten of the wide set in retrieval
+    order, so a Bedrock hiccup can never cost an answer. A success carries the reranker's
+    relevance as each item's score, because the verifier sorts by score and would otherwise undo
+    the reranking with Bedrock's similarity."""
+    from valkeyrie.application_runtime import (
+        _RERANK_TEXT_CHARS,
+        _RERANKER_MODEL_ARN,
+        _RETRIEVE_KEEP,
+        _RETRIEVE_WIDE,
+        _reranked,
+    )
 
+    assert _RETRIEVE_WIDE == 20 and _RETRIEVE_KEEP == 10
+    assert _RERANKER_MODEL_ARN == "arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0"
     wide = {
         "retrievalResults": [
-            {"content": {"text": f"chunk {i}"}, "metadata": {"i": i}} for i in range(_RETRIEVE_WIDE)
+            {"content": {"text": f"chunk {i}"}, "metadata": {"i": i}, "score": 0.9 - i / 100}
+            for i in range(_RETRIEVE_WIDE)
         ]
     }
 
     class _Reranker:
-        def __init__(self, order: list[int] | Exception) -> None:
-            self.order = order
+        def __init__(self, results: list[dict[str, object]] | Exception) -> None:
+            self.results = results
             self.calls = 0
+            self.kwargs: dict[str, object] = {}
 
         def rerank(self, **kwargs: object) -> dict[str, object]:
             self.calls += 1
-            if isinstance(self.order, Exception):
-                raise self.order
-            assert len(cast(list[object], kwargs["sources"])) == _RETRIEVE_WIDE
-            return {"results": [{"index": i} for i in self.order]}
+            self.kwargs = kwargs
+            if isinstance(self.results, Exception):
+                raise self.results
+            return {"results": self.results}
 
-    # The reranker's order wins, cut to the budget.
-    good = _Reranker([19, 3, 7, 0, 15, 2, 11, 5, 18, 9, 1, 4])
-    out = cast(list[dict[str, dict[str, int]]], _reranked(good, "q", wide)["retrievalResults"])
-    assert [r["metadata"]["i"] for r in out] == [19, 3, 7, 0, 15, 2, 11, 5, 18, 9]
-    assert len(out) == _RETRIEVE_KEEP
+    def ranked(order: list[int]) -> list[dict[str, object]]:
+        return [{"index": i, "relevanceScore": 1.0 - n / 100} for n, i in enumerate(order)]
 
-    # A failure degrades to the first ten, unchanged.
+    def ids(response: Mapping[str, object]) -> list[int]:
+        return [
+            cast(dict[str, int], cast(dict[str, object], r)["metadata"])["i"]
+            for r in cast(list[object], response["retrievalResults"])
+        ]
+
+    # The reranker's exact ten wins, and each kept item now carries the reranker's relevance.
+    good = _Reranker(ranked([19, 3, 7, 0, 15, 2, 11, 5, 18, 9]))
+    out = _reranked(good, "q", wide)
+    assert ids(out) == [19, 3, 7, 0, 15, 2, 11, 5, 18, 9]
+    assert [r["score"] for r in cast(list[dict[str, object]], out["retrievalResults"])] == [
+        1.0 - n / 100 for n in range(10)
+    ]
+    sent = cast(list[object], good.kwargs["sources"])
+    assert len(sent) == _RETRIEVE_WIDE
+    config = cast(dict[str, dict[str, object]], good.kwargs["rerankingConfiguration"])
+    bedrock = config["bedrockRerankingConfiguration"]
+    assert bedrock["numberOfResults"] == _RETRIEVE_KEEP
+    assert cast(dict[str, str], bedrock["modelConfiguration"])["modelArn"] == _RERANKER_MODEL_ARN
+
+    # Whole chunks go to the reranker up to the safety bound; a 2,000-char prefix hid the
+    # query-bearing part of a hierarchical parent.
+    long = {"retrievalResults": [{"content": {"text": "x" * 6000}} for _ in range(20)]}
+    seen = _Reranker(ranked(list(range(10))))
+    _reranked(seen, "q", long)
+    first = cast(list[dict[str, dict[str, dict[str, str]]]], seen.kwargs["sources"])[0]
+    assert len(first["inlineDocumentSource"]["textDocument"]["text"]) == 6000 <= _RERANK_TEXT_CHARS
+
+    # A failure degrades to the first ten, unchanged, scores untouched.
     broken = _Reranker(RuntimeError("throttled"))
-    out = cast(list[dict[str, dict[str, int]]], _reranked(broken, "q", wide)["retrievalResults"])
-    assert [r["metadata"]["i"] for r in out] == list(range(_RETRIEVE_KEEP))
+    assert ids(_reranked(broken, "q", wide)) == list(range(_RETRIEVE_KEEP))
 
-    # An unusable ordering (duplicates, out of range) is treated as a failure, not trusted.
-    for hostile in ([1, 1, 2], [0, 99], []):
-        out = cast(
-            list[dict[str, dict[str, int]]],
-            _reranked(_Reranker(hostile), "q", wide)["retrievalResults"],
-        )
-        assert [r["metadata"]["i"] for r in out] == list(range(_RETRIEVE_KEEP)), hostile
+    # Anything but exactly ten distinct real ints in range with a relevance in [0,1] is a
+    # failure, never a shorter package: one valid index must not shrink twenty to one.
+    bad_bool: dict[str, object] = {"index": True, "relevanceScore": 0.5}
+    no_score: dict[str, object] = {"index": 0}
+    big_score: dict[str, object] = {"index": 0, "relevanceScore": 7.0}
+    hostile: list[list[dict[str, object]]] = [
+        ranked([19]),
+        ranked([1, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        ranked([0, 99, 2, 3, 4, 5, 6, 7, 8, 9]),
+        ranked(list(range(12))),
+        [bad_bool, *ranked(list(range(1, 10)))],
+        [no_score, *ranked(list(range(1, 10)))],
+        [big_score, *ranked(list(range(1, 10)))],
+        [],
+    ]
+    for results in hostile:
+        assert ids(_reranked(_Reranker(results), "q", wide)) == list(range(_RETRIEVE_KEEP)), results
 
-    # Ten or fewer results are not reranked at all: nothing to reorder, no call spent.
-    narrow = {"retrievalResults": wide["retrievalResults"][:5]}
-    counting = _Reranker([0])
-    assert _reranked(counting, "q", narrow) is narrow
-    assert counting.calls == 0
+    # Exactly ten or fewer results are not reranked at all: nothing to reorder, no call spent.
+    for n in (5, _RETRIEVE_KEEP):
+        narrow = {"retrievalResults": wide["retrievalResults"][:n]}
+        counting = _Reranker(ranked([0]))
+        assert _reranked(counting, "q", narrow) is narrow
+        assert counting.calls == 0
+
+
+def test_reranked_order_survives_the_verifier_and_quota_calls_do_not_rerank() -> None:
+    """End to end through verify_retrieval_results: with the reranker's relevance carried as the
+    score, the verifier's own sort agrees with the reranker instead of reversing it. And the
+    per-repository quota calls skip reranking, so a broad scope does not multiply the cost."""
+    from valkeyrie.application_runtime import _RETRIEVE_KEEP, _runtime_retrieve
+    from valkeyrie.retrieval import verify_retrieval_results
+
+    generation = "sha256:" + "a" * 64
+
+    class _Client:
+        def __init__(self) -> None:
+            self.rerank_calls = 0
+
+        def retrieve(self, **kwargs: object) -> dict[str, object]:
+            # Bedrock's similarity INCREASES with index, so a naive verifier sort would put 19
+            # first; the reranker wants 0 first.
+            return {
+                "retrievalResults": [
+                    {
+                        "content": {"type": "TEXT", "text": f"text {i}"},
+                        "location": {"s3Location": {"uri": "s3://bucket/key"}, "type": "S3"},
+                        "metadata": {
+                            "generation_id": generation,
+                            "document_id": generation,
+                            "repository": "valkey",
+                            "authority": "canonical",
+                            "marker": i,
+                        },
+                        "score": 0.5 + i / 100,
+                    }
+                    for i in range(20)
+                ]
+            }
+
+        def rerank(self, **kwargs: object) -> dict[str, object]:
+            self.rerank_calls += 1
+            return {"results": [{"index": i, "relevanceScore": 1.0 - i / 20} for i in range(10)]}
+
+    client = _Client()
+    response = _runtime_retrieve(client, "kb", "q", {"equals": {}})
+    verified = verify_retrieval_results(response, generation, "generation_id", 10, ("valkey",))
+    assert [r.metadata["marker"] for r in verified] == list(range(_RETRIEVE_KEEP))
+    assert client.rerank_calls == 1
+
+    quota = _Client()
+    unranked = _runtime_retrieve(quota, "kb", "q", {"equals": {}}, rerank=False)
+    assert quota.rerank_calls == 0
+    assert len(cast(list[object], unranked["retrievalResults"])) == _RETRIEVE_KEEP
 
 
 def test_an_abstention_names_its_shortfall_and_the_router_supplies_the_missing_lookup(
@@ -3485,6 +3582,11 @@ def test_an_abstention_names_its_shortfall_and_the_router_supplies_the_missing_l
     )
     assert result["outcome"] == "answer", result
     assert len(services.route_calls) == 2, "the router was asked once more, with the shortfall"
+    # The second ask keeps the pinned question as the question, carries the shortfall as a
+    # field, and carries the date the first router saw.
+    second = json.loads(services.route_calls[1].split("\n", 1)[1])
+    assert second["current_question"] == "what is the default of repl-diskless-sync?"
+    assert second["today"] == "2026-08-19"
     assert len(services.model_calls) == 2
     assert any(isinstance(q, FileQuery) for q in services.live_calls)
     # The plan revision holds the cited file record, and the retry flag rides with it.
@@ -3516,3 +3618,32 @@ def test_an_abstention_names_its_shortfall_and_the_router_supplies_the_missing_l
     )
     assert kept["outcome"] == "abstention"
     assert len(down.model_calls) == 1
+
+
+def test_shortfall_lookups_survive_a_router_crash_and_merge_without_duplicate_searches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash inside route_lookups itself (not merely a route transport error) yields no lookups.
+    And the shortfall plan and the generic supplement are merged on canonical identity: the same
+    search with its terms in another order is fetched once."""
+    from valkeyrie import application_runtime
+    from valkeyrie.application_runtime import _merged_queries, _shortfall_lookups
+    from valkeyrie.live_github import IssueSearchQuery
+
+    def crash(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("router crashed")
+
+    monkeypatch.setattr(application_runtime, "route_lookups", crash)
+    assert _shortfall_lookups(FakeServices(), "q", "missing", today="2026-08-18") == ()
+
+    same_terms_reordered = IssueSearchQuery(
+        repository="valkey", terms=("default", "repl-diskless-sync"), kind="pull-request"
+    )
+    generic = IssueSearchQuery(
+        repository="valkey", terms=("repl-diskless-sync", "default"), kind="pull-request"
+    )
+    other = IssueSearchQuery(
+        repository="valkey", terms=("repl-diskless-sync", "default"), kind="issue"
+    )
+    merged = _merged_queries((same_terms_reordered,), (generic, other))
+    assert merged == (same_terms_reordered, other)
