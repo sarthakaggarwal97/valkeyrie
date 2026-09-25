@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -267,9 +267,11 @@ _CAPABILITY_REPLY: Final = (
     " a symbol appears in the source.\n"
     '\u2022 Follow-ups in a thread, so you can ask "and in a cluster?" without repeating'
     " yourself, in whichever language you ask in.\n"
-    "What I will not do: act on your behalf, so no merging, commenting, deploying or"
-    " triggering; read anything private; judge whether a release is ready; or answer from"
-    " outside the project public sources.\n"
+    "Answers never act on your behalf: no merging, commenting, deploying or triggering, no"
+    " reading anything private, no judging whether a release is ready, and nothing from outside"
+    " the project public sources. Separately, configured operators can dispatch a small reviewed"
+    " catalog of GitHub workflows on personal repositories by starting a message with run; bare"
+    " run lists them.\n"
     "Naming a repository, version or command gets you a sharper answer, and if the evidence"
     " does not support something I say so instead of guessing."
 )
@@ -298,6 +300,10 @@ _CREDENTIAL: Final = re.compile(
 )
 # Distinguishes "not yet looked up" from "looked up and absent", so an absent token is
 # not re-fetched on every question.
+# The runtime's own diagnostics. Lambda is configured for JSON logs, and these were print() to
+# stderr, which lands as unstructured text: same messages, real log records now, so the CloudWatch
+# filters that match on the message text keep working and gain a level.
+_LOG: Final = logging.getLogger("valkeyrie.runtime")
 _UNSET: Final = object()
 _MAX_EVIDENCE: Final = 10
 _MAX_EVIDENCE_BYTES: Final = 64 * 1024
@@ -542,7 +548,7 @@ def _answer(
     # nothing downstream can see it, and the rest of the question is answered.
     question, redactions = _redacted(question)
     if redactions:
-        print(f"redacted {redactions} credential(s) from a question", file=sys.stderr, flush=True)
+        _LOG.warning("redacted %d credential(s) from a question", redactions)
     requirement = event["version_requirement"]
     if requirement not in {"none", "required", "current_state"}:
         raise ApplicationRuntimeError("version requirement is unsupported")
@@ -948,7 +954,7 @@ def _execute_plan(
         # Nothing has been written at this point, so a second draw costs latency and nothing else.
         # A response cut off mid-claim is the one failure a retry fixes, and it was the only
         # remaining cause of "I couldn't produce a reliable answer" in the regression battery.
-        print(f"retrying after: {truncated}", file=sys.stderr, flush=True)
+        _LOG.warning("retrying after: %s", truncated)
         try:
             response = services.converse(
                 model_id=cast(str, plan["model_id"]),
@@ -1102,10 +1108,8 @@ def _accept_output(
             # this failure was unfixable after the fact: it is rare, and it never reproduced on
             # demand. A bounded prefix of the model's own text names the shape. Model output about
             # Valkey, capped, and only on the path that is already discarding it.
-            print(
-                f"unparseable model response: {response_text[:160]!r} (len {len(response_text)})",
-                file=sys.stderr,
-                flush=True,
+            _LOG.warning(
+                "unparseable model response: %r (len %d)", response_text[:160], len(response_text)
             )
             raise _UnparseableModelOutput("normalized model response is invalid JSON") from error
         try:
@@ -1186,7 +1190,7 @@ def _accept_output(
         cited.update(unique_ids)
         claims.append({"claim_id": claim_id, "text": text, "evidence_ids": unique_ids})
     if dropped:
-        print(f"claims dropped: {dropped}", file=sys.stderr, flush=True)
+        _LOG.warning("claims dropped: %s", dropped)
     if not claims:
         raise ApplicationRuntimeError("model answer has no claim")
     static_targets: set[tuple[str, str, str, str]] = set()
@@ -1233,11 +1237,7 @@ def _failed_answer(
     # Nothing recorded it, so an error was unexplainable after the fact and a rare screen false
     # positive could not be told from a malformed response. These messages are fixed strings plus a
     # field name, never asker or evidence text.
-    print(
-        f"answer rejected: {type(rejection).__name__}: {rejection}",
-        file=sys.stderr,
-        flush=True,
-    )
+    _LOG.warning("answer rejected: %s: %s", type(rejection).__name__, rejection)
     terminal_at = _completion_timestamp(completion_clock, completed_at)
     failed = RuntimeResult(
         "error",

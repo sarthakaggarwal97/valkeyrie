@@ -3259,7 +3259,15 @@ def test_a_question_about_this_service_is_answered_by_the_application(
 
     # The text states what the code does. These are the promises a reader will hold us to, so a
     # capability that disappears must fail here rather than quietly become a lie.
-    for promise in ("cites them", "issues and pull requests", "directory", "act on your behalf"):
+    for promise in (
+        "cites them",
+        "issues and pull requests",
+        "directory",
+        "act on your behalf",
+        # The command path exists and the description must say so, or the reply is a lie the
+        # first time an operator dispatches a workflow in front of someone who read it.
+        "configured operators",
+    ):
         assert promise in _CAPABILITY_REPLY
 
 
