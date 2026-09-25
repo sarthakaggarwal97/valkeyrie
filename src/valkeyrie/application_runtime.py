@@ -2580,35 +2580,17 @@ def _runtime_retrieval_metadata(metadata: object, text: str = "") -> Mapping[str
     }
 
 
-# Retrieve WIDE, then rerank down to what the evidence budget takes. Measured on the active
-# corpus: reranking the top 20 changed 4 to 5 of the top 10 on three of five questions and moved
-# the correct document to rank 1 on two of them ("event loop" -> src/ae.c). Anthropic's contextual
-# retrieval work puts reranking at the largest single retrieval lever they measured. The reranker
-# is best-effort: any failure keeps the first ten of the wide retrieval in Bedrock's order, which
-# is the ten the previous implementation asked for, so a Bedrock hiccup can never cost an answer.
-_RETRIEVE_WIDE: Final = 20
+# Ten results, Bedrock's hybrid order. A reranker (cohere.rerank-v3-5) was measured here on 16
+# battery questions against the active corpus: recall in the top ten fell from 15 to 13 and the
+# top three tied at 8. It promoted command docs and demoted C source and valkey.conf, because prose
+# repeats the query words and code does not; the model reads all ten, so top-ten membership is what
+# matters. The measurement is tools/regression/run.py's citation axis. Removed, not disabled.
 _RETRIEVE_KEEP: Final = 10
-_RERANKER_MODEL_ARN: Final = "arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0"
-# Whole hierarchical parents (measured mean 4,893 bytes) go to the reranker; a 2,000-character
-# prefix hid the query-bearing part of a parent and let a decoy win. The cap is a safety bound for
-# a pathological chunk, not a budget.
-_RERANK_TEXT_CHARS: Final = 8000
 
 
 def _runtime_retrieve(
-    client: Any,
-    knowledge_base_id: str,
-    query: str,
-    retrieval_filter: Mapping[str, object],
-    *,
-    rerank: bool = True,
+    client: Any, knowledge_base_id: str, query: str, retrieval_filter: Mapping[str, object]
 ) -> Mapping[str, object]:
-    """The wide retrieval, reranked to ten unless ``rerank`` is False, then the first ten.
-
-    The per-repository quota calls pass ``rerank=False``: they fill a share of one to three
-    results each, and reranking twenty candidates for that share would multiply the reranker's
-    cost by the number of repositories named for no ordering the merge respects.
-    """
     try:
         response = client.retrieve(
             knowledgeBaseId=knowledge_base_id,
@@ -2616,7 +2598,7 @@ def _runtime_retrieve(
             retrievalConfiguration={
                 "vectorSearchConfiguration": {
                     "filter": retrieval_filter,
-                    "numberOfResults": _RETRIEVE_WIDE if rerank else _RETRIEVE_KEEP,
+                    "numberOfResults": _RETRIEVE_KEEP,
                     "overrideSearchType": "HYBRID",
                 }
             },
@@ -2625,82 +2607,7 @@ def _runtime_retrieve(
         raise ApplicationRuntimeError(f"static retrieval intent is invalid: {error}") from error
     if not isinstance(response, Mapping):
         raise ApplicationRuntimeError("Bedrock retrieval response is malformed")
-    if not rerank:
-        results = response.get("retrievalResults")
-        if isinstance(results, list) and len(results) > _RETRIEVE_KEEP:
-            return {**response, "retrievalResults": results[:_RETRIEVE_KEEP]}
-        return response
-    return _reranked(client, query, response)
-
-
-def _reranked(client: Any, query: str, response: Mapping[str, object]) -> Mapping[str, object]:
-    """The wide retrieval reordered by a reranker and cut to the evidence budget, or the first
-    ten of it unchanged when reranking is unavailable.
-
-    Each kept item's ``score`` becomes the reranker's relevance score. The verifier downstream
-    sorts within an authority bucket by score, so leaving Bedrock's similarity score in place
-    would have let it silently undo the reranking: reproduced, the verifier reversed a perfectly
-    reranked ten. The score IS the relevance the reranker assigned, so nothing is invented.
-    """
-    results = response.get("retrievalResults")
-    if not isinstance(results, list) or len(results) <= _RETRIEVE_KEEP:
-        return response
-    if not all(isinstance(item, Mapping) for item in results):
-        # Reranking must not launder a malformed candidate out of the set the verifier sees.
-        raise ApplicationRuntimeError("Bedrock retrieval response is malformed")
-    try:
-        documents = []
-        for item in results:
-            content = item.get("content", {}) if isinstance(item, Mapping) else {}
-            text = content.get("text", "") if isinstance(content, Mapping) else ""
-            documents.append(
-                {
-                    "type": "INLINE",
-                    "inlineDocumentSource": {
-                        "type": "TEXT",
-                        "textDocument": {"text": str(text)[:_RERANK_TEXT_CHARS] or " "},
-                    },
-                }
-            )
-        ranked = client.rerank(
-            queries=[{"type": "TEXT", "textQuery": {"text": query}}],
-            sources=documents,
-            rerankingConfiguration={
-                "type": "BEDROCK_RERANKING_MODEL",
-                "bedrockRerankingConfiguration": {
-                    "modelConfiguration": {"modelArn": _RERANKER_MODEL_ARN},
-                    "numberOfResults": _RETRIEVE_KEEP,
-                },
-            },
-        )
-        entries = ranked.get("results") if isinstance(ranked, Mapping) else None
-        # Exactly ten, each a real int (a JSON boolean is an int to Python and would select
-        # document 1), distinct, in range, with a numeric relevance. Anything else is a failure,
-        # never a shorter package: one valid index must not shrink twenty candidates to one.
-        if not isinstance(entries, list) or len(entries) != _RETRIEVE_KEEP:
-            raise ValueError("reranker returned the wrong number of results")
-        order: list[tuple[int, float]] = []
-        for entry in entries:
-            index = entry.get("index") if isinstance(entry, Mapping) else None
-            relevance = entry.get("relevanceScore") if isinstance(entry, Mapping) else None
-            if type(index) is not int or not 0 <= index < len(results):
-                raise ValueError("reranker returned an unusable index")
-            if not isinstance(relevance, (int, float)) or isinstance(relevance, bool):
-                raise ValueError("reranker returned an unusable relevance")
-            score = float(relevance)
-            if not 0.0 <= score <= 1.0:
-                raise ValueError("reranker returned an unusable relevance")
-            order.append((index, score))
-        if len({index for index, _ in order}) != len(order):
-            raise ValueError("reranker returned a duplicate index")
-        reordered = [
-            {**cast(Mapping[str, object], results[index]), "score": relevance}
-            for index, relevance in order
-        ]
-    except Exception as error:  # noqa: BLE001 - a rerank failure is a degradation, not a loss
-        _LOG.warning("reranking unavailable, keeping retrieval order: %s", error)
-        reordered = results[:_RETRIEVE_KEEP]
-    return {**response, "retrievalResults": reordered}
+    return response
 
 
 class AwsRuntimeServices:
@@ -2921,9 +2828,7 @@ class AwsRuntimeServices:
         combined ranking, never a requirement: if it fails or returns something unverifiable, that
         repository keeps whatever the combined call already gave it."""
         try:
-            response = _runtime_retrieve(
-                client, knowledge_base_id, intent.query, scoped, rerank=False
-            )
+            response = _runtime_retrieve(client, knowledge_base_id, intent.query, scoped)
             results = verify_retrieval_results(
                 response, generation_id, "generation_id", 10, (repository,)
             )
