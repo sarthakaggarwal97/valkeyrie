@@ -40,6 +40,7 @@ from valkeyrie.live_github import (
 from valkeyrie.lookup_router import (
     MAX_CONVERSATION_BYTES,
     MAX_CONVERSATION_TURNS,
+    MAX_LOOKUPS,
     MAX_TURN_BYTES,
     ConversationTurn,
     route_lookups,
@@ -790,6 +791,8 @@ def _answer(
         "previous_answer": _previous_answer(conversation),
         # Set true by the one abstention retry, in the same revision that widens the evidence.
         "retry_attempted": False,
+        # The date the router saw, so the retry's router sees the same one.
+        "routed_on": now[:10],
         "generation_id": generation_id,
         "knowledge_base_id": plan_knowledge_base_id,
         "application_revision": manifest["application_revision"],
@@ -911,9 +914,9 @@ def _execute_plan(
     completion_clock: Callable[[], str] | None = None,
 ) -> RuntimeResult:
     generation_id = _plan_generation_id(plan)
-    # The date the retry's router sees: the request's own date, as the first router saw it. The
+    # The date the retry's router sees is the one the first router saw, pinned in the plan. The
     # completion clock is sampled once, for the terminal record, after every model call.
-    today = completed_at[:10]
+    today = cast(str, plan["routed_on"])
     if not _controls_enabled(services):
         return RuntimeResult(
             "partial",
@@ -999,13 +1002,13 @@ def _execute_plan(
         and plan.get("evidence_mode") == "static"
         and plan.get("route") != "exact_lookup"
     ):
-        # One more attempt before giving up, as a NEW plan revision. A corpus-only abstention on
-        # a question about work that has not shipped is the residual refusal class; the GitHub
-        # supplement covers it, forced on regardless of the intent gate. The widened evidence is
-        # persisted under the same fence before the second model call, so the durable plan
-        # always names every record the answer was grounded in and a redelivery replays against
-        # a plan that contains the cited ids. If the revision write is lost, the request moved
-        # on without us and the abstention is not written either.
+        # One more attempt before giving up, as a NEW plan revision. An abstention on a static
+        # plan whose evidence did not hold the answer is the residual refusal class; a targeted
+        # lookup from the stated shortfall, with the GitHub supplement forced on, covers it. The
+        # widened evidence is persisted under the same fence before the second model call, so
+        # the durable plan always names every record the answer was grounded in and a redelivery
+        # replays against a plan that contains the cited ids. If the revision write is lost, the
+        # request moved on without us and the abstention is not written either.
         retried = _retry_with_supplement(
             services,
             plan,
@@ -1101,6 +1104,62 @@ def _unfenced(response_text: str) -> str | None:
     return inner
 
 
+def _top_level_objects(text: str) -> list[tuple[int, int]]:
+    """Spans of the top-level ``{...}`` objects in text, found by one quote-aware brace scan.
+
+    Linear in the text length. Repeated ``raw_decode`` from each brace was quadratic and a
+    256 KiB brace-heavy response took ten seconds; the scan does not decode, it only brackets.
+    """
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            if depth:
+                in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                spans.append((start, index + 1))
+    return spans
+
+
+def _primary_object(text: str) -> str | None:
+    """The FIRST object of a response shaped as object, prose, object, nothing after.
+
+    Reproduced on "hashtable?": the model wrote a complete answer, then "Wait, that included an
+    invalid field. Correct output:" and the answer again. The first object is the one a conforming
+    reader would have taken, and it goes through every check that follows exactly as a lone object
+    would; if it fails them the whole response is refused, never the second object substituted.
+    So nothing is trusted for being second, and prose cannot steer which object is read: an
+    attacker who can shape the first object needed no second one. Any other multi-object shape is
+    refused as before.
+    """
+    spans = _top_level_objects(text)
+    if len(spans) != 2:
+        return None
+    (first_start, first_end), (second_start, second_end) = spans
+    if text[:first_start].strip() or text[second_end:].strip():
+        return None
+    if not text[first_end:second_start].strip():
+        return None
+    return text[first_start:first_end]
+
+
 def _accept_output(
     response_text: str,
     evidence: tuple[RuntimeEvidence, ...],
@@ -1112,7 +1171,7 @@ def _accept_output(
         # Exactly one fence around exactly one object, with nothing else outside it, is the same
         # object; prose beside the JSON stays a rejection, because then the model said two things
         # and there is no way to know which one it meant.
-        unfenced = _unfenced(response_text)
+        unfenced = _unfenced(response_text) or _primary_object(response_text)
         if unfenced is None:  # noqa: SIM102 - the diagnostic below belongs to this branch
             # The REASON alone could not distinguish a fence from prose from a truncated object, so
             # this failure was unfixable after the fact: it is rare, and it never reproduced on
@@ -1435,20 +1494,23 @@ def _retry_with_supplement(
     that would satisfy it, the file that holds the option, the release notes for the version, the
     listing where the path was unknown. The generic forced issue/PR search stays as insurance for
     a router that chose something unhelpful, but the two are merged and deduplicated by canonical
-    query identity before ONE fetch: reproduced, running them as two fetches searched the same
-    terms twice in a different order. Everything stays inside the closed catalog and the evidence
-    bounds.
+    query identity into one bounded read batch: reproduced, running them separately searched the
+    same terms twice in a different order. Everything stays inside the closed catalog and the
+    evidence bounds.
 
     The widened package is persisted as a plan revision BEFORE the second model call. Any
-    failure inside the retry itself (a fetch, the model, the parse) leaves the abstention in
-    place under the revised plan, never an error. Controls are rechecked immediately before the
-    second inference, as they are before the first.
+    failure inside the retry itself leaves the abstention in place, never an error: before the
+    revision is written when the reads yield nothing, under the revised plan once it is.
+    Controls are rechecked immediately before the second inference, as they are before the
+    first.
     """
     if plan.get("retry_attempted") is True:
         return None
     question = cast(str, plan["question"])
     queries = _shortfall_lookups(services, question, shortfall, today=today)
-    queries = _merged_queries(queries, _supplement_queries(question, force=True))
+    # The targeted lookups first, the generic pair filling what room is left, under the same
+    # bound the router itself has: eight reads for five live slots was measured waste.
+    queries = _merged_queries(queries, _supplement_queries(question, force=True))[:MAX_LOOKUPS]
     if not queries:
         return None
     try:
@@ -2034,6 +2096,7 @@ def _existing_plan(
         "resolved_from_followup",
         "previous_answer",
         "retry_attempted",
+        "routed_on",
         "generation_id",
         "knowledge_base_id",
         "application_revision",
@@ -2580,11 +2643,9 @@ def _runtime_retrieval_metadata(metadata: object, text: str = "") -> Mapping[str
     }
 
 
-# Ten results, Bedrock's hybrid order. A reranker (cohere.rerank-v3-5) was measured here on 16
-# battery questions against the active corpus: recall in the top ten fell from 15 to 13 and the
-# top three tied at 8. It promoted command docs and demoted C source and valkey.conf, because prose
-# repeats the query words and code does not; the model reads all ten, so top-ten membership is what
-# matters. The measurement is tools/regression/run.py's citation axis. Removed, not disabled.
+# Ten hybrid results, Bedrock's order: the evidence budget. (A reranker was measured here with the
+# battery's citation axis and lost two of sixteen expected documents from the top ten; see the
+# history of this line before adding one back.)
 _RETRIEVE_KEEP: Final = 10
 
 

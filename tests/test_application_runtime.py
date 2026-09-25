@@ -3455,7 +3455,11 @@ def test_an_abstention_names_its_shortfall_and_the_router_supplies_the_missing_l
     services = Sufficiency()
     services.router_reply = "unused"
     result = run_runtime_event(
-        _event(request_id="req_shortfall-1", question="what is the default of repl-diskless-sync?"),
+        _event(
+            request_id="req_shortfall-1",
+            question="what is the default of repl-diskless-sync?",
+            completed_at="2026-08-20T00:00:01Z",
+        ),
         services,
         root=ROOT,
         manifest=manifest,
@@ -3466,7 +3470,12 @@ def test_an_abstention_names_its_shortfall_and_the_router_supplies_the_missing_l
     # field, and carries the date the first router saw.
     second = json.loads(services.route_calls[1].split("\n", 1)[1])
     assert second["current_question"] == "what is the default of repl-diskless-sync?"
+    # The date the FIRST router saw (event now), pinned in the plan, not completed_at.
     assert second["today"] == "2026-08-19"
+    assert services.route_calls[0].startswith("Today is 2026-08-19.")
+    assert cast(dict[str, object], services.requests["req_shortfall-1"]["plan"])["routed_on"] == (
+        "2026-08-19"
+    )
     assert len(services.model_calls) == 2
     assert any(isinstance(q, FileQuery) for q in services.live_calls)
     # The plan revision holds the cited file record, and the retry flag rides with it.
@@ -3545,3 +3554,87 @@ def test_shortfall_lookups_survive_a_router_crash_and_merge_without_duplicate_se
     )
     merged = _merged_queries((same_terms_reordered,), (generic, other))
     assert merged == (same_terms_reordered, other)
+    # The retry never reads more than the router's own bound, targeted lookups first.
+    from valkeyrie.lookup_router import MAX_LOOKUPS
+
+    many = tuple(
+        IssueSearchQuery(repository="valkey", terms=(f"term{i}", "x"), kind="issue")
+        for i in range(6)
+    )
+    assert len(_merged_queries(many, (generic, other))[:MAX_LOOKUPS]) == 6
+    assert _merged_queries(many, (generic, other))[:MAX_LOOKUPS] == many
+
+
+def test_a_response_of_two_objects_around_prose_reads_the_first_and_refuses_the_rest() -> None:
+    """Reproduced on "hashtable?": a complete answer, then "Wait, that included an invalid field.
+    Correct output:", then the answer again. The FIRST object is read, exactly as a lone object
+    would be, and validated in full; if it fails, the response is refused rather than the second
+    substituted, so prose cannot steer which object is read. Anything but object, prose, object,
+    nothing after is refused as before."""
+    import time
+
+    from valkeyrie.application_runtime import _accept_output, _primary_object, _top_level_objects
+
+    evidence: tuple[RuntimeEvidence, ...] = (
+        StaticRuntimeEvidence(
+            "ev_a",
+            "GET key returns the value.",
+            "gen",
+            "valkey-doc",
+            "commands/get.md",
+            "c" * 40,
+            "canonical",
+            "none",
+            "sha256:" + "0" * 64,
+            "https://github.com/valkey-io/valkey-doc/blob/c/commands/get.md",
+        ),
+    )
+    good = json.dumps(
+        {
+            "api_version": "valkeyrie.io/model-output/1",
+            "kind": "ModelOutput",
+            "outcome": "answer",
+            "claims": [
+                {
+                    "claim_id": "c1",
+                    "text": "GET reads a key.",
+                    "evidence_ids": [evidence[0].evidence_id],
+                }
+            ],
+        },
+        separators=(",", ":"),
+    )
+    other = good.replace("GET reads a key.", "Alternative reading.")
+    corrected = f"{good}\n\nWait, that included an invalid field. Correct output:\n\n{other}"
+    assert _primary_object(corrected) == good
+    outcome, claims, _, _ = _accept_output(corrected, evidence)
+    assert outcome == "answer" and claims[0]["text"] == "GET reads a key."
+
+    # A first object that fails validation refuses the whole response; the second is never used.
+    bad_first = good.replace('"outcome":"answer"', '"outcome":"nonsense"')
+    with pytest.raises(ApplicationRuntimeError):
+        _accept_output(f"{bad_first}\nCorrect output:\n{good}", evidence)
+
+    # Shapes that are not object, prose, object, nothing-after stay refusals.
+    for text in (
+        f"{good} Here is my answer.",
+        f"{good}\n{other}\n",
+        f"{good}\nCorrected:\n{other}\nDone.",
+        f"{good}\n{other}\n{other}",
+        f"Preamble first.\n{good}\nthen\n{other}",
+        f'{good}\n\nCorrect: {{"not": "closed"',
+    ):
+        assert _primary_object(text) is None, text[:40]
+    assert _primary_object(good) is None, "a lone object is not this shape"
+    # Braces and quotes inside strings do not open or close objects.
+    tricky = '{"a":"}{\\"{","b":1}'
+    assert _top_level_objects(f"{tricky} prose {{}}") == [
+        (0, len(tricky)),
+        (len(tricky) + 7, len(tricky) + 9),
+    ]
+
+    # Linear time: a quarter-megabyte of braces scans in well under a second (the old raw_decode
+    # loop took ten seconds on the same input).
+    started = time.monotonic()
+    _primary_object("{" * 262_144)
+    assert time.monotonic() - started < 1.0

@@ -95,7 +95,8 @@ _MAX_NUMBER: Final = 10_000_000
 # Five live records is what the evidence budget admits beside the corpus (half of ten), and a
 # search is naturally two lookups (issues and pull requests), so a topic plus a release check
 # plus the corpus needs six.
-_MAX_LOOKUPS: Final = 6
+MAX_LOOKUPS: Final = 6
+_MAX_LOOKUPS = MAX_LOOKUPS
 _MAX_RESPONSE_BYTES: Final = 4096
 _DEFAULT_REPOSITORY: Final = "valkey"
 # Conversation history bounds. Six turns is three exchanges, which is what a follow-up needs;
@@ -285,7 +286,9 @@ def route_lookups(
 ) -> LookupPlan | None:
     """Ask the model which lookups the question needs. None means fall back to keywords.
 
-    With ``conversation``, the same call also resolves a follow-up into a standalone question,
+    With ``shortfall``, the first answer's reason for abstaining rides beside the question as data
+    and the lookups are chosen to supply what it names. With ``conversation``, the same call also
+    resolves a follow-up into a standalone question,
     so memory costs no extra model turn. Returns None rather than raising for every failure,
     because a routing failure must never remove a capability the keyword path already has.
     """
@@ -347,7 +350,8 @@ def _router_prompt(
     today: str | None = None,
     shortfall: str | None = None,
 ) -> str:
-    """Present history as data, never as prose the model could mistake for instructions.
+    """Present history and any shortfall as data, never as prose the model could mistake for
+    instructions.
 
     A prose transcript let a prior turn containing "Current question: ..." forge a second marker
     and replace what was asked. As a JSON document the boundary is unambiguous: the turns are

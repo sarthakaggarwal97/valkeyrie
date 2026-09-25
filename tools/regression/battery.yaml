@@ -49,7 +49,10 @@
 - id: internals-compression
   question: How does Valkey replication compression work?
   expect: answer
-  because: "The canary for evidence assembly: it needs the live supplement to reach four claims."
+  because: |
+    The canary for evidence assembly. When added, replication compression had not shipped and only
+    the live supplement could answer it; it has since landed and the corpus answers directly. The
+    entry still guards the path that combines the two.
 
 - id: onboarding-add-command
   question: How do I add a new command to valkey?
@@ -101,7 +104,7 @@
 - id: security-cve
   question: What is CVE-2025-21605 about?
   expect: answer
-  cites: live GitHub advisory
+  cites: security/advisories
   because: Advisory lookups are a separate path from issue search.
 
 - id: multilingual-spanish

@@ -20,6 +20,9 @@ OPERATOR = "U08UZUQ790R"
 def test_only_messages_naming_the_run_word_are_commands() -> None:
     assert actions.match_command("run backport-sweep branch=8.1") == "backport-sweep branch=8.1"
     assert actions.match_command("  RUN ci") == "ci"
+    # The catalogue's spelling is returned so the case-sensitive parser accepts it.
+    assert actions.match_command("RUN CI") == "ci"
+    assert actions.match_command("run Backport-Sweep branch=8.1") == "backport-sweep branch=8.1"
     assert actions.match_command("run") == ""
     # Everything else is a question, including questions that contain the word, and including
     # ones that START with it but name no catalogued action: "run valkey-benchmark how?" is a

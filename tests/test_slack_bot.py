@@ -251,6 +251,24 @@ def test_the_reply_is_assembled_whole_claim_by_whole_claim_under_the_slack_limit
     text = slack_bot._format(result)
     assert len(text) < 40_000
     assert text.count("```") % 2 == 0, "every fence that was emitted is closed"
+    # The WHOLE message is under the cap, sources and limitation included, with worst-case
+    # citations: two claims that each fit alone plus many long citations must not overflow.
+    long_cites = [
+        f"valkey/src/{'d' * 200}/file{i}.c@{'a' * 40}: https://github.com/valkey-io/valkey/blob/"
+        + "a" * 40
+        + f"/src/{'d' * 200}/file{i}.c"
+        for i in range(40)
+    ]
+    heavy = {
+        "outcome": "answer",
+        "claims": [
+            {"claim_id": "a", "text": "x" * 14_900},
+            {"claim_id": "b", "text": "y" * 14_900},
+        ],
+        "citations": long_cites,
+        "message": "z" * 2_000,
+    }
+    assert len(slack_bot._format(heavy)) < 40_000
     assert "more claim(s) did not fit" in text
     assert "*Sources*" in text
     # A normal answer is untouched.

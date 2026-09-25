@@ -8,7 +8,8 @@ POST that is not a GraphQL query). Nothing in a Slack message can name a reposit
 file or an input key: a command selects a catalog entry, and the catalog is a reviewed file in
 the repository.
 
-A command is a mention whose text starts with the word "run":
+A command is a mention whose text is the bare word "run", or "run" followed by the name of a
+catalogued action; "run valkey-benchmark how?" names no action and is an ordinary question:
 
     @Valkeyrie run valkey-daily test_args="--single unit/type/hash --loops 3"
     @Valkeyrie run backport-sweep branch=8.1
@@ -116,13 +117,15 @@ def match_command(question: str, path: Path = CATALOG_PATH) -> str | None:
     if not stripped.lower().startswith("run "):
         return None
     rest = stripped[3:].strip()
-    first = rest.split(maxsplit=1)[0].lower() if rest else ""
+    head, _, tail = rest.partition(" ")
     try:
         _, catalogued = load_catalog(path)
     except CommandError:
         return rest
-    if first in {name.lower() for name in catalogued}:
-        return rest
+    for name in catalogued:
+        if name.lower() == head.lower():
+            # The catalogue's spelling, so "RUN CI" reaches the case-sensitive parser as "ci".
+            return f"{name} {tail}".strip()
     return None
 
 

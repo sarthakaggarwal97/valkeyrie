@@ -13,12 +13,13 @@ tell you whether it RELIABLY is. A question that answers two draws in three is n
 flaking, and a single pass hides exactly the failure that took four draws to see in production.
 
 TWO AXES. A RAG answer can fail in two independent places, and one pass/fail hides which. Axis one
-is the answer SHAPE: the outcome the entry expects, with at least one claim for an answer. Axis two,
-for an entry that names `cites` (a substring of a citation), is whether the answer CITED a source
-matching it. Neither axis judges the claims' truth; a wrong claim citing the right file passes both.
-What the second axis buys is attribution: an answer with the right shape that did not cite the
-expected source is a RETRIEVAL problem and is marked so, and it FAILS the draw, because the answer
-was drawn from somewhere other than where the truth lives.
+is the answer SHAPE: the outcome the entry expects, with at least one claim for an answer. Axis
+two, for an entry that names `cites`, is whether the answer CITED a source matching it: a
+substring of the corpus source path, or of a live observation's URL path. Neither axis judges the
+claims' truth; a wrong claim citing the right file passes both. What the second axis buys is
+attribution: an answer with the right shape that did not cite the expected source is a RETRIEVAL
+problem and is marked so, and it FAILS the draw, because the answer was drawn from somewhere other
+than where the truth lives.
 
 Exit status is 0 only when every question matched its expectation on every draw, so this is usable
 as a gate. Failures print the outcome and the message so the reason is in the output, not in a
@@ -48,7 +49,7 @@ REGION = "us-east-1"
 BATTERY = Path(__file__).with_name("battery.yaml")
 # Lambda rejects concurrent invocations of the same version beyond a small burst (TooManyRequests
 # was observed at six), and every draw is a full model turn, so two at a time is the ceiling that
-# finishes a 28-question battery without failing for the wrong reason.
+# finishes a 44-question battery without failing for the wrong reason.
 PARALLELISM = 2
 # An answer is an answer; these two are the other legitimate shapes. "partial" is a dependency
 # failure (the corpus or GitHub was unreachable), which is neither a pass nor a regression, so it

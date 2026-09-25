@@ -395,32 +395,30 @@ def _format(result: dict[str, Any]) -> str:
         # Slack refuses a message over 40,000 characters and would truncate a fence mid-block if
         # it did not. The answer is assembled whole claim by whole claim under a cap that leaves
         # room for the sources and closers, and the count of claims left out is said.
+        # The sources and closers are rendered FIRST and their size reserved, so the whole
+        # message, not only the claims, stays under the cap.
+        sources = ""
+        if citations:
+            # Citations are application-authored from validated GitHub URLs, so the link markup is
+            # built here; the label is still escaped since it carries a path.
+            sources = "\n\n*Sources*\n" + "\n".join(f"  {_source_link(c)}" for c in citations)
+        tail = (f"\n\n_{_plain(message)}_" if message else "") + (
+            f"\n\n_{_MORE_HELP if message else _FOLLOW_UP}_"
+        )
+        budget = MAX_REPLY_CHARS - len(sources) - len(tail) - 80
         rendered: list[str] = []
         used = 0
         for claim in claims:
             if not claim.get("text"):
                 continue
             line = f"• {_plain(claim['text'])}"
-            if rendered and used + len(line) > MAX_REPLY_CHARS:
+            if rendered and used + len(line) > budget:
                 left = sum(1 for c in claims[claims.index(claim) :] if c.get("text"))
                 rendered.append(f"• _{left} more claim(s) did not fit in one Slack message._")
                 break
             rendered.append(line)
             used += len(line) + 1
-        body = "\n".join(rendered)
-        if citations:
-            # Citations are application-authored from validated GitHub URLs, so the link markup is
-            # built here; the label is still escaped since it carries a path.
-            sources = "\n".join(f"  {_source_link(c)}" for c in citations)
-            body += f"\n\n*Sources*\n{sources}"
-        if message:
-            # An answer may carry one limitation: the part of the question the evidence did not
-            # support. It is the difference between a useful partial answer and a silent gap.
-            body = f"{body}\n\n_{_plain(message)}_"
-        # Where to go next. An answer with a stated limitation is the case where someone most needs
-        # somewhere else to go, so that one names the human channels; every other answer just says
-        # that the thread is open, which is the cheapest way to get a better second answer.
-        return f"{body}\n\n_{_MORE_HELP if message else _FOLLOW_UP}_"
+        return "\n".join(rendered) + sources + tail
 
     # No claims is not one situation. A clarification is the assistant asking something
     # back, a partial means evidence was reachable but incomplete, and an abstention is a

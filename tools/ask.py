@@ -27,10 +27,10 @@ import boto3
 from botocore.config import Config
 
 FUNCTION = "valkeyrie-development-application"
-# Version 9 runs Claude Fable 5, the candidate that passed qualification, with a 120s
-# timeout so the densest questions are not cut off. The corpus is resolved at runtime
-# from the active pointer, so this serves the complete generation. Version 8 is Opus,
-# which failed the claim-to-evidence gate at 0.743 against a required 1.0.
+# The version below runs Claude Fable 5, the candidate that passed qualification, with a 120s
+# timeout so the densest questions are not cut off. The corpus is resolved at runtime from the
+# active pointer, so this serves the complete generation. (Version 8 was Opus, which failed the
+# claim-to-evidence gate at 0.743 against a required 1.0.)
 QUALIFIER = "71"
 KNOWLEDGE_BASE_ID = "ONVASJDDNX"
 REGION = "us-east-1"
