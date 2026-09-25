@@ -3408,3 +3408,111 @@ def test_wide_retrieval_is_reranked_and_a_rerank_failure_keeps_retrieval_order()
     counting = _Reranker([0])
     assert _reranked(counting, "q", narrow) is narrow
     assert counting.calls == 0
+
+
+def test_an_abstention_names_its_shortfall_and_the_router_supplies_the_missing_lookup(
+    manifest: dict[str, object],
+) -> None:
+    """The evidence-sufficiency pass. The first answer says what was missing; the router is asked
+    once more with that shortfall AS DATA and picks the lookup that supplies it (here a file
+    read), which the generic issue/PR search would never have found. Still one retry, one plan
+    revision, and the plan holds every id the answer cites."""
+    from valkeyrie.live_github import FileQuery
+
+    class Sufficiency(FakeServices):
+        def route(self, *, system: str, question: str) -> str:
+            if not hasattr(self, "route_calls"):
+                self.route_calls: list[str] = []
+            self.route_calls.append(question)
+            if "shortfall" in question:
+                # The second ask carries the first answer's own words, bounded, as a JSON field.
+                assert '"shortfall": "The evidence never shows the option' in question
+                return (
+                    '{"lookups":[{"kind":"file","repository":"valkey","path":"valkey.conf",'
+                    '"around":["repl-diskless-sync"]}]}'
+                )
+            return '{"lookups":[{"kind":"corpus_search"}]}'
+
+        def read_live(self, query: object) -> LiveObservation:
+            self.live_calls.append(query)
+            if isinstance(query, FileQuery):
+                return _live_observation(
+                    kind="file",
+                    object_type="file",
+                    source_url="https://api.github.com/repos/valkey-io/valkey/contents/valkey.conf",
+                    url="https://github.com/valkey-io/valkey/blob/unstable/valkey.conf",
+                )
+            raise RuntimeError("search is down in this test")
+
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            self.model_calls.append(dict(kwargs))
+            evidence = cast(tuple[RuntimeEvidence, ...], kwargs["evidence"])
+            files = [
+                e
+                for e in evidence
+                if isinstance(e, LiveRuntimeEvidence) and e.object_type == "file"
+            ]
+            output: dict[str, object]
+            if not files:
+                output = {
+                    "api_version": "valkeyrie.io/model-output/1",
+                    "kind": "ModelOutput",
+                    "outcome": "abstention",
+                    "reason": "The evidence never shows the option's default in valkey.conf.",
+                }
+            else:
+                output = {
+                    "api_version": "valkeyrie.io/model-output/1",
+                    "kind": "ModelOutput",
+                    "outcome": "answer",
+                    "claims": [
+                        {
+                            "claim_id": "c1",
+                            "text": "repl-diskless-sync defaults to yes.",
+                            "evidence_ids": [files[0].evidence_id],
+                        }
+                    ],
+                }
+            return BedrockTextResponse(json.dumps(output, separators=(",", ":")), "end_turn")
+
+    services = Sufficiency()
+    services.router_reply = "unused"
+    result = run_runtime_event(
+        _event(request_id="req_shortfall-1", question="what is the default of repl-diskless-sync?"),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] == "answer", result
+    assert len(services.route_calls) == 2, "the router was asked once more, with the shortfall"
+    assert len(services.model_calls) == 2
+    assert any(isinstance(q, FileQuery) for q in services.live_calls)
+    # The plan revision holds the cited file record, and the retry flag rides with it.
+    plan = cast(dict[str, object], services.requests["req_shortfall-1"]["plan"])
+    assert plan["retry_attempted"] is True
+    cited = {c["evidence_ids"][0] for c in cast(list[dict[str, list[str]]], result["claims"])}
+    persisted = {
+        cast(dict[str, str], cast(dict[str, object], e)["metadata"])["evidence_id"]
+        for e in cast(list[object], plan["evidence"])
+    }
+    assert cited <= persisted
+
+    # A router that fails on the second ask costs nothing: the abstention stands, no error.
+    class RouterDown(Sufficiency):
+        def route(self, *, system: str, question: str) -> str:
+            if "shortfall" in question:
+                raise RuntimeError("router unavailable")
+            return super().route(system=system, question=question)
+
+    down = RouterDown()
+    down.router_reply = "unused"
+    kept = run_runtime_event(
+        _event(
+            request_id="req_shortfall-down", question="what is the default of repl-diskless-sync?"
+        ),
+        down,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert kept["outcome"] == "abstention"
+    assert len(down.model_calls) == 1

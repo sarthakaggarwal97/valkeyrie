@@ -70,7 +70,7 @@
 - id: governance-meeting
   question: What did the TSC discuss in its September meeting?
   expect: answer
-  cites: community
+  cites: GOVERNANCE.md
   because: The meeting word had to follow the body immediately, so this lost the community scope.
 
 - id: docs-download
@@ -99,7 +99,7 @@
 - id: security-cve
   question: What is CVE-2025-21605 about?
   expect: answer
-  cites: security-advisories
+  cites: live GitHub advisory
   because: Advisory lookups are a separate path from issue search.
 
 - id: multilingual-spanish

@@ -1004,7 +1004,13 @@ def _execute_plan(
         # a plan that contains the cited ids. If the revision write is lost, the request moved
         # on without us and the abstention is not written either.
         retried = _retry_with_supplement(
-            services, plan, evidence, request_id=request_id, revision=revision, fence=fence
+            services,
+            plan,
+            evidence,
+            request_id=request_id,
+            revision=revision,
+            fence=fence,
+            shortfall=message,
         )
         if retried is not None:
             if retried.lost:
@@ -1410,6 +1416,7 @@ def _retry_with_supplement(
     request_id: str,
     revision: int,
     fence: int,
+    shortfall: str | None = None,
 ) -> _Retry | None:
     """Ask once more with the GitHub supplement forced on. None means keep the abstention as is.
 
@@ -1417,6 +1424,13 @@ def _retry_with_supplement(
     one evidence id the first package did not have, after bounding. That is the right condition,
     not "no live evidence yet": a plan whose live records did not help can still be rescued by
     different ones, and a plan that already holds what the supplement would add cannot.
+
+    Two sources widen the package. The forced generic supplement, as before. And, when the
+    abstention named what was missing, the router is asked once more with that shortfall as data
+    and its chosen lookups run: the file that holds the option, the release notes for the version,
+    the listing where the path was unknown. This is the evidence-sufficiency pass: the first answer
+    is the sufficiency judge, the router turns its verdict into exactly the lookups that would
+    satisfy it, and both stay inside the same closed catalog and the same evidence bounds.
 
     The widened package is persisted as a plan revision BEFORE the second model call. Any
     failure inside the retry itself (a fetch, the model, the parse) leaves the abstention in
@@ -1429,7 +1443,9 @@ def _retry_with_supplement(
     try:
         supplement = _forced_supplementary_live_evidence(services, question)
     except Exception:
-        return None
+        supplement = ()
+    if shortfall:
+        supplement = (*supplement, *_shortfall_lookups(services, question, shortfall))
     if not supplement:
         return None
     known = {item.evidence_id for item in evidence}
@@ -1474,6 +1490,31 @@ def _retry_with_supplement(
     if output[0] != "answer":
         return _Retry(next_revision)
     return _Retry(next_revision, output=output)
+
+
+def _shortfall_lookups(
+    services: RuntimeServices, question: str, shortfall: str
+) -> tuple[RuntimeEvidence, ...]:
+    """Live records for the lookups the router chooses given the first answer's shortfall.
+
+    Best-effort in every part: a router failure, an empty plan, or a failed read yields no
+    records, and the retry then rests on the generic supplement alone. Only live lookups are
+    taken; the corpus search already ran once for this question.
+    """
+    try:
+        plan = route_lookups(
+            question,
+            lambda system, prompt: services.route(system=system, question=prompt),
+            shortfall=shortfall,
+        )
+    except Exception:
+        return ()
+    if plan is None or not plan.live:
+        return ()
+    try:
+        return tuple(_live_records(services, plan.live))
+    except Exception:
+        return ()
 
 
 def _forced_supplementary_live_evidence(
