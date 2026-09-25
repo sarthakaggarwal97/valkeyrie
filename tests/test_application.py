@@ -259,6 +259,7 @@ def test_service_role_and_existing_role_policies_are_exact(tmp_path: Path) -> No
         "InvokeExactOwnerDirectedOpusComparisonRoute",
         "ReadExactGitHubTokenSecret",
         "RetrieveExactKnowledgeBase",
+        "RerankWithExactModel",
         "ReadCorpusPointersAndOwnRequests",
         "ConditionallyAuditOwnRequests",
         "ReadFailClosedRuntimeControls",
@@ -303,6 +304,14 @@ def test_service_role_and_existing_role_policies_are_exact(tmp_path: Path) -> No
             ]
         },
         "Sid": "RetrieveExactKnowledgeBase",
+    }
+    # The reranker is one exact model, named for both the Rerank action and the InvokeModel the
+    # service performs on its behalf. Never a wildcard: the runtime must not gain any other model.
+    assert runtime["RerankWithExactModel"] == {
+        "Action": ["bedrock:Rerank", "bedrock:InvokeModel"],
+        "Effect": "Allow",
+        "Resource": "arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0",
+        "Sid": "RerankWithExactModel",
     }
     # Reads and writes are separate statements so the runtime can never move the active pointer
     # or record an approval: writes are confined to its own request audit rows.

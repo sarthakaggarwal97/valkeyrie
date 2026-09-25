@@ -12,6 +12,12 @@ decides whether its evidence is enough. One pass tells you whether a question CA
 tell you whether it RELIABLY is. A question that answers two draws in three is not passing, it is
 flaking, and a single pass hides exactly the failure that took four draws to see in production.
 
+TWO AXES. A RAG answer can fail in two independent places, and one pass/fail hides which. An entry
+may name `cites` (a path fragment), and the run then reports separately whether the answer CITED a
+source containing that fragment. An answer that is correct but cited the wrong document is a
+retrieval problem; an answer that cited the right document and still went wrong is a drafting
+problem. The evaluation literature is unanimous that conflating the two makes both unfixable.
+
 Exit status is 0 only when every question matched its expectation on every draw, so this is usable
 as a gate. Failures print the outcome and the message so the reason is in the output, not in a
 follow-up investigation.
@@ -120,6 +126,9 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001 - the report names the failure either way
             result = {"outcome": "invoke_failed", "message": f"{type(error).__name__}: {error}"}
         claims = result.get("claims") or []
+        citations = [str(c) for c in (result.get("citations") or [])]
+        wanted = case.get("cites")
+        cited_ok = None if not wanted else any(str(wanted) in c for c in citations)
         return {
             "id": case["id"],
             "draw": draw,
@@ -128,6 +137,8 @@ def main() -> int:
             "claims": len(claims),
             "detail": (claims[0]["text"] if claims else result.get("message")) or "",
             "seconds": round(time.monotonic() - started, 1),
+            "cites": wanted,
+            "cited_ok": cited_ok,
             "passed": _outcome_matches(case["expect"], str(result.get("outcome")), len(claims)),
         }
 
@@ -150,7 +161,14 @@ def main() -> int:
             flaking += 1
         elif mark == "FAIL":
             failing += 1
-        print(f"{mark:5} {passed}/{len(draws)}  {case['id']:32} expect {case['expect']}")
+        cited = [row["cited_ok"] for row in draws if row["cited_ok"] is not None]
+        axis = ""
+        if cited:
+            hits = sum(1 for c in cited if c)
+            axis = f"  cited {hits}/{len(cited)}"
+            if hits < len(cited):
+                axis += " RETRIEVAL"
+        print(f"{mark:5} {passed}/{len(draws)}  {case['id']:32} expect {case['expect']}{axis}")
         if passed != len(draws):
             print(f"        because: {case['because']}")
             for row in draws:

@@ -134,6 +134,12 @@ path_policies:
           - tests/**/*.tcl
           - utils/**/*.py
           - runtest*
+          # The two files that document every configuration option, with defaults and the
+          # prose explaining each one. They were never included, so every configuration question
+          # was answered from test files and topic docs by luck: "what does repl-diskless-sync
+          # do?" retrieved four Tcl tests and never the option's own documentation.
+          - /valkey.conf
+          - /sentinel.conf
         reason: canonical_core_behavior_policy_source_and_tests
       - action: exclude
         patterns: ["**"]

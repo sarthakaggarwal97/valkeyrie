@@ -3359,3 +3359,52 @@ def test_a_claim_carrying_a_program_may_exceed_the_prose_bound() -> None:
     # Two fences, or text after the fence, is not the one shape the prompt permits.
     assert not _has_code_block("a\n```x```\n```y```")
     assert not _has_code_block("a\n```x\n``` trailing prose")
+
+
+def test_wide_retrieval_is_reranked_and_a_rerank_failure_keeps_retrieval_order() -> None:
+    """Reranking is best-effort: any failure returns the first ten of the wide set, which is
+    exactly the previous behaviour, so a Bedrock hiccup can never cost an answer."""
+    from valkeyrie.application_runtime import _RETRIEVE_KEEP, _RETRIEVE_WIDE, _reranked
+
+    wide = {
+        "retrievalResults": [
+            {"content": {"text": f"chunk {i}"}, "metadata": {"i": i}} for i in range(_RETRIEVE_WIDE)
+        ]
+    }
+
+    class _Reranker:
+        def __init__(self, order: list[int] | Exception) -> None:
+            self.order = order
+            self.calls = 0
+
+        def rerank(self, **kwargs: object) -> dict[str, object]:
+            self.calls += 1
+            if isinstance(self.order, Exception):
+                raise self.order
+            assert len(cast(list[object], kwargs["sources"])) == _RETRIEVE_WIDE
+            return {"results": [{"index": i} for i in self.order]}
+
+    # The reranker's order wins, cut to the budget.
+    good = _Reranker([19, 3, 7, 0, 15, 2, 11, 5, 18, 9, 1, 4])
+    out = cast(list[dict[str, dict[str, int]]], _reranked(good, "q", wide)["retrievalResults"])
+    assert [r["metadata"]["i"] for r in out] == [19, 3, 7, 0, 15, 2, 11, 5, 18, 9]
+    assert len(out) == _RETRIEVE_KEEP
+
+    # A failure degrades to the first ten, unchanged.
+    broken = _Reranker(RuntimeError("throttled"))
+    out = cast(list[dict[str, dict[str, int]]], _reranked(broken, "q", wide)["retrievalResults"])
+    assert [r["metadata"]["i"] for r in out] == list(range(_RETRIEVE_KEEP))
+
+    # An unusable ordering (duplicates, out of range) is treated as a failure, not trusted.
+    for hostile in ([1, 1, 2], [0, 99], []):
+        out = cast(
+            list[dict[str, dict[str, int]]],
+            _reranked(_Reranker(hostile), "q", wide)["retrievalResults"],
+        )
+        assert [r["metadata"]["i"] for r in out] == list(range(_RETRIEVE_KEEP)), hostile
+
+    # Ten or fewer results are not reranked at all: nothing to reorder, no call spent.
+    narrow = {"retrievalResults": wide["retrievalResults"][:5]}
+    counting = _Reranker([0])
+    assert _reranked(counting, "q", narrow) is narrow
+    assert counting.calls == 0

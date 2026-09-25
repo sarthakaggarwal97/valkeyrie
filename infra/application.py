@@ -771,6 +771,14 @@ def _runtime_statements(stack: Stack, artifact: ApplicationArtifact) -> list[dic
             "Resource": kb,
         },
         {
+            # Reranking the wide retrieval. bedrock:Rerank is authorized on the reranker model,
+            # and the model is also invoked, so both actions name the one exact model ARN.
+            "Sid": "RerankWithExactModel",
+            "Effect": "Allow",
+            "Action": ["bedrock:Rerank", "bedrock:InvokeModel"],
+            "Resource": "arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0",
+        },
+        {
             # Reads: the active pointer and the version pointers, the generation record they
             # name, structured records under it, and the request's own audit row.
             "Sid": "ReadCorpusPointersAndOwnRequests",

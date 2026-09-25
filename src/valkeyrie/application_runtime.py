@@ -2508,6 +2508,17 @@ def _runtime_retrieval_metadata(metadata: object, text: str = "") -> Mapping[str
     }
 
 
+# Retrieve WIDE, then rerank down to what the evidence budget takes. Measured on the active
+# corpus: reranking the top 20 changed 4 to 5 of the top 10 on three of five questions and moved
+# the correct document to rank 1 on two of them ("event loop" -> src/ae.c). Anthropic's contextual
+# retrieval work puts reranking at the largest single retrieval lever they measured. The reranker
+# is best-effort: any failure returns the first ten of the wide set, which is exactly today's
+# result, so a Bedrock hiccup can never cost an answer.
+_RETRIEVE_WIDE: Final = 20
+_RETRIEVE_KEEP: Final = 10
+_RERANKER_MODEL_ARN: Final = "arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0"
+
+
 def _runtime_retrieve(
     client: Any, knowledge_base_id: str, query: str, retrieval_filter: Mapping[str, object]
 ) -> Mapping[str, object]:
@@ -2518,7 +2529,7 @@ def _runtime_retrieve(
             retrievalConfiguration={
                 "vectorSearchConfiguration": {
                     "filter": retrieval_filter,
-                    "numberOfResults": 10,
+                    "numberOfResults": _RETRIEVE_WIDE,
                     "overrideSearchType": "HYBRID",
                 }
             },
@@ -2527,7 +2538,58 @@ def _runtime_retrieve(
         raise ApplicationRuntimeError(f"static retrieval intent is invalid: {error}") from error
     if not isinstance(response, Mapping):
         raise ApplicationRuntimeError("Bedrock retrieval response is malformed")
-    return response
+    return _reranked(client, query, response)
+
+
+def _reranked(client: Any, query: str, response: Mapping[str, object]) -> Mapping[str, object]:
+    """The wide retrieval reordered by a reranker and cut to the evidence budget, or the first
+    ten of it unchanged when reranking is unavailable."""
+    results = response.get("retrievalResults")
+    if not isinstance(results, list) or len(results) <= _RETRIEVE_KEEP:
+        return response
+    try:
+        documents = []
+        for item in results:
+            content = item.get("content", {}) if isinstance(item, Mapping) else {}
+            text = content.get("text", "") if isinstance(content, Mapping) else ""
+            documents.append(
+                {
+                    "type": "INLINE",
+                    "inlineDocumentSource": {
+                        "type": "TEXT",
+                        # Bounded: the reranker prices by input, and the first part of a chunk is
+                        # what carries its subject.
+                        "textDocument": {"text": str(text)[:2000] or " "},
+                    },
+                }
+            )
+        ranked = client.rerank(
+            queries=[{"type": "TEXT", "textQuery": {"text": query}}],
+            sources=documents,
+            rerankingConfiguration={
+                "type": "BEDROCK_RERANKING_MODEL",
+                "bedrockRerankingConfiguration": {
+                    "modelConfiguration": {"modelArn": _RERANKER_MODEL_ARN},
+                    "numberOfResults": _RETRIEVE_KEEP,
+                },
+            },
+        )
+        order = [
+            int(entry["index"])
+            for entry in ranked.get("results", [])
+            if isinstance(entry, Mapping) and isinstance(entry.get("index"), int)
+        ]
+        if (
+            not order
+            or len(set(order)) != len(order)
+            or any(i < 0 or i >= len(results) for i in order)
+        ):
+            raise ValueError("reranker returned an unusable ordering")
+        reordered = [results[i] for i in order[:_RETRIEVE_KEEP]]
+    except Exception as error:  # noqa: BLE001 - a rerank failure is a degradation, not a loss
+        _LOG.warning("reranking unavailable, keeping retrieval order: %s", error)
+        reordered = results[:_RETRIEVE_KEEP]
+    return {**response, "retrievalResults": reordered}
 
 
 class AwsRuntimeServices:

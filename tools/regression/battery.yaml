@@ -14,26 +14,31 @@
 - id: command-basic
   question: What does HSET do?
   expect: answer
+  cites: commands/hset.md
   because: The simplest possible question. If this fails, everything is broken.
 
 - id: command-hello
   question: HELLO
   expect: answer
+  cites: commands/hello.md
   because: HELLO is a command, and a case-insensitive greeting pattern greeted it back instead.
 
 - id: command-module-load
   question: How does MODULE LOAD work?
   expect: answer
+  cites: commands/module-load.md
   because: "Matching the bare word 'module' sent a core server command to eight module repositories."
 
 - id: command-client-list
   question: How does CLIENT LIST report status?
   expect: answer
+  cites: commands/client-list.md
   because: "Matching the bare word 'client' sent a core server command to sixteen client libraries."
 
 - id: internals-event-loop
   question: How does the Valkey event loop process callbacks?
   expect: answer
+  cites: src/ae.c
   because: "The event category matched 'event' and scoped the event loop to the website and community."
 
 - id: internals-terse
@@ -49,6 +54,7 @@
 - id: onboarding-add-command
   question: How do I add a new command to valkey?
   expect: answer
+  cites: src/commands
   because: "Errored every time: the answer says 'source of truth' and the authority screen refused it."
 
 - id: sibling-helm
@@ -64,6 +70,7 @@
 - id: governance-meeting
   question: What did the TSC discuss in its September meeting?
   expect: answer
+  cites: community
   because: The meeting word had to follow the body immediately, so this lost the community scope.
 
 - id: docs-download
@@ -92,6 +99,7 @@
 - id: security-cve
   question: What is CVE-2025-21605 about?
   expect: answer
+  cites: security-advisories
   because: Advisory lookups are a separate path from issue search.
 
 - id: multilingual-spanish
@@ -189,6 +197,7 @@
 - id: repo-symbol
   question: Which file implements the SCAN cursor logic?
   expect: answer
+  cites: src/db.c
   because: Embedding similarity over prose does not find a function; code search does.
 
 - id: repo-cross-repository-symbol
@@ -219,6 +228,7 @@
 - id: copilot-troubleshooting
   question: I get MISCONF Errors writing against a read only replica, what now?
   expect: answer
+  cites: topics/
   because: A pasted error is the subject of the message, whatever library it also mentions.
 
 - id: copilot-troubleshooting-known
