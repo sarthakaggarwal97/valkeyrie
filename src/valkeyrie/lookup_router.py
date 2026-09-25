@@ -169,12 +169,12 @@ ROUTER_SYSTEM: Final = (
     "answering that with merged ones answers a different question. With a window the terms may be "
     'empty, so "what merged '
     'this week" is a search with since and no terms, and "what happened in August" is since the '
+    "1st until the 31st. Compute the days from today's date, given with the question. "
     'An optional "state" of "open" or "closed" and up to three "labels" filter by issue state and '
     'repository label, and both waive the terms: "how many open bugs are there" is state open '
     "with label bug, not the words open and bugs. Valkey labels include bug, enhancement, "
     "cluster, documentation, good first issue, help wanted and release-blocker. The payload "
-    "carries the exact total, so a count question needs nothing more.\n"
-    "1st until the 31st. Compute the days from today's date, given with the question. An optional "
+    "carries the exact total, so a count question needs nothing more. An optional "
     '"author":"login" restricts to items that GitHub user authored, and also waives the terms: '
     "use it for what a named person has contributed or is working on, with the login the asker "
     "gives (madolson) or the one the corpus gives for a full name; searching a login as a word "

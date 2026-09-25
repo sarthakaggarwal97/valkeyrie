@@ -54,7 +54,11 @@ Choose the outcome in this order:
    authored, what merged) and state in one claim, in plain words, that the rest is a matter of opinion
    the evidence does not settle. A question is not unanswerable because part of it is. Match the
    asker's tone in that one claim; never invent a verdict.
-10. Otherwise abstain with exactly `Insufficient validated evidence.`
+10. Otherwise abstain with a reason of 20 words or fewer that names the missing thing when one can
+    be named: the document, file, option, version, release, repository, or object the answer would
+    need. A second lookup reads this reason to fetch exactly that, so "the evidence does not include
+    the 8.1 release notes" leads somewhere and a bare phrase does not. When nothing specific can be
+    safely named, abstain with exactly `Insufficient validated evidence.`
 
 ORDER THE CLAIMS LIKE A COLLEAGUE ANSWERING, not like a list of retrieved facts:
 - The FIRST claim answers the question directly, in one sentence, whenever the question has a direct

@@ -21,9 +21,13 @@ def test_only_messages_naming_the_run_word_are_commands() -> None:
     assert actions.match_command("run backport-sweep branch=8.1") == "backport-sweep branch=8.1"
     assert actions.match_command("  RUN ci") == "ci"
     assert actions.match_command("run") == ""
-    # Everything else is a question, including questions that contain the word.
+    # Everything else is a question, including questions that contain the word, and including
+    # ones that START with it but name no catalogued action: "run valkey-benchmark how?" is a
+    # question about a tool, not a dispatch, and used to be swallowed as a refused command.
     assert actions.match_command("how do I run valkey in a container?") is None
     assert actions.match_command("rundown of eviction policies") is None
+    assert actions.match_command("run valkey-benchmark how?") is None
+    assert actions.match_command("run down the list of eviction policies") is None
 
 
 def test_a_non_operator_is_refused_before_learning_anything() -> None:

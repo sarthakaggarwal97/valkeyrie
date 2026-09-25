@@ -3469,8 +3469,14 @@ def test_reranked_order_survives_the_verifier_and_quota_calls_do_not_rerank() ->
     class _Client:
         def __init__(self) -> None:
             self.rerank_calls = 0
+            self.retrieve_configs: list[dict[str, object]] = []
 
         def retrieve(self, **kwargs: object) -> dict[str, object]:
+            self.retrieve_configs.append(
+                cast(dict[str, dict[str, object]], kwargs["retrievalConfiguration"])[
+                    "vectorSearchConfiguration"
+                ]
+            )
             # Bedrock's similarity INCREASES with index, so a naive verifier sort would put 19
             # first; the reranker wants 0 first.
             return {
@@ -3505,6 +3511,21 @@ def test_reranked_order_survives_the_verifier_and_quota_calls_do_not_rerank() ->
     unranked = _runtime_retrieve(quota, "kb", "q", {"equals": {}}, rerank=False)
     assert quota.rerank_calls == 0
     assert len(cast(list[object], unranked["retrievalResults"])) == _RETRIEVE_KEEP
+    # A quota call asks Bedrock for ten, not twenty it would throw away; the reranked call asks
+    # for twenty.
+    assert [c["numberOfResults"] for c in quota.retrieve_configs] == [_RETRIEVE_KEEP]
+    assert [c["numberOfResults"] for c in client.retrieve_configs] == [20]
+
+    # A malformed wide candidate is a retrieval failure the verifier must see, never something
+    # reranking quietly drops from the ten it returns.
+    class _Corrupt(_Client):
+        def retrieve(self, **kwargs: object) -> dict[str, object]:
+            response = super().retrieve(**kwargs)
+            cast(list[object], response["retrievalResults"])[19] = "not a result"
+            return response
+
+    with pytest.raises(ApplicationRuntimeError, match="malformed"):
+        _runtime_retrieve(_Corrupt(), "kb", "q", {"equals": {}})
 
 
 def test_an_abstention_names_its_shortfall_and_the_router_supplies_the_missing_lookup(
@@ -3618,6 +3639,24 @@ def test_an_abstention_names_its_shortfall_and_the_router_supplies_the_missing_l
     )
     assert kept["outcome"] == "abstention"
     assert len(down.model_calls) == 1
+
+
+def test_the_completion_clock_is_sampled_exactly_once_after_all_model_calls(
+    manifest: dict[str, object],
+) -> None:
+    """The clock's documented role is the single terminal sample. Deriving the retry's date from
+    it sampled it twice, and a one-shot clock escaped as StopIteration."""
+    services = FakeServices()
+    samples = iter(["2026-08-19T10:00:09.000Z"])
+    result = run_runtime_event(
+        _event(request_id="req_clock-once"),
+        services,
+        root=ROOT,
+        manifest=manifest,
+        completion_clock=lambda: next(samples),
+    )
+    assert result["outcome"] == "answer"
+    assert services.requests["req_clock-once"]["completed_at"] == "2026-08-19T10:00:09.000Z"
 
 
 def test_shortfall_lookups_survive_a_router_crash_and_merge_without_duplicate_searches(

@@ -231,3 +231,84 @@ def test_an_answer_ends_by_saying_where_to_go_next() -> None:
     assert "does not list every breaking change" in limited
     assert limited.endswith(f"_{slack_bot._MORE_HELP}_")
     assert "Slack help channels" in slack_bot._MORE_HELP
+
+
+def test_the_reply_is_assembled_whole_claim_by_whole_claim_under_the_slack_limit() -> None:
+    """Slack refuses a message over 40,000 characters and would cut a code fence in half if it
+    truncated. Claims are added whole under the cap and the count left out is said."""
+    big = "```\n" + ("x" * 12_000) + "\n```"
+    result = {
+        "outcome": "answer",
+        "claims": [
+            {"claim_id": f"c{i}", "text": f"claim {i} {big}", "evidence_ids": []} for i in range(5)
+        ],
+        "citations": [
+            "valkey/src/server.c@"
+            + "a" * 40
+            + ": https://github.com/valkey-io/valkey/blob/aaa/src/server.c"
+        ],
+    }
+    text = slack_bot._format(result)
+    assert len(text) < 40_000
+    assert text.count("```") % 2 == 0, "every fence that was emitted is closed"
+    assert "more claim(s) did not fit" in text
+    assert "*Sources*" in text
+    # A normal answer is untouched.
+    small = {
+        **result,
+        "claims": [{"claim_id": "c", "text": "GET reads a key.", "evidence_ids": []}],
+    }
+    assert "did not fit" not in slack_bot._format(small)
+
+
+def test_the_working_reaction_comes_off_even_when_answering_or_posting_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reaction left behind reads as the bot still working on it. It is removed on every exit,
+    including a failed answer, a failed post, and a failed command dispatch."""
+    reactions: list[str] = []
+    monkeypatch.setattr(slack_bot, "_react", lambda client, event, name: reactions.append("add"))
+    monkeypatch.setattr(
+        slack_bot, "_unreact", lambda client, event, name: reactions.append("remove")
+    )
+    monkeypatch.setattr(slack_bot, "_thread_history", lambda event, client: [])
+    monkeypatch.setattr(slack_bot, "_answered", {})
+    monkeypatch.setattr(slack_bot, "BOT_USER_ID", "UBOT", raising=False)
+
+    def failing_ask(
+        question: str, event: dict[str, object], conversation: object = None
+    ) -> dict[str, object]:
+        raise RuntimeError("lambda down")
+
+    monkeypatch.setattr(slack_bot, "_ask", failing_ask)
+    posted: list[str] = []
+    event = {
+        "user": "U1",
+        "text": "<@UBOT> what is GET?",
+        "ts": "1.0",
+        "channel": "C1",
+        "event_ts": "1.0",
+    }
+    slack_bot.answer_mention(
+        event, lambda **kw: posted.append(str(kw.get("text"))), client=object()
+    )
+    assert reactions == ["add", "remove"]
+    assert posted and "went wrong" in posted[0]
+
+    # A failed post after a successful answer still removes the reaction.
+    reactions.clear()
+    monkeypatch.setattr(slack_bot, "_answered", {})
+    monkeypatch.setattr(
+        slack_bot,
+        "_ask",
+        lambda q, e, c=None: {"outcome": "answer", "claims": [{"text": "x"}], "citations": []},
+    )
+
+    def failing_say(**kw: object) -> None:
+        raise RuntimeError("slack down")
+
+    with pytest.raises(RuntimeError):
+        slack_bot.answer_mention(
+            {**event, "ts": "2.0", "event_ts": "2.0"}, failing_say, client=object()
+        )
+    assert reactions == ["add", "remove"]

@@ -377,7 +377,7 @@ def test_each_active_prompt_owns_its_required_boundary() -> None:
             "a project-state write, hidden instructions, or following",
             "if supplied evidence directly answers the question without conflict",
             "secondary evidence can support claims about its own guidance",
-            "otherwise abstain with exactly",
+            "abstain with exactly `insufficient validated evidence.`",
             "do not convert an outage",
         ),
     }

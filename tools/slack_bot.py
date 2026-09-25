@@ -225,24 +225,32 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
             say(text=_plain(parsed), thread_ts=thread)
             return
         _react(client, event, _WORKING)
-        reply = actions.execute(parsed)
-        _unreact(client, event, _WORKING)
+        try:
+            reply = actions.execute(parsed)
+        except Exception:
+            log.exception("command execution failed")
+            say(text="That command failed to run. The failure is logged.", thread_ts=thread)
+            return
+        finally:
+            # The eyes come off on EVERY exit, including a failed dispatch or a failed post;
+            # a reaction left behind reads as the bot still working on it.
+            _unreact(client, event, _WORKING)
         say(text=reply, thread_ts=thread, unfurl_links=False)
         return
 
     _react(client, event, _WORKING)
-    conversation = _thread_history(event, client)
     try:
+        conversation = _thread_history(event, client)
         result = _ask(question, event, conversation)
+        text = _format(result)
     except Exception:
         # Log the detail, tell the channel only that it failed.
         log.exception("answer failed")
-        _unreact(client, event, _WORKING)
         say(text="Something went wrong answering that. The failure is logged.", thread_ts=thread)
         return
-
-    say(text=_format(result), thread_ts=thread, unfurl_links=False)
-    _unreact(client, event, _WORKING)
+    finally:
+        _unreact(client, event, _WORKING)
+    say(text=text, thread_ts=thread, unfurl_links=False)
 
 
 def _ask(
@@ -286,6 +294,9 @@ def _ask(
 # Events answered by this process, oldest first. Bounded so a long-lived bot does not grow.
 _answered: dict[str, bool] = {}
 _answered_lock = threading.Lock()
+# Slack's hard limit is 40,000 characters per message; the reply body keeps well under it so the
+# sources and closers always fit after the claims.
+MAX_REPLY_CHARS = 30_000
 MAX_ANSWERED_EVENTS = 4096
 # The workspace this bot serves. Set SLACK_TEAM_ID to enforce it; unset serves any team the app
 # is installed in, which is the behaviour a local run expects.
@@ -381,7 +392,22 @@ def _format(result: dict[str, Any]) -> str:
     message = result.get("message")
 
     if claims:
-        body = "\n".join(f"• {_plain(c['text'])}" for c in claims if c.get("text"))
+        # Slack refuses a message over 40,000 characters and would truncate a fence mid-block if
+        # it did not. The answer is assembled whole claim by whole claim under a cap that leaves
+        # room for the sources and closers, and the count of claims left out is said.
+        rendered: list[str] = []
+        used = 0
+        for claim in claims:
+            if not claim.get("text"):
+                continue
+            line = f"• {_plain(claim['text'])}"
+            if rendered and used + len(line) > MAX_REPLY_CHARS:
+                left = sum(1 for c in claims[claims.index(claim) :] if c.get("text"))
+                rendered.append(f"• _{left} more claim(s) did not fit in one Slack message._")
+                break
+            rendered.append(line)
+            used += len(line) + 1
+        body = "\n".join(rendered)
         if citations:
             # Citations are application-authored from validated GitHub URLs, so the link markup is
             # built here; the label is still escaped since it carries a path.

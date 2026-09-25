@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import uuid
@@ -128,7 +129,14 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001 - the report names the failure either way
             result = {"outcome": "invoke_failed", "message": f"{type(error).__name__}: {error}"}
         claims = result.get("claims") or []
-        citations = [str(c) for c in (result.get("citations") or [])]
+        # A citation renders as "<source descriptor>: <url>", the descriptor being
+        # "repo/path@commit" for the corpus or "live GitHub <object> observed <time>". Only the
+        # descriptor before the commit or the timestamp is matched: `cites: github` matched every
+        # URL host and `cites: 2026-09-25` matched every observation time.
+        citations = [
+            re.split(r"@[0-9a-f]{40}| observed ", str(c).split(": ", 1)[0], maxsplit=1)[0]
+            for c in (result.get("citations") or [])
+        ]
         wanted = case.get("cites")
         cited_ok = None if not wanted else any(str(wanted) in c for c in citations)
         return {

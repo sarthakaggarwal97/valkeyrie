@@ -911,9 +911,9 @@ def _execute_plan(
     completion_clock: Callable[[], str] | None = None,
 ) -> RuntimeResult:
     generation_id = _plan_generation_id(plan)
-    # The date the retry's router sees. From the trusted clock when there is one, else the
-    # caller's completion timestamp, which is what the first router saw too.
-    today = (completion_clock() if completion_clock is not None else completed_at)[:10]
+    # The date the retry's router sees: the request's own date, as the first router saw it. The
+    # completion clock is sampled once, for the terminal record, after every model call.
+    today = completed_at[:10]
     if not _controls_enabled(services):
         return RuntimeResult(
             "partial",
@@ -1535,10 +1535,12 @@ def _merged_queries(
     merged: list[LiveGitHubQuery] = []
     for query in (*first, *second):
         fields = {
-            key: sorted(value) if isinstance(value, (tuple, list)) else value
+            key: [type(value).__name__, sorted(value)] if isinstance(value, tuple) else value
             for key, value in asdict(query).items()
         }
-        key = type(query).__name__ + json.dumps(fields, sort_keys=True, default=str)
+        # Typed queries hold only strings, ints, bools, None and tuples of strings; anything else
+        # is a defect and json.dumps says so rather than a stringified stand-in colliding.
+        key = type(query).__name__ + json.dumps(fields, sort_keys=True)
         if key in seen:
             continue
         seen.add(key)
@@ -2614,7 +2616,7 @@ def _runtime_retrieve(
             retrievalConfiguration={
                 "vectorSearchConfiguration": {
                     "filter": retrieval_filter,
-                    "numberOfResults": _RETRIEVE_WIDE,
+                    "numberOfResults": _RETRIEVE_WIDE if rerank else _RETRIEVE_KEEP,
                     "overrideSearchType": "HYBRID",
                 }
             },
@@ -2643,6 +2645,9 @@ def _reranked(client: Any, query: str, response: Mapping[str, object]) -> Mappin
     results = response.get("retrievalResults")
     if not isinstance(results, list) or len(results) <= _RETRIEVE_KEEP:
         return response
+    if not all(isinstance(item, Mapping) for item in results):
+        # Reranking must not launder a malformed candidate out of the set the verifier sees.
+        raise ApplicationRuntimeError("Bedrock retrieval response is malformed")
     try:
         documents = []
         for item in results:

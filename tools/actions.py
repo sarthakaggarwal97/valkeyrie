@@ -103,11 +103,26 @@ def load_catalog(path: Path = CATALOG_PATH) -> tuple[tuple[str, ...], dict[str, 
     return operators, actions
 
 
-def match_command(question: str) -> str | None:
-    """The command text when the message is a command, else None (an ordinary question)."""
+def match_command(question: str, path: Path = CATALOG_PATH) -> str | None:
+    """The command text when the message is a command, else None (an ordinary question).
+
+    Bare `run` asks what exists. `run <word> ...` is a command only when the word names a
+    catalogued action; "run valkey-benchmark how?" is a question about running a tool and falls
+    through to answering. This is what the module docstring promised and the code did not do.
+    """
     stripped = question.strip()
-    if stripped.lower() == "run" or stripped.lower().startswith("run "):
-        return stripped[3:].strip()
+    if stripped.lower() == "run":
+        return ""
+    if not stripped.lower().startswith("run "):
+        return None
+    rest = stripped[3:].strip()
+    first = rest.split(maxsplit=1)[0].lower() if rest else ""
+    try:
+        _, catalogued = load_catalog(path)
+    except CommandError:
+        return rest
+    if first in {name.lower() for name in catalogued}:
+        return rest
     return None
 
 
