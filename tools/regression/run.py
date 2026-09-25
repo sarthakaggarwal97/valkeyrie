@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 import time
 import uuid
@@ -129,14 +128,18 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001 - the report names the failure either way
             result = {"outcome": "invoke_failed", "message": f"{type(error).__name__}: {error}"}
         claims = result.get("claims") or []
-        # A citation renders as "<source descriptor>: <url>", the descriptor being
-        # "repo/path@commit" for the corpus or "live GitHub <object> observed <time>". Only the
-        # descriptor before the commit or the timestamp is matched: `cites: github` matched every
-        # URL host and `cites: 2026-09-25` matched every observation time.
-        citations = [
-            re.split(r"@[0-9a-f]{40}| observed ", str(c).split(": ", 1)[0], maxsplit=1)[0]
-            for c in (result.get("citations") or [])
-        ]
+        # A citation renders as "<source descriptor>: <url>". For the corpus the descriptor is
+        # "repo/path@commit" and the part before the commit is matched. A live observation's
+        # descriptor is "live GitHub <object> observed <time>", which names no path, so its URL
+        # PATH is matched instead, after the host: `cites: github` used to match every URL host
+        # and `cites: 2026-09-25` every observation time, and neither can now.
+        citations = []
+        for raw in result.get("citations") or []:
+            descriptor, _, url = str(raw).partition(": ")
+            if descriptor.startswith("live GitHub"):
+                citations.append(url.split("://", 1)[-1].split("/", 1)[-1] if url else "")
+            else:
+                citations.append(descriptor.split("@", 1)[0])
         wanted = case.get("cites")
         cited_ok = None if not wanted else any(str(wanted) in c for c in citations)
         return {

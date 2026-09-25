@@ -1027,10 +1027,10 @@ def _execute_plan(
     # Sampled after every model call this request will make, so the terminal record does not
     # predate its own completion.
     terminal_at = _completion_timestamp(completion_clock, completed_at)
-    if outcome == "abstention":
+    if outcome == "abstention" and (message or "").strip() == "Insufficient validated evidence.":
         # Applied here, at the single point where a parsed model outcome becomes a result,
-        # rather than at each return site. The model writes its own reason, so wrapping the
-        # sites individually left this one bare and would leave the next one bare too.
+        # rather than at each return site. Only the generic fallback gets the generic advice: a
+        # reason that already names the missing document is not told to name one.
         # A clarification is deliberately excluded: it is already a question to the user.
         message = _guided(message, _STATIC_GUIDANCE)
     terminal = "answer" if outcome == "answer" else outcome

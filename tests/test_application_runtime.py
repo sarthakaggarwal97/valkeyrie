@@ -604,10 +604,34 @@ def test_runtime_clarification_abstention_and_partial(manifest: dict[str, object
         _event(request_id="req_abstain"), no_evidence, root=ROOT, manifest=manifest
     )
     assert abstain["outcome"] == "abstention"
-    # The model writes its own reason. It still has to reach the user with a next step,
-    # which is why the guidance is applied where the parsed outcome becomes a result
-    # rather than at each return site.
+    # Empty evidence is an application-authored refusal and carries the next step.
     assert "indexed Valkey repositories" in cast(str, abstain["message"])
+    # A model-written reason reaches the user as written; the generic next-step advice is added
+    # only to the generic fallback phrase, at the single point where a parsed outcome becomes a
+    # result. A reason that already names the missing document is not told to name one.
+    specific = FakeServices()
+    specific.output = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": "abstention",
+        "reason": "The evidence does not include valkey.conf.",
+    }
+    named = run_runtime_event(
+        _event(request_id="req_abstain-named"), specific, root=ROOT, manifest=manifest
+    )
+    assert cast(str, named["message"]) == "The evidence does not include valkey.conf."
+    generic = FakeServices()
+    generic.output = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": "abstention",
+        "reason": "Insufficient validated evidence.",
+    }
+    fallback = run_runtime_event(
+        _event(request_id="req_abstain-generic"), generic, root=ROOT, manifest=manifest
+    )
+    assert cast(str, fallback["message"]).startswith("Insufficient validated evidence.")
+    assert "indexed Valkey repositories" in cast(str, fallback["message"])
 
     disabled = FakeServices()
     disabled.controls[next(iter(disabled.controls))] = "false"
@@ -2334,7 +2358,9 @@ def test_a_corpus_abstention_is_retried_once_with_the_github_supplement_forced_o
         isinstance(e, LiveRuntimeEvidence)
         for e in cast(tuple[RuntimeEvidence, ...], still.model_calls[0]["evidence"])
     )
-    assert "indexed Valkey repositories" in cast(str, result["message"])
+    # The model's own specific reason reaches the user as written; the generic advice is added
+    # only to the generic fallback phrase.
+    assert cast(str, result["message"]) == "Nothing here describes it."
 
     # GitHub unavailable during the retry: the abstention stands, nothing leaks.
     down = FakeServices()
@@ -2566,7 +2592,7 @@ def test_retry_fallbacks_keep_the_abstention_and_never_error(
     else:
         assert result["outcome"] == "abstention"
         assert len(services.model_calls) == (1 if retry_result == "controls_off" else 2)
-        assert "indexed Valkey repositories" in cast(str, result["message"])
+        assert cast(str, result["message"]) == "The available evidence does not establish this."
     assert "retry failed" not in json.dumps(result)
 
 
