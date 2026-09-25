@@ -1,0 +1,56 @@
+# The ONLY actions the Slack command path can perform. This file is the write-side twin of the
+# lookup catalog: a command names an entry here or it does not run, and nothing in a Slack message
+# can add a repository, a workflow or an input key that this file does not spell out.
+#
+# Every entry is a GitHub Actions workflow_dispatch. No entry may point at valkey-io/*: commands
+# operate on repositories the operator personally owns, and widening that is a decision to make in
+# review, not in a message.
+#
+# operators: Slack user IDs allowed to run commands. An entry may narrow further with its own
+# allowed_slack_users; it cannot widen.
+operators:
+  - U08UZUQ790R  # sarthagg
+
+actions:
+  - name: ci
+    description: Run the ci-agent's own CI
+    repo: sarthakaggarwal97/valkey-ci-agent
+    workflow: ci.yml
+    ref: main
+    inputs: {}
+
+  - name: backport-sweep
+    description: Run the backport sweep against a release branch
+    repo: sarthakaggarwal97/valkey-ci-agent
+    workflow: backport-sweep.yml
+    ref: main
+    inputs:
+      branch:
+        required: false
+        # A release branch name and nothing else: 8.1, 9.0, 10.2.
+        pattern: "^[0-9]+\\.[0-9]+$"
+
+  - name: valkey-daily
+    description: Run the Daily test workflow on the valkey fork (valgrind stress runs)
+    repo: sarthakaggarwal97/valkey
+    workflow: daily.yml
+    ref: unstable
+    inputs:
+      test_args:
+        required: false
+        # --single <unit> --loops N and similar. No shell metacharacters: the value is delivered
+        # to workflow_dispatch as data, but the workflow may interpolate it, so it is bounded here.
+        pattern: "^[A-Za-z0-9 ._/=-]{0,200}$"
+      skipjobs:
+        required: false
+        pattern: "^[a-z,-]{0,100}$"
+      skiptests:
+        required: false
+        pattern: "^[A-Za-z0-9 ,._-]{0,200}$"
+
+  - name: fable-smoke
+    description: Run the Fable 5 smoke test on the ci-agent
+    repo: sarthakaggarwal97/valkey-ci-agent
+    workflow: fable-smoke.yml
+    ref: main
+    inputs: {}

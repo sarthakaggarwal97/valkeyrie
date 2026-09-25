@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -71,6 +72,11 @@ FEEDBACK_PATH = Path(os.environ.get("VALKEYRIE_FEEDBACK_PATH", "/tmp/valkeyrie-f
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("valkeyrie-slack")
+
+# The command module lives beside this file; the bot is launched as a script, not a package, so
+# the directory has to be on the path before the import can be spelled plainly.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import actions  # noqa: E402
 
 lambda_client = boto3.client("lambda", region_name="us-east-1")
 
@@ -197,6 +203,32 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
         _answered[key] = True
         while len(_answered) > MAX_ANSWERED_EVENTS:
             _answered.pop(next(iter(_answered)))
+
+    # A command, not a question. Checked AFTER dedup so a redelivered command cannot dispatch
+    # twice, and before any retrieval, because a command needs no evidence. Only a message whose
+    # second word names a catalogued action is a command; "run down the list of eviction
+    # policies" is a question and falls through.
+    command_text = actions.match_command(question)
+    if command_text is not None:
+        try:
+            parsed = actions.parse_command(command_text, str(event.get("user", "")))
+        except actions.CommandError as refusal:
+            say(text=_plain(str(refusal)), thread_ts=thread)
+            return
+        except Exception:
+            log.exception("command handling failed")
+            say(
+                text="That command could not be processed. The failure is logged.", thread_ts=thread
+            )
+            return
+        if isinstance(parsed, str):
+            say(text=_plain(parsed), thread_ts=thread)
+            return
+        _react(client, event, _WORKING)
+        reply = actions.execute(parsed)
+        _unreact(client, event, _WORKING)
+        say(text=reply, thread_ts=thread, unfurl_links=False)
+        return
 
     _react(client, event, _WORKING)
     conversation = _thread_history(event, client)
