@@ -331,6 +331,22 @@ class KnowledgePlaneStack(Stack):
         )
         publisher.add_to_policy(
             iam.PolicyStatement(
+                sid="ReadTheActivePointer",
+                # The refresh READS the active pointer before activating, to supply the exact
+                # expected value the compare-and-swap checks. Reading is harmless and cannot skip
+                # the candidate check; only writing can, and no write is granted here. Without
+                # this statement the first scheduled run after the pointer writes were confined
+                # to the transaction failed at that read (2026-09-27), so this is the split that
+                # was meant: reads plain, writes only inside the checked transaction.
+                actions=["dynamodb:GetItem"],
+                resources=[state_table.attr_arn],
+                conditions={
+                    "ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["active_generation"]}
+                },
+            )
+        )
+        publisher.add_to_policy(
+            iam.PolicyStatement(
                 sid="ActivateOnlyInsideTheCheckedTransaction",
                 # The active pointer may be written ONLY as part of a transaction. DynamoDB
                 # authorizes each item of a TransactWriteItems by its own action, so PutItem has

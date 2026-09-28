@@ -67,7 +67,7 @@ GITHUB_TOKEN_SECRET_ID: Final = "valkeyrie/development/github-read-token"
 KNOWLEDGE_STACK_NAME: Final = "valkeyrie-development-knowledge-plane"
 KNOWLEDGE_BASE_ID: Final = "ONVASJDDNX"
 D01_TEMPLATE_SHA256: Final = (
-    "sha256:99cd1ad6798d333397df8e2d5975c558cc8c0cb9d82b7d7b603650141a325448"
+    "sha256:0b808a6bdae245f2b673626585ff36832283147f132bfc186c72decbd097626d"
 )
 
 

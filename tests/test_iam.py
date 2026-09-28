@@ -241,6 +241,7 @@ def test_publisher_holds_exactly_publication_and_refresh_permission(
         "ReadGenerationObjects",
         "ListGenerationObjects",
         "ConditionalGenerationLifecycle",
+        "ReadTheActivePointer",
         "ActivateOnlyInsideTheCheckedTransaction",
         "IngestExactKnowledgeBase",
         "SmokeTestCandidateRetrieval",
@@ -648,6 +649,16 @@ def test_publisher_refresh_permission_is_scoped_and_cannot_delete(tmp_path: Path
         "ForAllValues:StringLike": {
             "dynamodb:LeadingKeys": ["generation#*", "candidate_generation"]
         }
+    }
+
+    # The pointer may be READ plainly: the refresh reads it to supply the exact value the
+    # compare-and-swap checks. A read cannot skip the candidate check. The scheduled run of
+    # 2026-09-27 failed at this read once the writes were confined to the transaction.
+    read_pointer = statements["ReadTheActivePointer"]
+    assert read_pointer["Action"] == "dynamodb:GetItem"
+    assert read_pointer["Resource"] == {"Fn::GetAtt": ["StateTable", "Arn"]}
+    assert read_pointer["Condition"] == {
+        "ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["active_generation"]}
     }
 
     activation = statements["ActivateOnlyInsideTheCheckedTransaction"]
