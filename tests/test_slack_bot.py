@@ -377,3 +377,35 @@ def test_numbers_hashes_and_run_ids_become_links_into_the_one_repository_the_sou
         slack_bot._linked("see src/commands/#12 or /pull/#13", "valkey")
         == "see src/commands/#12 or /pull/#13"
     )
+
+
+def test_a_claim_enumerating_numbered_items_is_rendered_as_sub_bullets() -> None:
+    """Twenty "#N title" items joined by commas is a paragraph no one can scan; four or more become
+    one line each. Fewer, or prose between them, stay exactly as written."""
+    base = "https://github.com/valkey-io/valkey"
+    text = slack_bot._linked(
+        slack_bot._plain(
+            "Others in the top 20 are #4788 RDMA: post small replies inline, #4796 Fix: Valgrind "
+            "io-threads error, #4795 Deflake the slot-migration failover tests, and #4783 Fix "
+            "HEXPIRE family command summaries."
+        ),
+        "valkey",
+    )
+    rendered = slack_bot._itemized(text)
+    lines = rendered.split("\n")
+    assert lines[0] == "• Others in the top 20 are"
+    assert lines[1] == f"    ◦ <{base}/issues/4788|#4788> RDMA: post small replies inline"
+    assert lines[2].startswith(f"    ◦ <{base}/issues/4796|#4796> Fix: Valgrind")
+    assert lines[4] == f"    ◦ <{base}/issues/4783|#4783> Fix HEXPIRE family command summaries"
+    assert len(lines) == 5
+    # Three references, or commas that are not between references: untouched.
+    short = "Fixed by #4797, #4782 and #4754 this week."
+    assert slack_bot._itemized(short) == f"• {short}"
+    # Prose between references stays attached to the item it follows; nothing is dropped.
+    prose = "#1 first, then we waited, #2 second, #3 third, #4 fourth, and finally it merged."
+    itemized = slack_bot._itemized(prose)
+    assert itemized.split("\n")[1] == "    ◦ #1 first, then we waited"
+    assert itemized.split("\n")[-1] == "    ◦ #4 fourth, and finally it merged"
+    # A semicolon-joined list (the valkey-search answer's shape) also splits.
+    semi = "#1472 Filtering improvements; #1365 Fix ThreadPool; #1397 Bug fix; #1400 Docs."
+    assert slack_bot._itemized(semi).count("    ◦ ") == 4

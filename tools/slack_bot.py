@@ -413,7 +413,7 @@ def _format(result: dict[str, Any]) -> str:
         for claim in claims:
             if not claim.get("text"):
                 continue
-            line = f"• {_linked(_plain(claim['text']), repository)}"
+            line = _itemized(_linked(_plain(claim["text"]), repository))
             if rendered and used + len(line) > budget:
                 left = sum(1 for c in claims[claims.index(claim) :] if c.get("text"))
                 rendered.append(f"• _{left} more claim(s) did not fit in one Slack message._")
@@ -493,6 +493,29 @@ _REFERENCE = re.compile(
     r"|\b(run) (\d{4,12})\b"  # run 13052
     r"|\b([0-9a-f]{40})\b"  # a full commit hash
 )
+
+
+_ITEM_REFERENCE = re.compile(r"(?<![\w/])(?:<[^|>]+\|)?#\d{1,6}\b")
+MIN_ITEMS_TO_LIST = 4
+
+
+def _itemized(text: str) -> str:
+    """A claim that enumerates four or more numbered items becomes a bullet with sub-items.
+
+    "#4797 Forkless Full-Sync, #4782 Make quicklist ..., #4754 ..." twenty times is a paragraph a
+    person cannot scan. The text is cut where each reference starts: what comes before the first
+    is the lead-in and stays the bullet, each reference with the words that follow it is one
+    indented line, with the joining comma, semicolon or "and" trimmed off. Claims with fewer
+    references are left exactly as written.
+    """
+    starts = [m.start() for m in _ITEM_REFERENCE.finditer(text)]
+    if len(starts) < MIN_ITEMS_TO_LIST:
+        return f"• {text}"
+    lead = text[: starts[0]].strip()
+    pieces = [text[a:b] for a, b in zip(starts, [*starts[1:], len(text)], strict=True)]
+    items = [re.sub(r"[\s,;]*(?:\band\b)?[\s,;]*$", "", piece).rstrip(".") for piece in pieces]
+    lines = [f"• {lead}" if lead else "• The items:"] + [f"    ◦ {item}" for item in items]
+    return "\n".join(lines)
 
 
 def _sole_repository(citations: Sequence[str]) -> str | None:
