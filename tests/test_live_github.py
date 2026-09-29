@@ -2344,8 +2344,10 @@ def test_workflow_runs_list_the_latest_on_a_branch_and_say_what_failed() -> None
     observation = read_live_github(
         WorkflowRunsQuery("valkey", "unstable", 5), fetch=fetch, observed_clock=lambda: OBSERVED
     )
+    # One listing read, plus the jobs of the one failed run (Codecov), additive.
     assert calls == [
-        "https://api.github.com/repos/valkey-io/valkey/actions/runs?branch=unstable&per_page=5"
+        "https://api.github.com/repos/valkey-io/valkey/actions/runs?branch=unstable&per_page=5",
+        "https://api.github.com/repos/valkey-io/valkey/actions/runs/3/jobs?per_page=100",
     ]
     assert observation.object_type == "workflow_run"
     payload = _decoded(observation)
@@ -2356,9 +2358,8 @@ def test_workflow_runs_list_the_latest_on_a_branch_and_say_what_failed() -> None
         "CI",
         "Daily",
     ]
-    assert (
-        str(payload["finding"])
-        == "Of the 3 most recent workflow runs on valkey-io/valkey branch unstable (GitHub counts "
+    assert str(payload["finding"]).startswith(
+        "Of the 3 most recent workflow runs on valkey-io/valkey branch unstable (GitHub counts "
         "2500 in total), 1 concluded in failure: Codecov. 1 had not completed at observation time."
     )
 
@@ -2581,3 +2582,54 @@ def test_an_open_pull_request_carries_its_readiness_files_and_check_conclusions(
     )
     assert degraded["files"] is None and degraded["checks"] is None
     assert degraded["mergeable_state"] == "blocked"
+
+
+def test_a_run_listing_explains_its_failed_runs_with_their_failing_jobs() -> None:
+    """The listing said "Daily failed" and the model answered that with no round to spare for the
+    why. The jobs of the first failed runs are read alongside, best effort."""
+    listing = {
+        "total_count": 3,
+        "workflow_runs": [
+            _run_fixture(3, "Daily", "failure"),
+            _run_fixture(2, "CI", "success"),
+            _run_fixture(1, "Codecov", "failure"),
+        ],
+    }
+    jobs = {
+        "total_count": 2,
+        "jobs": [
+            {
+                "name": "test-valgrind-test (unit)",
+                "status": "completed",
+                "conclusion": "failure",
+                "steps": [{"name": "test", "conclusion": "failure"}],
+            },
+            {"name": "build", "status": "completed", "conclusion": "success", "steps": []},
+        ],
+    }
+    calls: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(url)
+        if "/jobs?" in url:
+            if "/runs/1/" in url:
+                raise GitHubReadError("down")
+            return _response(jobs)
+        return _response(listing)
+
+    payload = _decoded(
+        read_live_github(
+            WorkflowRunsQuery("valkey", "unstable", 5), fetch=fetch, observed_clock=lambda: OBSERVED
+        )
+    )
+    assert [u for u in calls if "/jobs?" in u] == [
+        "https://api.github.com/repos/valkey-io/valkey/actions/runs/3/jobs?per_page=100",
+        "https://api.github.com/repos/valkey-io/valkey/actions/runs/1/jobs?per_page=100",
+    ]
+    details = cast(list[dict[str, object]], payload["failure_details"])
+    assert [d["run_id"] for d in details] == [3], "the unreadable run is simply not explained"
+    assert (
+        cast(list[dict[str, object]], details[0]["failed_jobs"])[0]["name"]
+        == "test-valgrind-test (unit)"
+    )
+    assert "1 failed: test-valgrind-test (unit) (failed at step: test)" in str(payload["finding"])

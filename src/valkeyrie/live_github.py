@@ -867,6 +867,8 @@ def read_live_github(
         payload = _with_readiness(
             payload, query.repository, query.number, fetch or fetch_public_github
         )
+    if isinstance(query, WorkflowRunsQuery):
+        payload = _with_failure_details(payload, query.repository, fetch or fetch_public_github)
     if (
         isinstance(query, IssueSearchQuery)
         and query.since is not None
@@ -2709,6 +2711,70 @@ def _workflow_runs(
         "runs": runs,
         "finding": finding,
     }
+
+
+MAX_EXPLAINED_RUNS: Final = 2
+
+
+def _with_failure_details(
+    payload: dict[str, object], repository: str, fetch: GitHubFetcher
+) -> dict[str, object]:
+    """Add, for the first failed runs in a listing, the jobs that failed and at which step.
+
+    "What is failing on unstable" wants the why, and a listing alone made the model answer "the
+    Daily run failed" with no round to spare for the jobs. Two runs at most, best effort: a read
+    that fails leaves the listing's own evidence intact.
+    """
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        return payload
+    details: list[dict[str, object]] = []
+    for run in runs:
+        if len(details) >= MAX_EXPLAINED_RUNS:
+            break
+        if not isinstance(run, Mapping) or run.get("conclusion") not in {
+            "failure",
+            "timed_out",
+            "startup_failure",
+        }:
+            continue
+        run_id = run.get("id")
+        if type(run_id) is not int:
+            continue
+        try:
+            jobs = _response_object(
+                fetch(
+                    f"{_API_ROOT}/repos/{OWNER}/{repository}/actions/runs/{run_id}/jobs"
+                    f"?per_page={MAX_RUN_JOBS}",
+                    REQUEST_TIMEOUT_SECONDS,
+                    MAX_FILE_RESPONSE_BYTES,
+                ),
+                source="REST",
+                maximum_bytes=MAX_FILE_RESPONSE_BYTES,
+            )
+            summary = _run_jobs(jobs, repository, run_id)
+        except (GitHubReadError, LiveGitHubError):
+            continue
+        details.append(
+            {
+                "run_id": run_id,
+                "name": run.get("name"),
+                "failed_jobs": [
+                    j
+                    for j in cast(list[dict[str, object]], summary["jobs"])
+                    if j["failed_steps"] or j["conclusion"] in {"failure", "timed_out"}
+                ][:10],
+                "finding": summary["finding"],
+            }
+        )
+    if details:
+        enriched = dict(payload)
+        enriched["failure_details"] = details
+        enriched["finding"] = (
+            str(payload["finding"]) + " " + " ".join(str(d["finding"]) for d in details)
+        )
+        return enriched
+    return payload
 
 
 def _run_jobs(value: Mapping[str, object], repository: str, run_id: int) -> dict[str, object]:
