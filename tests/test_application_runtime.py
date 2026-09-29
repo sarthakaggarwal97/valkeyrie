@@ -3818,3 +3818,84 @@ def test_a_limitation_triggers_a_targeted_round_that_is_kept_only_if_it_improves
     # Two model calls: the round ran, did not improve, and the loop stopped rather than spending
     # its second round on the same limitation.
     assert len(same.model_calls) == 2
+
+
+def test_an_english_question_answered_in_another_language_is_redrawn_once(
+    manifest: dict[str, object],
+) -> None:
+    """Seen twice in production on one day: an English question with no history answered in
+    Spanish. Grounded or not, that is the wrong answer. The first draw is redrawn like an
+    unparseable one; a Spanish question is still answered in Spanish; a second wrong-language draw
+    is refused rather than sent."""
+    from valkeyrie.application_runtime import _dominant_language, _require_askers_language
+
+    spanish = (
+        "En el momento de la observación, CI en la rama unstable no estaba fallando: de las 10 "
+        "ejecuciones de workflows más recientes, ninguna concluyó en fallo."
+    )
+    english = (
+        "At observation time, CI on unstable was not failing: none of the 10 recent runs failed."
+    )
+    assert (
+        _dominant_language("Why is CI failing on unstable? Are there fixes open for it already?")
+        == "en"
+    )
+    assert _dominant_language(spanish) == "other"
+    assert _dominant_language(english) == "en"
+    assert _dominant_language("HSET key field value") is None, "too few function words to judge"
+    _require_askers_language("Why is CI failing?", [{"text": english}], None)
+    _require_askers_language("¿Por qué falla la CI en la rama unstable?", [{"text": spanish}], None)
+    with pytest.raises(ApplicationRuntimeError, match="another language"):
+        _require_askers_language("Why is CI failing on unstable?", [{"text": spanish}], None)
+
+    class Bilingual(FakeServices):
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            self.model_calls.append(dict(kwargs))
+            evidence = cast(tuple[RuntimeEvidence, ...], kwargs["evidence"])
+            text = spanish if len(self.model_calls) == 1 else english
+            return BedrockTextResponse(
+                _output(
+                    "answer",
+                    [{"claim_id": "c1", "text": text, "evidence_ids": [evidence[0].evidence_id]}],
+                ),
+                "end_turn",
+            )
+
+    services = Bilingual()
+    result = run_runtime_event(
+        _event(request_id="req_lang-1", question="Why is CI failing on unstable?"),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] == "answer"
+    assert cast(list[dict[str, str]], result["claims"])[0]["text"] == english
+    assert len(services.model_calls) == 2
+
+    class Stubborn(Bilingual):
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            self.model_calls.append(dict(kwargs))
+            evidence = cast(tuple[RuntimeEvidence, ...], kwargs["evidence"])
+            return BedrockTextResponse(
+                _output(
+                    "answer",
+                    [
+                        {
+                            "claim_id": "c1",
+                            "text": spanish,
+                            "evidence_ids": [evidence[0].evidence_id],
+                        }
+                    ],
+                ),
+                "end_turn",
+            )
+
+    stubborn = Stubborn()
+    refused = run_runtime_event(
+        _event(request_id="req_lang-2", question="Why is CI failing on unstable?"),
+        stubborn,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert refused["outcome"] == "error" and len(stubborn.model_calls) == 2
+    assert "En el momento" not in json.dumps(refused)

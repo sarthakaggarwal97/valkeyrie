@@ -963,6 +963,7 @@ def _execute_plan(
     try:
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
         outcome, claims, citations, message = _accept_output(normalized.response_text, evidence)
+        _require_askers_language(cast(str, plan["question"]), claims, message)
     except _UnparseableModelOutput as truncated:
         # Nothing has been written at this point, so a second draw costs latency and nothing else.
         # A response cut off mid-claim is the one failure a retry fixes, and it was the only
@@ -982,6 +983,9 @@ def _execute_plan(
             )
             normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
             outcome, claims, citations, message = _accept_output(normalized.response_text, evidence)
+            # A second draw in the wrong language is not redrawn again; it is a wrong answer and
+            # is refused like any other unusable response rather than sent to the asker.
+            _require_askers_language(cast(str, plan["question"]), claims, message)
         except (ApplicationRuntimeError, BedrockResponseError, DraftingError) as rejection:
             return _failed_answer(
                 services,
@@ -1100,6 +1104,51 @@ def _execute_plan(
         revision + 1,
         fence,
     )
+
+
+# Function words that mark a language. A question in plain English answered in Spanish (seen twice
+# in production on the same day, on an English question with no history and no restatement) is
+# a wrong answer however grounded, and the prompt's "answer in the asker's language" did not stop
+# it. The check is deliberately narrow: only an English question answered in another language is
+# redrawn, so an asker who writes in Spanish is still answered in Spanish.
+_ENGLISH_MARKERS: Final = frozenset(
+    "the of and to in is are was were for with that this on at from by an be it as or not".split()
+)
+_OTHER_MARKERS: Final = frozenset(
+    # Spanish, Portuguese, French, German, Italian function words that do not occur in English.
+    "el la los las de del que en un una es son está están para con por como pero sí no "
+    "o os as do da dos das não uma um com para por ser está são "
+    "le les des du et est sont dans pour avec sur une pas que qui "
+    "der die das und ist sind nicht ein eine mit für auf von zu den dem "
+    "il lo gli le di che non con per una sono è".split()
+)
+
+
+def _dominant_language(text: str, *, minimum: int = 3) -> str | None:
+    """'en', 'other', or None when the text carries fewer than ``minimum`` function words."""
+    words = re.findall(r"[a-záéíóúñüçàèìòùâêîôûäöß]+", text.lower())
+    english = sum(1 for w in words if w in _ENGLISH_MARKERS)
+    other = sum(1 for w in words if w in _OTHER_MARKERS and w not in _ENGLISH_MARKERS)
+    if english + other < minimum:
+        return None
+    if english >= 2 * max(other, 1):
+        return "en"
+    if other >= 2 * max(english, 1):
+        return "other"
+    return None
+
+
+def _require_askers_language(
+    question: str, claims: Sequence[Mapping[str, object]], message: str | None
+) -> None:
+    """Refuse (for a redraw) an answer whose language is not the English the asker used."""
+    # A question is short: "Why is CI failing on unstable?" has two function words. One is
+    # enough to call it English when nothing else contradicts it; the ANSWER keeps the strict bar.
+    if _dominant_language(question, minimum=1) != "en":
+        return
+    written = " ".join(str(c.get("text", "")) for c in claims) + " " + (message or "")
+    if _dominant_language(written) == "other":
+        raise _UnparseableModelOutput("model answered an English question in another language")
 
 
 class _UnparseableModelOutput(ApplicationRuntimeError):
