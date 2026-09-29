@@ -422,7 +422,7 @@ def _format(result: dict[str, Any], *, seconds: float | None = None) -> str:
         for claim in claims:
             if not claim.get("text"):
                 continue
-            line = _grouped(_itemized(_linked(_plain(claim["text"]), repository)))
+            line = _grouped(_itemized(_led(_linked(_plain(claim["text"]), repository))))
             if rendered and used + len(line) > budget:
                 left = sum(1 for c in claims[claims.index(claim) :] if c.get("text"))
                 rendered.append(f"• _{left} more claim(s) did not fit in one Slack message._")
@@ -521,6 +521,10 @@ _REFERENCE = re.compile(
     r"(?<![\w/#])#(\d{1,6})\b"  # #4797
     r"|\b(run) (\d{4,12})\b"  # run 13052
     r"|\b([0-9a-f]{40})\b"  # a full commit hash
+    # "issue 4153", "PR 4795", "pull request 4795", with or without a hash: the model writes all
+    # of these, and an unlinked number is a number the reader has to retype.
+    r"|\b((?:issue|PR|pull request|pull-request)) #?(\d{1,6})\b",
+    re.IGNORECASE,
 )
 
 
@@ -537,6 +541,9 @@ def _itemized(text: str) -> str:
     indented line, with the joining comma, semicolon or "and" trimmed off. Claims with fewer
     references are left exactly as written.
     """
+    if not text.startswith("• ") or "\n" in text:
+        return text
+    text = text[2:]
     starts = [m.start() for m in _ITEM_REFERENCE.finditer(text)]
     if len(starts) < MIN_ITEMS_TO_LIST:
         return f"• {text}"
@@ -551,6 +558,33 @@ def _itemized(text: str) -> str:
 # with a short label and a colon, joined by semicolons. A version, a repository or a client name.
 _GROUP_LABEL = re.compile(r"^(?:[A-Za-z][\w.+-]{0,30}|\d+(?:\.\d+){1,2}(?:-rc\d+)?):\s")
 MIN_GROUPS = 2
+
+
+# A sentence end followed by a capital letter or a link: where a long claim can break.
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+(?=[A-Z<])")
+LEAD_MAX_CHARS = 220
+
+
+def _led(text: str) -> str:
+    """A long claim of several sentences: the first sentence is the bullet, the rest is indented.
+
+    A 300-character bullet is a paragraph; the eye finds nothing in it. The first sentence is what
+    the claim asserts, the rest is how it knows, and setting them apart makes both readable while
+    dropping nothing. Short claims and single sentences are left exactly as written.
+    """
+    if len(text) <= LEAD_MAX_CHARS:
+        return f"• {text}"
+    sentences = _SENTENCE_BREAK.split(text, maxsplit=1)
+    if len(sentences) >= 2:
+        return f"• {sentences[0]}\n    {sentences[1]}"
+    # One long sentence: its semicolon-joined clauses are separate points and read as such.
+    clauses = [c.strip() for c in text.split("; ") if c.strip()]
+    if len(clauses) >= 2:
+        first, rest = clauses[0], clauses[1:]
+        return "\n".join(
+            [f"• {first}"] + [f"    {clause[0].upper()}{clause[1:]}" for clause in rest]
+        )
+    return f"• {text}"
 
 
 def _grouped(text: str) -> str:
@@ -603,8 +637,11 @@ def _linked(text: str, repository: str | None) -> str:
             return f"<{base}/issues/{match.group(1)}|#{match.group(1)}>"
         if match.group(2):
             return f"run <{base}/actions/runs/{match.group(3)}|{match.group(3)}>"
-        sha = match.group(4)
-        return f"<{base}/commit/{sha}|{sha[:10]}>"
+        if match.group(4):
+            sha = match.group(4)
+            return f"<{base}/commit/{sha}|{sha[:10]}>"
+        word, number = match.group(5), match.group(6)
+        return f"{word} <{base}/issues/{number}|#{number}>"
 
     return _REFERENCE.sub(link, text)
 

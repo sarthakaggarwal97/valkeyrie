@@ -428,7 +428,7 @@ def test_a_claim_enumerating_numbered_items_is_rendered_as_sub_bullets() -> None
         ),
         "valkey",
     )
-    rendered = slack_bot._itemized(text)
+    rendered = slack_bot._itemized(f"• {text}")
     lines = rendered.split("\n")
     assert lines[0] == "• Others in the top 20 are"
     assert lines[1] == f"    ◦ <{base}/issues/4788|#4788> RDMA: post small replies inline"
@@ -437,15 +437,15 @@ def test_a_claim_enumerating_numbered_items_is_rendered_as_sub_bullets() -> None
     assert len(lines) == 5
     # Three references, or commas that are not between references: untouched.
     short = "Fixed by #4797, #4782 and #4754 this week."
-    assert slack_bot._itemized(short) == f"• {short}"
+    assert slack_bot._itemized(f"• {short}") == f"• {short}"
     # Prose between references stays attached to the item it follows; nothing is dropped.
     prose = "#1 first, then we waited, #2 second, #3 third, #4 fourth, and finally it merged."
-    itemized = slack_bot._itemized(prose)
+    itemized = slack_bot._itemized(f"• {prose}")
     assert itemized.split("\n")[1] == "    ◦ #1 first, then we waited"
     assert itemized.split("\n")[-1] == "    ◦ #4 fourth, and finally it merged"
     # A semicolon-joined list (the valkey-search answer's shape) also splits.
     semi = "#1472 Filtering improvements; #1365 Fix ThreadPool; #1397 Bug fix; #1400 Docs."
-    assert slack_bot._itemized(semi).count("    ◦ ") == 4
+    assert slack_bot._itemized(f"• {semi}").count("    ◦ ") == 4
 
 
 def test_listing_citations_are_labelled_by_what_they_searched_or_listed() -> None:
@@ -466,3 +466,38 @@ def test_listing_citations_are_labelled_by_what_they_searched_or_listed() -> Non
     # The object forms are unchanged.
     assert slack_bot._names(f"{base}/pull/4797") == "#4797"
     assert slack_bot._names(f"{base}/blob/{'a' * 40}/src/ae.c") == "src/ae.c"
+
+
+def test_issue_and_pr_words_before_a_number_are_linked_and_long_claims_get_a_lead_line() -> None:
+    """The model writes "issue 4153" and "PR 4795" as often as "#4153"; all link. A claim of
+    several sentences over the lead length breaks after its first sentence."""
+    base = "https://github.com/valkey-io/valkey"
+    text = slack_bot._linked(
+        slack_bot._plain("Open issue 4153 reports it; PR 4795 and pull request #4444 fix it."),
+        "valkey",
+    )
+    assert text == (
+        f"Open issue <{base}/issues/4153|#4153> reports it; PR <{base}/issues/4795|#4795> and "
+        f"pull request <{base}/issues/4444|#4444> fix it."
+    )
+    long = (
+        "Of the 10 most recent workflow runs on the unstable branch at observation time, one "
+        "failed: the CI workflow run 35744630680, where 1 of 14 jobs failed at the test step. "
+        "Open issue 4153 reports that the test-sanitizer-address job has shown slot-migration "
+        "flakes, part of a broader flaky family across the unstable job matrix."
+    )
+    led = slack_bot._led(long)
+    lines = led.split("\n")
+    assert lines[0].startswith("• Of the 10 most recent") and lines[0].endswith("at the test step.")
+    assert lines[1].startswith("    Open issue 4153 reports")
+    short = "GET returns the value of a key."
+    assert slack_bot._led(short) == f"• {short}"
+    one_sentence = (
+        "There are open fix PRs for CI test failures, including PR 4795, which deflakes the "
+        "slot-migration failover tests (raising cluster-node-timeout to 5000 ms), and PR 4444, "
+        "which addresses flaky crash-log tests; a search for open PRs matching fix test failure "
+        "returned 217 results."
+    )
+    lines = slack_bot._led(one_sentence).split("\n")
+    assert lines[0].startswith("• There are open fix PRs") and lines[0].endswith("crash-log tests")
+    assert lines[1] == "    A search for open PRs matching fix test failure returned 217 results."
