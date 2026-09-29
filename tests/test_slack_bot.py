@@ -446,3 +446,23 @@ def test_a_claim_enumerating_numbered_items_is_rendered_as_sub_bullets() -> None
     # A semicolon-joined list (the valkey-search answer's shape) also splits.
     semi = "#1472 Filtering improvements; #1365 Fix ThreadPool; #1397 Bug fix; #1400 Docs."
     assert slack_bot._itemized(semi).count("    ◦ ") == 4
+
+
+def test_listing_citations_are_labelled_by_what_they_searched_or_listed() -> None:
+    """Two sources both labelled "issue" tell the reader nothing; the query is the identity."""
+    base = "https://github.com/valkey-io/valkey"
+    assert slack_bot._names(f"{base}/pulls?q=is%3Apull-request+is%3Aopen+review%3Arequired") == (
+        "PR search: is:open review:required"
+    )
+    assert slack_bot._names(f"{base}/issues?q=is%3Aissue+fix+test+failure") == (
+        "issue search: fix test failure"
+    )
+    assert slack_bot._names(f"{base}/actions?query=branch%3Aunstable") == "runs branch:unstable"
+    assert slack_bot._names(f"{base}/actions/runs/35744630680") == "run 35744630680"
+    assert slack_bot._names(f"{base}/compare/9.1.0...unstable") == "9.1.0...unstable"
+    assert (
+        slack_bot._names(f"{base}/commits/HEAD/src/replication.c") == "history of src/replication.c"
+    )
+    # The object forms are unchanged.
+    assert slack_bot._names(f"{base}/pull/4797") == "#4797"
+    assert slack_bot._names(f"{base}/blob/{'a' * 40}/src/ae.c") == "src/ae.c"

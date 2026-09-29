@@ -456,7 +456,28 @@ _MORE_HELP = (
 
 def _names(url: str) -> str:
     """What a GitHub URL is ABOUT, for a citation label: a tag, a number, or a file path."""
-    parts = [part for part in url.split("/") if part]
+    from urllib.parse import parse_qs, urlparse
+
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    path = parsed.path
+    # Listings are labelled by their query, since the URL has no object in it: a search by its
+    # terms and qualifiers, a runs page by its branch, a compare by its refs, a history by its path.
+    if path.endswith(("/pulls", "/issues")) and query.get("q"):
+        words = [
+            w for w in query["q"][0].split() if not w.startswith(("is:pull-request", "is:issue"))
+        ]
+        kind = "PR search" if path.endswith("/pulls") else "issue search"
+        return f"{kind}: {' '.join(words)[:60]}" if words else kind
+    if path.endswith("/actions") and query.get("query"):
+        return f"runs {query['query'][0]}"
+    if "/actions/runs/" in path:
+        return f"run {path.rsplit('/', 1)[-1]}"
+    if "/compare/" in path:
+        return path.split("/compare/", 1)[1]
+    if "/commits/HEAD/" in path:
+        return f"history of {path.split('/commits/HEAD/', 1)[1]}"
+    parts = [part for part in path.split("/") if part]
     for marker, render in (
         ("tag", lambda rest: rest[0] if rest else ""),
         ("pull", lambda rest: f"#{rest[0]}" if rest else ""),
