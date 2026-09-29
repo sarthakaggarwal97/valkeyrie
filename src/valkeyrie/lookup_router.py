@@ -37,6 +37,7 @@ from valkeyrie.live_github import (
     WINDOW_PER_PAGE,
     AdvisoryQuery,
     CodeSearchQuery,
+    CompareQuery,
     DirectoryQuery,
     FileQuery,
     IssueQuery,
@@ -46,6 +47,7 @@ from valkeyrie.live_github import (
     PullRequestQuery,
     ReleaseByTagQuery,
     ReleaseListQuery,
+    WorkflowRunsQuery,
 )
 
 # The closed catalog. Adding an entry here is the ONLY way the model gains a capability.
@@ -60,6 +62,8 @@ _KINDS: Final[frozenset[str]] = frozenset(
         "issue",
         "releases",
         "release_notes",
+        "ci_runs",
+        "compare",
         "project_board",
         "search",
     }
@@ -127,6 +131,15 @@ ROUTER_SYSTEM: Final = (
     "what changed since its last candidate and refers to the candidates for the feature list, so "
     "for what a major version added ask for the .0 release AND its -rc1 (and -rc2 when one "
     "exists); for a patch release its own tag is enough.\n"
+    '- {"kind":"ci_runs","repository":"valkey","branch":"unstable"}: the latest workflow runs on a '
+    "branch with their conclusions. Use for what is failing or red on a branch, whether CI is "
+    "green, and which workflows ran most recently. It lists runs; a named run's detail is "
+    "workflow_run.\n"
+    '- {"kind":"compare","repository":"valkey","base":"9.1.0","head":"unstable"}: the commits in '
+    "head that are not in base, with the exact count. Use for what changed since a version or "
+    "tag, what is on a branch that a release does not have, and how far two refs have diverged. "
+    "Refs are tags (9.1.0) or branches (unstable, 9.2); a version question usually wants its tag "
+    "as base and unstable or the next release branch as head.\n"
     '- {"kind":"file","repository":"valkey","path":"valkey.conf","around":["repl-compression"]}: '
     "one file's text at the repository's default branch, or at an exact release tag with "
     '"ref":"9.1.0". Use for a configuration default or its documentation (valkey.conf), a '
@@ -171,6 +184,11 @@ ROUTER_SYSTEM: Final = (
     'empty, so "what merged '
     'this week" is a search with since and no terms, and "what happened in August" is since the '
     "1st until the 31st. Compute the days from today's date, given with the question. "
+    'For pull requests an optional "review" of "required" (no review yet, the review queue), '
+    '"approved", or "changes_requested" selects by review state, and it waives the terms: "which '
+    'pull requests need review" is scope pull-request with review required and state open. An '
+    'optional "order":"oldest" lists the earliest-created first, for which issues or pull requests '
+    "have been open the longest. "
     'An optional "state" of "open" or "closed" and up to three "labels" filter by issue state and '
     'repository label, and both waive the terms: "how many open bugs are there" is state open '
     "with label bug, not the words open and bugs. Valkey labels include bug, enhancement, "
@@ -528,9 +546,28 @@ def _live_lookup(kind: str, item: Mapping[str, object]) -> LiveGitHubQuery | Non
                 "author",
                 "state",
                 "labels",
+                "review",
+                "order",
             },
         )
         return _search(item)
+    if kind == "ci_runs":
+        _only_keys(item, {"kind", "repository", "branch"})
+        branch = item.get("branch", "unstable")
+        if not isinstance(branch, str) or _RELEASE_TAG.fullmatch(branch) is None:
+            raise LookupRouterError("ci runs branch is malformed")
+        return WorkflowRunsQuery(_repository(item), branch)
+    if kind == "compare":
+        _only_keys(item, {"kind", "repository", "base", "head"})
+        refs = []
+        for key in ("base", "head"):
+            ref = item.get(key, "unstable" if key == "head" else None)
+            if not isinstance(ref, str) or _RELEASE_TAG.fullmatch(ref) is None:
+                raise LookupRouterError(f"compare {key} is malformed")
+            refs.append(ref)
+        if refs[0] == refs[1]:
+            raise LookupRouterError("compare refs must differ")
+        return CompareQuery(_repository(item), refs[0], refs[1])
     if kind == "project_board":
         _only_keys(item, {"kind", "number"})
         return ProjectQuery(_number(item))
@@ -622,6 +659,12 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
     state = item.get("state")
     if state is not None and state not in {"open", "closed"}:
         raise LookupRouterError("search state must be open or closed")
+    review = item.get("review")
+    if review is not None and review not in {"required", "approved", "changes_requested"}:
+        raise LookupRouterError("search review must be required, approved or changes_requested")
+    order = item.get("order")
+    if order is not None and order != "oldest":
+        raise LookupRouterError("search order must be oldest")
     labels_value = item.get("labels", [])
     if not isinstance(labels_value, Sequence) or isinstance(labels_value, str):
         raise LookupRouterError("search labels must be an array")
@@ -633,7 +676,7 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
             raise LookupRouterError("search label is malformed")
         if label not in labels:
             labels.append(label)
-    unscoped = since is None and author is None and state is None and not labels
+    unscoped = since is None and author is None and state is None and not labels and review is None
     terms = item.get("terms", [])
     if not isinstance(terms, Sequence) or isinstance(terms, str):
         raise LookupRouterError("search terms must be an array")
@@ -666,6 +709,8 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
     scope = item.get("scope", "pull-request")
     if not isinstance(scope, str) or scope not in {"pull-request", "issue"}:
         raise LookupRouterError("search scope must be pull-request or issue")
+    if review is not None and scope != "pull-request":
+        raise LookupRouterError("search review applies to pull requests only")
     # Same page as the supplement. A search carries whole issue bodies, and the model often
     # chooses two to four searches; at twenty items each they overran the evidence budget so
     # far that only one survived it. Five recent items per search lets them all be evidence.
@@ -674,7 +719,7 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
         repository=repositories[0],
         repositories=tuple(repositories[1:]),
         # A window lists many short items (a period summary); a topic search a few whole ones.
-        per_page=WINDOW_PER_PAGE if (since or author) else SUPPLEMENT_PER_PAGE,
+        per_page=WINDOW_PER_PAGE if (since or author or review or order) else SUPPLEMENT_PER_PAGE,
         kind=scope,
         since=since,
         until=until,
@@ -682,6 +727,8 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
         author=author,
         state=state,
         labels=tuple(labels),
+        review=review,
+        order=order,
     )
 
 

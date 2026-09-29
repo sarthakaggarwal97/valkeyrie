@@ -349,7 +349,8 @@ _LIVE_KINDS: Final[Mapping[str, frozenset[str]]] = {
     "pull_request": frozenset({"pull_request"}),
     "issue": frozenset({"issue", "issue_search", "milestone"}),
     "release": frozenset({"release", "release_list"}),
-    "workflow_run": frozenset({"workflow_run"}),
+    "workflow_run": frozenset({"workflow_run", "workflow_runs"}),
+    "compare": frozenset({"compare"}),
     "check": frozenset({"check_run", "commit_checks", "commit_status"}),
     "controller_status": frozenset({"project"}),
     "file": frozenset({"file"}),
@@ -793,6 +794,9 @@ def _answer(
         "retry_attempted": False,
         # The date the router saw, so the retry's router sees the same one.
         "routed_on": now[:10],
+        # Canonical keys of every lookup a retry round has run, so a later round (or a worker
+        # recovering this request) never reads the same thing again.
+        "retry_queries": [],
         "generation_id": generation_id,
         "knowledge_base_id": plan_knowledge_base_id,
         "application_revision": manifest["application_revision"],
@@ -997,36 +1001,63 @@ def _execute_plan(
             completion_clock=completion_clock,
             completed_at=completed_at,
         )
-    if (
-        outcome == "abstention"
-        and plan.get("evidence_mode") == "static"
-        and plan.get("route") != "exact_lookup"
-    ):
-        # One more attempt before giving up, as a NEW plan revision. An abstention on a static
-        # plan whose evidence did not hold the answer is the residual refusal class; a targeted
-        # lookup from the stated shortfall, with the GitHub supplement forced on, covers it. The
-        # widened evidence is persisted under the same fence before the second model call, so
-        # the durable plan always names every record the answer was grounded in and a redelivery
-        # replays against a plan that contains the cited ids. If the revision write is lost, the
-        # request moved on without us and the abstention is not written either.
-        retried = _retry_with_supplement(
-            services,
-            plan,
-            evidence,
-            request_id=request_id,
-            revision=revision,
-            fence=fence,
-            shortfall=message or "",
-            today=today,
-        )
-        if retried is not None:
+    if plan.get("evidence_mode") == "static" and plan.get("route") != "exact_lookup":
+        # Iterate before giving up, each round a NEW plan revision. The first answer is the
+        # judge of its own evidence: an abstention names what was missing, an answer with a
+        # limitation names what it could not cover. Either is handed to the router, which
+        # chooses the lookup that would supply it; the reads run, the widened package is
+        # persisted under the same fence, and the model answers again over it. Bounded at
+        # MAX_RETRY_ROUNDS so a question the corpus cannot answer costs a known amount, and
+        # every round must ADD evidence the plan did not have or it does not run. A redelivery
+        # replays against a plan that names every cited record. A lost revision write means the
+        # request moved on without us and nothing further is written.
+        recorded = plan.get("retry_attempted")
+        rounds = int(recorded) if isinstance(recorded, (int, bool)) else 0
+        while rounds < MAX_RETRY_ROUNDS:
+            if outcome == "abstention":
+                shortfall, generic, improving = message or "", True, False
+            elif outcome == "answer" and message:
+                # A limitation round is targeted only: the generic issue/PR search almost always
+                # finds SOMETHING new, and that would turn every qualified answer into a second
+                # model call. The round is kept only if it removes the limitation or adds claims.
+                shortfall, generic, improving = message, False, True
+            else:
+                break
+            retried = _retry_with_supplement(
+                services,
+                plan,
+                evidence,
+                request_id=request_id,
+                revision=revision,
+                fence=fence,
+                shortfall=shortfall,
+                today=today,
+                rounds=rounds,
+                generic=generic,
+            )
+            if retried is None:
+                break
             if retried.lost:
                 return RuntimeResult(
                     "partial", request_id, "Request completion could not be confirmed."
                 )
             revision = retried.revision
-            if retried.output is not None:
-                outcome, claims, citations, message = retried.output
+            evidence = retried.evidence
+            plan = retried.plan
+            rounds += 1
+            if retried.output is None:
+                continue
+            new_outcome, new_claims, new_citations, new_message = retried.output
+            if new_outcome == "abstention" and not improving:
+                # Still short, but the reason may have moved on ("now the compare is missing"):
+                # that is what the next round routes on. The outcome stays an abstention.
+                message = new_message
+                continue
+            if new_outcome != "answer":
+                break
+            if improving and not (new_message is None or len(new_claims) > len(claims)):
+                break
+            outcome, claims, citations, message = retried.output
     # Sampled after every model call this request will make, so the terminal record does not
     # predate its own completion.
     terminal_at = _completion_timestamp(completion_clock, completed_at)
@@ -1462,11 +1493,22 @@ def _routed_evidence(
     return evidence, None, None, "live", question
 
 
+# How many times the answer may send the router back for more evidence. Each round is a router
+# call, up to six bounded reads, a plan revision and a model call, so two is the budget that
+# keeps the worst case inside the function timeout with room for the first pass.
+MAX_RETRY_ROUNDS: Final = 2
+
+
 @dataclass(frozen=True)
 class _Retry:
-    """Outcome of the abstention retry. ``lost`` means the plan revision was not ours to write."""
+    """Outcome of one lookup round. ``lost`` means the plan revision was not ours to write.
+
+    ``plan`` and ``evidence`` are the revised state the next round builds on, so a second round
+    widens what the first already widened rather than the original package."""
 
     revision: int
+    plan: Mapping[str, object]
+    evidence: tuple[RuntimeEvidence, ...]
     lost: bool = False
     output: tuple[str, tuple[Mapping[str, object], ...], tuple[str, ...], str | None] | None = None
 
@@ -1481,6 +1523,8 @@ def _retry_with_supplement(
     fence: int,
     shortfall: str,
     today: str,
+    rounds: int = 0,
+    generic: bool = True,
 ) -> _Retry | None:
     """Ask once more with the GitHub supplement forced on. None means keep the abstention as is.
 
@@ -1504,13 +1548,19 @@ def _retry_with_supplement(
     Controls are rechecked immediately before the second inference, as they are before the
     first.
     """
-    if plan.get("retry_attempted") is True:
+    if rounds >= MAX_RETRY_ROUNDS:
         return None
     question = cast(str, plan["question"])
     queries = _shortfall_lookups(services, question, shortfall, today=today)
-    # The targeted lookups first, the generic pair filling what room is left, under the same
-    # bound the router itself has: eight reads for five live slots was measured waste.
-    queries = _merged_queries(queries, _supplement_queries(question, force=True))[:MAX_LOOKUPS]
+    if generic:
+        # The targeted lookups first, the generic pair filling what room is left, under the same
+        # bound the router itself has: eight reads for five live slots was measured waste.
+        queries = _merged_queries(queries, _supplement_queries(question, force=True))
+    already = plan.get("retry_queries")
+    done = set(already) if isinstance(already, list) else set()
+    # A lookup an earlier round already ran is not run again: its result is in the plan (or was
+    # judged not novel), and re-reading it spends GitHub quota to learn what is already known.
+    queries = tuple(q for q in queries if _query_key(q) not in done)[:MAX_LOOKUPS]
     if not queries:
         return None
     try:
@@ -1519,16 +1569,25 @@ def _retry_with_supplement(
         return None
     if not supplement:
         return None
-    known = {item.evidence_id for item in evidence}
-    widened = _bounded_evidence((*evidence, *supplement))
-    if not any(item.evidence_id not in known for item in widened):
+    # Novelty is judged by CONTENT. A live observation's id carries its observation time, so the
+    # same search fetched again a second later has a new id and the same payload; a round that
+    # only re-read what the plan already holds must not run, or every abstention would spend
+    # every round on the generic searches saying the same thing.
+    known = {_evidence_content_key(item) for item in evidence}
+    novel = tuple(item for item in supplement if _evidence_content_key(item) not in known)
+    if not novel:
+        return None
+    widened = _bounded_evidence((*evidence, *novel))
+    if not any(_evidence_content_key(item) not in known for item in widened):
         return None
     revised = dict(plan)
     revised["evidence"] = [_evidence_value(item) for item in widened]
-    # The flag rides the SAME revision as the widened evidence, so a worker that recovers this
-    # request after a crash sees that the retry already happened. Without it, recovery abstained,
-    # refetched observations whose ids differ only by observation time, and retried again.
-    revised["retry_attempted"] = True
+    # The round count rides the SAME revision as the widened evidence, so a worker that recovers
+    # this request after a crash sees how many rounds already ran. Without it, recovery
+    # abstained, refetched observations whose ids differ only by observation time, and retried
+    # again. (Older plans hold a boolean here; True counts as one round.)
+    revised["retry_attempted"] = rounds + 1
+    revised["retry_queries"] = sorted(done | {_query_key(q) for q in queries})
     try:
         written = services.revise_plan(
             request_id=request_id, revision=revision, fence=fence, plan=revised
@@ -1536,12 +1595,12 @@ def _retry_with_supplement(
     except Exception:
         # An indeterminate write: the revision may or may not have landed, so this worker stops
         # rather than answering over a state it cannot describe.
-        return _Retry(revision, lost=True)
+        return _Retry(revision, plan, evidence, lost=True)
     if not written:
-        return _Retry(revision, lost=True)
+        return _Retry(revision, plan, evidence, lost=True)
     next_revision = revision + 1
     if not _controls_enabled(services):
-        return _Retry(next_revision)
+        return _Retry(next_revision, revised, widened)
     try:
         response = services.converse(
             model_id=cast(str, plan["model_id"]),
@@ -1557,10 +1616,17 @@ def _retry_with_supplement(
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
         output = _accept_output(normalized.response_text, widened)
     except Exception:
-        return _Retry(next_revision)
-    if output[0] != "answer":
-        return _Retry(next_revision)
-    return _Retry(next_revision, output=output)
+        return _Retry(next_revision, revised, widened)
+    # Whatever the model said this round comes back: an answer to adopt, or an abstention whose
+    # reason is the NEXT round's shortfall. The loop decides what to keep.
+    return _Retry(next_revision, revised, widened, output=output)
+
+
+def _evidence_content_key(item: RuntimeEvidence) -> str:
+    """What an evidence record SAYS, independent of when it was observed."""
+    if isinstance(item, LiveRuntimeEvidence):
+        return f"live:{item.source_url}:{item.payload_digest}"
+    return f"static:{item.evidence_id}"
 
 
 def _shortfall_lookups(
@@ -1596,18 +1662,23 @@ def _merged_queries(
     seen: set[str] = set()
     merged: list[LiveGitHubQuery] = []
     for query in (*first, *second):
-        fields = {
-            key: [type(value).__name__, sorted(value)] if isinstance(value, tuple) else value
-            for key, value in asdict(query).items()
-        }
-        # Typed queries hold only strings, ints, bools, None and tuples of strings; anything else
-        # is a defect and json.dumps says so rather than a stringified stand-in colliding.
-        key = type(query).__name__ + json.dumps(fields, sort_keys=True)
+        key = _query_key(query)
         if key in seen:
             continue
         seen.add(key)
         merged.append(query)
     return tuple(merged)
+
+
+def _query_key(query: LiveGitHubQuery) -> str:
+    """A query's canonical identity: its type and fields, collections sorted."""
+    fields = {
+        key: [type(value).__name__, sorted(value)] if isinstance(value, tuple) else value
+        for key, value in asdict(query).items()
+    }
+    # Typed queries hold only strings, ints, bools, None and tuples of strings; anything else
+    # is a defect and json.dumps says so rather than a stringified stand-in colliding.
+    return type(query).__name__ + json.dumps(fields, sort_keys=True)
 
 
 def _forced_supplementary_live_evidence(
@@ -2097,6 +2168,7 @@ def _existing_plan(
         "previous_answer",
         "retry_attempted",
         "routed_on",
+        "retry_queries",
         "generation_id",
         "knowledge_base_id",
         "application_revision",

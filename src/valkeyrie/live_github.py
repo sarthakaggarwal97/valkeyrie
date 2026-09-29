@@ -63,6 +63,12 @@ class IssueSearchQuery:
     # finds the items that happen to say those words. Both waive the term minimum.
     state: str | None = None
     labels: tuple[str, ...] = ()
+    # Pull-request review state: "required" (no review yet), "approved", or "changes_requested".
+    # "Which pull requests need review" is a review state, not words, so it waives the terms.
+    review: str | None = None
+    # "oldest": ascending by creation, so "which issues have been open longest" reads from the
+    # right end. Default is GitHub's best match, or newest-first when a window or author is set.
+    order: str | None = None
     # GitHub requires an explicit is:issue or is:pull-request on authenticated
     # search/issues requests and returns 422 without one. Anonymous requests are not yet
     # enforced, which is why this was invisible until the runtime started authenticating.
@@ -179,6 +185,39 @@ class ProjectQuery:
     number: int
 
 
+@dataclass(frozen=True)
+class WorkflowRunsQuery:
+    """The latest workflow runs on a branch, with their conclusions.
+
+    "What is failing on unstable" is a listing question, not one run: it wants the recent runs,
+    their names, whether each completed, and how. One page, bounded; the per-run detail read
+    (WorkflowRunQuery) remains for a run the asker names.
+    """
+
+    repository: str
+    branch: str = "unstable"
+    per_page: int = 10
+
+
+@dataclass(frozen=True)
+class CompareQuery:
+    """The commits between two refs, base...head, as GitHub's compare endpoint reports them.
+
+    "What changed since 9.1.0" and "what is on unstable that is not in 9.2" are this question.
+    The endpoint reports the commit count exactly and lists the commits in bounded pages; the
+    first page is carried, newest last, with the totals so the model knows what it is not seeing.
+    """
+
+    repository: str
+    base: str
+    head: str = "unstable"
+    per_page: int = 25
+
+
+MAX_WORKFLOW_RUNS: Final = 20
+MAX_COMPARE_COMMITS: Final = 50
+
+
 LiveGitHubQuery: TypeAlias = (
     PullRequestQuery
     | IssueQuery
@@ -191,6 +230,8 @@ LiveGitHubQuery: TypeAlias = (
     | CodeSearchQuery
     | AdvisoryQuery
     | WorkflowRunQuery
+    | WorkflowRunsQuery
+    | CompareQuery
     | CheckRunQuery
     | ProjectQuery
 )
@@ -1648,11 +1689,20 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
         labels = tuple(_search_label(label) for label in query.labels[:MAX_SEARCH_LABELS])
         if len(query.labels) > MAX_SEARCH_LABELS:
             raise LiveGitHubError("search names too many labels")
+        review = query.review
+        if review is not None and review not in {"required", "approved", "changes_requested"}:
+            raise LiveGitHubError(
+                "search review state must be required, approved or changes_requested"
+            )
+        if review is not None and query.kind != "pull-request":
+            raise LiveGitHubError("search review state applies to pull requests only")
+        if query.order is not None and query.order != "oldest":
+            raise LiveGitHubError("search order must be oldest or absent")
         if until is not None and since is None:
             raise LiveGitHubError("search window end requires a start")
         if until is not None and since is not None and until < since:
             raise LiveGitHubError("search window end precedes its start")
-        scoped_without_terms = bool(since or author or state or labels)
+        scoped_without_terms = bool(since or author or state or labels or review)
         terms = _search_terms(query.terms, minimum=0 if scoped_without_terms else MIN_SEARCH_TERMS)
         search_repository = _optional_repository(query.repository)
         per_page = _search_per_page(query.per_page)
@@ -1679,6 +1729,10 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
         if state is not None:
             window.append(f"is:{state}")
         window.extend(f'label:"{label}"' for label in labels)
+        if review is not None:
+            # GitHub spells the qualifier review:required / approved / changes_requested.
+            window.append(f"review:{review}")
+            parameters = {"sort": "updated", "order": "desc"}
         if author is not None:
             window.append(f"author:{author}")
             # Authorship alone has nothing to rank by; newest first is what "their work" wants.
@@ -1691,6 +1745,9 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
             by_creation = query.window == "created" or query.kind != "pull-request"
             window.extend([f"created:{span}"] if by_creation else ["is:merged", f"merged:{span}"])
             parameters = {"sort": "updated", "order": "desc"}
+        if query.order == "oldest":
+            # Ascending by creation date: the longest-open items come first.
+            parameters = {"sort": "created", "order": "asc"}
         # Without a window, no sort parameter: GitHub has no value that names best match, it is
         # what you get by not asking for a sort. The payload records the ordering by name.
         search_query = " ".join((*qualifiers, f"is:{query.kind}", *window, *terms))
@@ -1718,6 +1775,8 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
                 labels=labels,
                 search_query=search_query,
                 window=query.window,
+                review=review,
+                order=query.order,
             ),
         )
     if isinstance(query, LatestReleaseQuery):
@@ -1809,6 +1868,46 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
             raise LiveGitHubError("release tag is malformed")
         url = f"{_API_ROOT}/repos/{OWNER}/{repository}/releases/tags/{quote(tag, safe='')}"
         return url, "release", lambda value: _release_by_tag(value, repository, tag)
+    if isinstance(query, WorkflowRunsQuery):
+        repository = _repository(query.repository)
+        branch = _tag(query.branch)
+        if "/" in branch or ".." in branch:
+            raise LiveGitHubError("workflow runs branch is malformed")
+        per_page = query.per_page
+        if type(per_page) is not int or not 1 <= per_page <= MAX_WORKFLOW_RUNS:
+            raise LiveGitHubError("workflow runs page size is outside its bound")
+        encoded = urlencode({"branch": branch, "per_page": str(per_page)})
+        url = f"{_API_ROOT}/repos/{OWNER}/{repository}/actions/runs?{encoded}"
+        return (
+            url,
+            "workflow_run",
+            lambda value: _workflow_runs(value, repository, branch, per_page),
+        )
+    if isinstance(query, CompareQuery):
+        repository = _repository(query.repository)
+        base = _tag(query.base)
+        head = _tag(query.head)
+        for ref in (base, head):
+            if "/" in ref or ".." in ref:
+                raise LiveGitHubError("compare ref is malformed")
+        if base == head:
+            raise LiveGitHubError("compare refs must differ")
+        per_page = query.per_page
+        if type(per_page) is not int or not 1 <= per_page <= MAX_COMPARE_COMMITS:
+            raise LiveGitHubError("compare page size is outside its bound")
+        url = (
+            f"{_API_ROOT}/repos/{OWNER}/{repository}/compare/"
+            f"{quote(base, safe='')}...{quote(head, safe='')}?per_page={per_page}"
+        )
+        return (
+            url,
+            "compare",
+            lambda value: _compare(value, repository, base, head, per_page),
+            # The endpoint always carries the diff of up to 300 files with patches, which per_page
+            # does not bound: 9.1.0...unstable measured 1.1 MB. Only the commits and counts are
+            # read from it; the same bound the whole repository tree uses covers the response.
+            MAX_TREE_RESPONSE_BYTES,
+        )
     if isinstance(query, ReleaseListQuery):
         repository = _repository(query.repository)
         per_page = query.per_page
@@ -1972,6 +2071,8 @@ def _issue_search(
     labels: tuple[str, ...] = (),
     search_query: str | None = None,
     window: str | None = None,
+    review: str | None = None,
+    order: str | None = None,
 ) -> dict[str, object]:
     incomplete = _boolean(value, "incomplete_results")
     items = _list(value, "items")
@@ -1989,7 +2090,7 @@ def _issue_search(
         _search_item(
             _object(item, "search item"),
             repositories,
-            compact=since is not None or author is not None,
+            compact=since is not None or author is not None or review is not None,
         )
         for item in items
     ]
@@ -2003,7 +2104,14 @@ def _issue_search(
         "repository": repositories[0] if repositories and len(repositories) == 1 else None,
         "repositories": list(repositories) if repositories else None,
         "terms": list(terms),
-        "sort": "updated" if (since or author) else SEARCH_SORT,
+        "sort": (
+            "oldest_first"
+            if order == "oldest"
+            else "updated"
+            if (since or author or review)
+            else SEARCH_SORT
+        ),
+        "review": review,
         "since": since,
         "until": until,
         "author": author,
@@ -2032,6 +2140,8 @@ def _issue_search(
             state,
             labels,
             window,
+            review,
+            order,
         ),
     }
 
@@ -2057,6 +2167,8 @@ def _search_finding(
     state: str | None = None,
     labels: tuple[str, ...] = (),
     window: str | None = None,
+    review: str | None = None,
+    order: str | None = None,
 ) -> str:
     span = f"from {since} through {until}" if until else f"on or after {since}"
     if since is None:
@@ -2073,6 +2185,13 @@ def _search_finding(
         what = f"{what} labelled " + " and ".join(f'"{label}"' for label in labels)
     if author is not None:
         what = f"{what} authored by {author}"
+    if review is not None:
+        described = {
+            "required": "awaiting review (no review yet)",
+            "approved": "with an approving review",
+            "changes_requested": "with changes requested",
+        }[review]
+        what = f"{what} {described}"
     where = (
         " or ".join(f"{OWNER}/{r}" for r in repositories)
         if repositories
@@ -2086,8 +2205,14 @@ def _search_finding(
         )
     # The listing order is what the request asked for: a date window orders by recency, and a
     # topic search takes GitHub's best match. The finding must not describe one as the other.
-    order = "most recently updated" if (since or author) else "best matching"
-    listed = f" The {shown} {order} are listed." if shown < total_count else ""
+    ordering = (
+        "oldest (earliest created)"
+        if order == "oldest"
+        else "most recently updated"
+        if (since or author or review)
+        else "best matching"
+    )
+    listed = f" The {shown} {ordering} are listed." if shown < total_count else ""
     return f"The search found {total_count} {what} in {where}{matching}.{listed}"
 
 
@@ -2300,6 +2425,95 @@ def _workflow_run(value: Mapping[str, object], repository: str, run_id: int) -> 
         "updated_at": _timestamp(value, "updated_at"),
         "api_url": _exact_url(value, "url", api_url),
         "url": _exact_url(value, "html_url", web_url),
+    }
+
+
+def _workflow_runs(
+    value: Mapping[str, object], repository: str, branch: str, per_page: int
+) -> dict[str, object]:
+    total = _integer(value, "total_count")
+    items = _list(value, "workflow_runs")
+    if len(items) > per_page:
+        raise LiveGitHubError("GitHub workflow runs exceed the requested page bound")
+    runs = []
+    for item in items:
+        run = _object(item, "workflow run")
+        run_id = _positive_integer(run, "id")
+        normalized = _workflow_run(run, repository, run_id)
+        if normalized["head_branch"] != branch:
+            raise LiveGitHubError("GitHub workflow run branch conflicts with the query")
+        runs.append(normalized)
+    if len({r["id"] for r in runs}) != len(runs):
+        raise LiveGitHubError("GitHub workflow runs contain duplicate items")
+    failing = [r for r in runs if r["conclusion"] in {"failure", "timed_out", "startup_failure"}]
+    unfinished = [r for r in runs if r["status"] != "completed"]
+    names = ", ".join(dict.fromkeys(str(r["name"]) for r in failing)) or "none"
+    finding = (
+        f"Of the {len(runs)} most recent workflow runs on {OWNER}/{repository} branch {branch} "
+        f"(GitHub counts {total} in total), {len(failing)} concluded in failure: {names}. "
+        f"{len(unfinished)} had not completed at observation time."
+    )
+    return {
+        "api_version": _API_VERSION,
+        "kind": "workflow_runs",
+        "repository": repository,
+        "branch": branch,
+        "per_page": per_page,
+        "total_count": total,
+        "runs": runs,
+        "finding": finding,
+    }
+
+
+def _compare(
+    value: Mapping[str, object], repository: str, base: str, head: str, per_page: int
+) -> dict[str, object]:
+    status = _choice(value, "status", {"ahead", "behind", "identical", "diverged"})
+    ahead = _integer(value, "ahead_by")
+    behind = _integer(value, "behind_by")
+    total = _integer(value, "total_commits")
+    items = _list(value, "commits")
+    if len(items) > per_page:
+        raise LiveGitHubError("GitHub compare commits exceed the requested page bound")
+    commits = []
+    for item in items:
+        entry = _object(item, "compare commit")
+        inner = _object(entry.get("commit"), "compare commit body")
+        message = _text(inner, "message", 65536)
+        commits.append(
+            {
+                "sha": _sha(entry, "sha"),
+                # The subject line only: a compare of hundreds of commits is read for what
+                # changed, and bodies would exhaust the evidence budget on the first page.
+                "subject": message.splitlines()[0][:200] if message else "",
+                "date": _timestamp(_object(inner.get("committer"), "committer"), "date"),
+            }
+        )
+    if len({c["sha"] for c in commits}) != len(commits):
+        raise LiveGitHubError("GitHub compare contains duplicate commits")
+    listed = (
+        f" The {len(commits)} oldest of them are listed, so the newest are not shown."
+        if len(commits) < total
+        else ""
+    )
+    finding = (
+        f"{OWNER}/{repository}: {head} is {ahead} commits ahead of {base} and {behind} behind "
+        f"({status}); {total} commits are in {head} and not in {base}.{listed}"
+    )
+    return {
+        "api_version": _API_VERSION,
+        "kind": "compare",
+        "repository": repository,
+        "base": base,
+        "head": head,
+        "status": status,
+        "ahead_by": ahead,
+        "behind_by": behind,
+        "total_commits": total,
+        "per_page": per_page,
+        "commits": commits,
+        "url": f"{_WEB_ROOT}/{OWNER}/{repository}/compare/{base}...{head}",
+        "finding": finding,
     }
 
 

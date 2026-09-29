@@ -575,3 +575,43 @@ def test_the_parser_refuses_a_repository_outside_the_reviewed_inventory() -> Non
         )
     accepted = parse_lookup_plan('{"lookups":[{"kind":"issue","repository":"valkey","number":1}]}')
     assert len(accepted.live) == 1
+
+
+def test_the_router_may_ask_for_the_review_queue_ci_runs_oldest_items_and_a_compare() -> None:
+    """The four questions a maintainer asks weekly that had no lookup: which pull requests need
+    review, what is failing on a branch, which issues have been open longest, what changed since
+    a tag. Each is one bounded typed query, validated at the parser."""
+    from valkeyrie.live_github import CompareQuery, IssueSearchQuery, WorkflowRunsQuery
+    from valkeyrie.lookup_router import LookupRouterError, parse_lookup_plan
+
+    plan = parse_lookup_plan(
+        '{"lookups":['
+        '{"kind":"search","scope":"pull-request","state":"open","review":"required"},'
+        '{"kind":"search","scope":"issue","state":"open","order":"oldest"},'
+        '{"kind":"ci_runs","repository":"valkey","branch":"unstable"},'
+        '{"kind":"compare","repository":"valkey","base":"9.1.0"}]}'
+    )
+    review, oldest, runs, compare = plan.live
+    assert isinstance(review, IssueSearchQuery) and review.review == "required"
+    assert review.terms == () and review.kind == "pull-request" and review.state == "open"
+    assert isinstance(oldest, IssueSearchQuery) and oldest.order == "oldest"
+    assert runs == WorkflowRunsQuery("valkey", "unstable")
+    assert compare == CompareQuery("valkey", "9.1.0", "unstable")
+
+    for bad, reason in (
+        ('{"kind":"search","scope":"issue","review":"required"}', "pull requests only"),
+        ('{"kind":"search","scope":"pull-request","review":"pending"}', "review must be"),
+        (
+            '{"kind":"search","scope":"issue","state":"open","order":"newest"}',
+            "order must be oldest",
+        ),
+        ('{"kind":"ci_runs","repository":"valkey","branch":"../x"}', "branch is malformed"),
+        (
+            '{"kind":"compare","repository":"valkey","base":"unstable","head":"unstable"}',
+            "must differ",
+        ),
+        ('{"kind":"compare","repository":"valkey"}', "compare base is malformed"),
+        ('{"kind":"ci_runs","repository":"valkey","branch":"unstable","extra":1}', "unsupported"),
+    ):
+        with pytest.raises(LookupRouterError, match=reason):
+            parse_lookup_plan('{"lookups":[' + bad + "]}")

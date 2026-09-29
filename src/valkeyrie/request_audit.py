@@ -68,6 +68,9 @@ _OBSERVATION_TYPES: Final = frozenset(
         # source. Same contract as the rest: a bounded read of exact objects, provenance in the
         # payload, and a flag saying whether the listing is complete.
         "directory",
+        # The commits between two refs, from GitHub's compare endpoint. A bounded read with the
+        # exact count and its provenance in the payload, like the rest.
+        "compare",
         "tree",
         "code_search",
     }

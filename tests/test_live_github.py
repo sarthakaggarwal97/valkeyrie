@@ -24,6 +24,7 @@ from valkeyrie.live_github import (  # noqa: PLC2701
     PROJECTS_GRAPHQL_QUERY,
     REQUEST_TIMEOUT_SECONDS,
     CheckRunQuery,
+    CompareQuery,
     IssueQuery,
     IssueSearchQuery,
     LatestReleaseQuery,
@@ -33,6 +34,7 @@ from valkeyrie.live_github import (  # noqa: PLC2701
     PullRequestQuery,
     ReleaseListQuery,
     WorkflowRunQuery,
+    WorkflowRunsQuery,
     _code_search,
     _code_term,
     _directory,
@@ -394,6 +396,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
         "author": None,
         "authors_of_listed": {"madolson": 2},
         "labels": [],
+        "review": None,
         "finding": (
             'The search found 2 issues in valkey-io/valkey matching "release" and "status".'
         ),
@@ -2217,3 +2220,203 @@ def test_a_transient_github_failure_is_retried_and_a_real_answer_is_not() -> Non
     with pytest.raises(LiveGitHubError):
         _fetch_with_retry(broken, "https://api.github.com/x", 1024, sleep=slept.append)
     assert len(calls) == 3
+
+
+def test_review_state_and_oldest_order_are_search_qualifiers_that_waive_the_terms() -> None:
+    """ "Which pull requests need review" is a review state, and "which issues have been open the
+    longest" is an ordering; neither is words to match. Both are sent as GitHub's own qualifiers
+    and the finding names what was listed and in which order."""
+    calls: list[str] = []
+
+    value = _issue_search(_search_item("valkey", 4797, pull_request=True))
+    value["total_count"] = 302
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(url)
+        return _response(value)
+
+    review = read_live_github(
+        IssueSearchQuery(terms=(), repository="valkey", kind="pull-request", review="required"),
+        fetch=fetch,
+        observed_clock=lambda: OBSERVED,
+    )
+    assert "review%3Arequired" in calls[0] and "is%3Apull-request" in calls[0]
+    assert "sort=updated&order=desc" in calls[0]
+    payload = _decoded(review)
+    assert payload["review"] == "required"
+    assert "awaiting review (no review yet)" in str(payload["finding"])
+    assert "most recently updated are listed" in str(payload["finding"])
+
+    oldest = read_live_github(
+        IssueSearchQuery(terms=(), repository="valkey", kind="issue", state="open", order="oldest"),
+        fetch=fetch,
+        observed_clock=lambda: OBSERVED,
+    )
+    assert "sort=created&order=asc" in calls[1]
+    payload = _decoded(oldest)
+    assert payload["sort"] == "oldest_first"
+    assert "oldest (earliest created) are listed" in str(payload["finding"])
+
+    # Review state on an issue search is a contradiction, and any other spelling is refused.
+    with pytest.raises(LiveGitHubError, match="pull requests only"):
+        read_live_github(
+            IssueSearchQuery(terms=(), repository="valkey", kind="issue", review="required"),
+            fetch=fetch,
+            observed_clock=lambda: OBSERVED,
+        )
+    with pytest.raises(LiveGitHubError, match="review state must be"):
+        read_live_github(
+            IssueSearchQuery(terms=(), repository="valkey", kind="pull-request", review="pending"),
+            fetch=fetch,
+            observed_clock=lambda: OBSERVED,
+        )
+    with pytest.raises(LiveGitHubError, match="order must be oldest"):
+        read_live_github(
+            IssueSearchQuery(terms=("a", "b"), repository="valkey", order="newest"),
+            fetch=fetch,
+            observed_clock=lambda: OBSERVED,
+        )
+
+
+def _run_fixture(
+    run_id: int, name: str, conclusion: str | None, status: str = "completed"
+) -> dict[str, object]:
+    return {
+        "id": run_id,
+        "workflow_id": 7,
+        "name": name,
+        "display_title": name,
+        "event": "push",
+        "status": status,
+        "conclusion": conclusion,
+        "run_number": run_id,
+        "run_attempt": 1,
+        "head_branch": "unstable",
+        "head_sha": "a" * 40,
+        "created_at": "2026-09-28T13:00:00Z",
+        "updated_at": "2026-09-28T13:30:00Z",
+        "url": f"https://api.github.com/repos/valkey-io/valkey/actions/runs/{run_id}",
+        "html_url": f"https://github.com/valkey-io/valkey/actions/runs/{run_id}",
+    }
+
+
+def test_workflow_runs_list_the_latest_on_a_branch_and_say_what_failed() -> None:
+    calls: list[str] = []
+    value = {
+        "total_count": 2500,
+        "workflow_runs": [
+            _run_fixture(3, "Codecov", "failure"),
+            _run_fixture(2, "CI", "success"),
+            _run_fixture(1, "Daily", None, status="in_progress"),
+        ],
+    }
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(url)
+        return _response(value)
+
+    observation = read_live_github(
+        WorkflowRunsQuery("valkey", "unstable", 5), fetch=fetch, observed_clock=lambda: OBSERVED
+    )
+    assert calls == [
+        "https://api.github.com/repos/valkey-io/valkey/actions/runs?branch=unstable&per_page=5"
+    ]
+    assert observation.object_type == "workflow_run"
+    payload = _decoded(observation)
+    assert payload["kind"] == "workflow_runs" and payload["total_count"] == 2500
+    assert [r["name"] for r in cast(list[dict[str, object]], payload["runs"])] == [
+        "Codecov",
+        "CI",
+        "Daily",
+    ]
+    assert (
+        str(payload["finding"])
+        == "Of the 3 most recent workflow runs on valkey-io/valkey branch unstable (GitHub counts "
+        "2500 in total), 1 concluded in failure: Codecov. 1 had not completed at observation time."
+    )
+
+    # A run from another branch, more runs than asked for, or a duplicate id fails closed.
+    other = dict(_run_fixture(9, "CI", "success"))
+    other["head_branch"] = "9.2"
+    with pytest.raises(LiveGitHubError, match="branch conflicts"):
+        read_live_github(
+            WorkflowRunsQuery("valkey", "unstable", 5),
+            fetch=lambda *a: _response({"total_count": 1, "workflow_runs": [other]}),
+            observed_clock=lambda: OBSERVED,
+        )
+    with pytest.raises(LiveGitHubError, match="exceed the requested page bound"):
+        read_live_github(
+            WorkflowRunsQuery("valkey", "unstable", 1),
+            fetch=lambda *a: _response(value),
+            observed_clock=lambda: OBSERVED,
+        )
+    for bad in (WorkflowRunsQuery("valkey", "../x"), WorkflowRunsQuery("valkey", "unstable", 0)):
+        with pytest.raises(LiveGitHubError):
+            read_live_github(bad, fetch=fetch, observed_clock=lambda: OBSERVED)
+
+
+def test_compare_lists_the_commits_between_two_refs_with_the_exact_count() -> None:
+    calls: list[str] = []
+    value = {
+        "status": "diverged",
+        "ahead_by": 451,
+        "behind_by": 122,
+        "total_commits": 451,
+        "commits": [
+            {
+                "sha": "c" * 40,
+                "commit": {
+                    "message": "Fix incorrect memory overhead calculation (#3372)\n\nlong body",
+                    "committer": {"date": "2026-06-01T10:00:00Z"},
+                },
+            },
+            {
+                "sha": "d" * 40,
+                "commit": {
+                    "message": "Make macOS leaks check skippable (#3370)",
+                    "committer": {"date": "2026-06-02T10:00:00Z"},
+                },
+            },
+        ],
+    }
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(url)
+        return _response(value)
+
+    observation = read_live_github(
+        CompareQuery("valkey", "9.1.0", "unstable", 25),
+        fetch=fetch,
+        observed_clock=lambda: OBSERVED,
+    )
+    assert calls == [
+        "https://api.github.com/repos/valkey-io/valkey/compare/9.1.0...unstable?per_page=25"
+    ]
+    assert observation.object_type == "compare"
+    payload = _decoded(observation)
+    commits = cast(list[dict[str, object]], payload["commits"])
+    assert [c["subject"] for c in commits] == [
+        "Fix incorrect memory overhead calculation (#3372)",
+        "Make macOS leaks check skippable (#3370)",
+    ]
+    assert payload["url"] == "https://github.com/valkey-io/valkey/compare/9.1.0...unstable"
+    assert str(payload["finding"]) == (
+        "valkey-io/valkey: unstable is 451 commits ahead of 9.1.0 and 122 behind (diverged); "
+        "451 commits are in unstable and not in 9.1.0. The 2 oldest of them are listed, so the "
+        "newest are not shown."
+    )
+    for bad in (
+        CompareQuery("valkey", "9.1.0", "9.1.0"),
+        CompareQuery("valkey", "../x", "unstable"),
+        CompareQuery("valkey", "9.1.0", "unstable", 0),
+    ):
+        with pytest.raises(LiveGitHubError):
+            read_live_github(bad, fetch=fetch, observed_clock=lambda: OBSERVED)
+    dup = dict(value)
+    dup["commits"] = [value["commits"][0], value["commits"][0]]  # type: ignore[index]
+    with pytest.raises(LiveGitHubError, match="duplicate commits"):
+        read_live_github(
+            CompareQuery("valkey", "9.1.0", "unstable"),
+            fetch=lambda *a: _response(dup),
+            observed_clock=lambda: OBSERVED,
+        )

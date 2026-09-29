@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -2862,7 +2862,7 @@ def test_the_retry_happens_once_per_request_even_across_recovery(
     )
     assert first["outcome"] == "partial", "completion was blocked, as a crash would"
     plan = cast(Mapping[str, object], services.requests["req_once"]["plan"])
-    assert plan["retry_attempted"] is True
+    assert plan["retry_attempted"] == 1
     assert len(services.model_calls) == 2
 
     services.complete = True
@@ -3480,7 +3480,7 @@ def test_an_abstention_names_its_shortfall_and_the_router_supplies_the_missing_l
     assert any(isinstance(q, FileQuery) for q in services.live_calls)
     # The plan revision holds the cited file record, and the retry flag rides with it.
     plan = cast(dict[str, object], services.requests["req_shortfall-1"]["plan"])
-    assert plan["retry_attempted"] is True
+    assert plan["retry_attempted"] == 1
     cited = {c["evidence_ids"][0] for c in cast(list[dict[str, list[str]]], result["claims"])}
     persisted = {
         cast(dict[str, str], cast(dict[str, object], e)["metadata"])["evidence_id"]
@@ -3638,3 +3638,183 @@ def test_a_response_of_two_objects_around_prose_reads_the_first_and_refuses_the_
     started = time.monotonic()
     _primary_object("{" * 262_144)
     assert time.monotonic() - started < 1.0
+
+
+def _output(
+    outcome: str, claims: Sequence[Mapping[str, object]] | None = None, **extra: object
+) -> str:
+    value: dict[str, object] = {
+        "api_version": "valkeyrie.io/model-output/1",
+        "kind": "ModelOutput",
+        "outcome": outcome,
+        **extra,
+    }
+    if outcome == "answer":
+        value["claims"] = list(claims or [])
+    return json.dumps(value, separators=(",", ":"))
+
+
+def test_the_answer_iterates_two_rounds_of_lookups_and_each_round_adds_new_evidence(
+    manifest: dict[str, object],
+) -> None:
+    """Round one: the abstention names a missing file; the router supplies a file read; the model
+    still abstains, now naming a missing compare. Round two: the router supplies the compare; the
+    model answers. Two rounds, two plan revisions, no round beyond MAX_RETRY_ROUNDS, and the
+    generic searches are run once and never re-read."""
+    from valkeyrie.application_runtime import MAX_RETRY_ROUNDS
+    from valkeyrie.live_github import CompareQuery, FileQuery
+
+    class Rounds(FakeServices):
+        def route(self, *, system: str, question: str) -> str:
+            if not hasattr(self, "route_calls"):
+                self.route_calls: list[str] = []
+            self.route_calls.append(question)
+            if "shortfall" not in question:
+                return '{"lookups":[{"kind":"corpus_search"}]}'
+            if "valkey.conf" in question:
+                return '{"lookups":[{"kind":"file","repository":"valkey","path":"valkey.conf"}]}'
+            return '{"lookups":[{"kind":"compare","repository":"valkey","base":"9.1.0"}]}'
+
+        def read_live(self, query: object) -> LiveObservation:
+            self.live_calls.append(query)
+            if isinstance(query, FileQuery):
+                return _live_observation(
+                    kind="file",
+                    object_type="file",
+                    source_url="https://api.github.com/repos/valkey-io/valkey/contents/valkey.conf",
+                    url="https://github.com/valkey-io/valkey/blob/unstable/valkey.conf",
+                )
+            if isinstance(query, CompareQuery):
+                return _live_observation(
+                    kind="compare",
+                    object_type="compare",
+                    source_url="https://api.github.com/repos/valkey-io/valkey/compare/9.1.0...unstable",
+                    url="https://github.com/valkey-io/valkey/compare/9.1.0...unstable",
+                )
+            return _live_observation(
+                kind="issue_search",
+                object_type="issue",
+                source_url="https://api.github.com/search/issues?q=x",
+                url=None,
+            )
+
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            self.model_calls.append(dict(kwargs))
+            evidence = cast(tuple[RuntimeEvidence, ...], kwargs["evidence"])
+            kinds = {e.object_type for e in evidence if isinstance(e, LiveRuntimeEvidence)}
+            if "compare" in kinds:
+                target = next(e for e in evidence if getattr(e, "object_type", "") == "compare")
+                text = _output(
+                    "answer",
+                    [
+                        {
+                            "claim_id": "c1",
+                            "text": "451 commits since 9.1.0.",
+                            "evidence_ids": [target.evidence_id],
+                        }
+                    ],
+                )
+            elif "file" in kinds:
+                text = _output("abstention", reason="The evidence lacks a compare against 9.1.0.")
+            else:
+                text = _output("abstention", reason="The evidence does not include valkey.conf.")
+            return BedrockTextResponse(text, "end_turn")
+
+    services = Rounds()
+    services.router_reply = "unused"
+    result = run_runtime_event(
+        _event(request_id="req_rounds-1", question="what changed in the config since 9.1.0?"),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] == "answer", result
+    assert len(services.model_calls) == 1 + MAX_RETRY_ROUNDS == 3
+    assert [type(q).__name__ for q in services.live_calls].count("FileQuery") == 1
+    assert [type(q).__name__ for q in services.live_calls].count("CompareQuery") == 1
+    # The generic issue and pull-request searches ran in round one only.
+    assert [type(q).__name__ for q in services.live_calls].count("IssueSearchQuery") == 2
+    plan = cast(dict[str, object], services.requests["req_rounds-1"]["plan"])
+    assert plan["retry_attempted"] == 2
+    assert len(cast(list[object], plan["retry_queries"])) == 4
+    assert cast(int, services.requests["req_rounds-1"]["revision"]) >= 3
+
+
+def test_a_limitation_triggers_a_targeted_round_that_is_kept_only_if_it_improves(
+    manifest: dict[str, object],
+) -> None:
+    """An answer that names what it could not cover gets ONE targeted round (no generic searches,
+    which would fire on every qualified answer). The round replaces the answer only when it
+    removes the limitation or adds claims; otherwise the first answer stands."""
+    from valkeyrie.live_github import FileQuery
+
+    class Limited(FakeServices):
+        def __init__(self, improves: bool) -> None:
+            super().__init__()
+            self.improves = improves
+
+        def route(self, *, system: str, question: str) -> str:
+            if "shortfall" in question:
+                return '{"lookups":[{"kind":"file","repository":"valkey","path":"sentinel.conf"}]}'
+            return '{"lookups":[{"kind":"corpus_search"}]}'
+
+        def read_live(self, query: object) -> LiveObservation:
+            self.live_calls.append(query)
+            assert isinstance(query, FileQuery), "a limitation round runs no generic search"
+            return _live_observation(
+                kind="file",
+                object_type="file",
+                source_url="https://api.github.com/repos/valkey-io/valkey/contents/sentinel.conf",
+                url="https://github.com/valkey-io/valkey/blob/unstable/sentinel.conf",
+            )
+
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            self.model_calls.append(dict(kwargs))
+            evidence = cast(tuple[RuntimeEvidence, ...], kwargs["evidence"])
+            static = next(e for e in evidence if isinstance(e, StaticRuntimeEvidence))
+            live = [e for e in evidence if isinstance(e, LiveRuntimeEvidence)]
+            first = {
+                "claim_id": "c1",
+                "text": "down-after-milliseconds is the SDOWN delay.",
+                "evidence_ids": [static.evidence_id],
+            }
+            if not live:
+                text = _output(
+                    "answer", [first], limitation="The evidence does not include sentinel.conf."
+                )
+            elif self.improves:
+                second = {
+                    "claim_id": "c2",
+                    "text": "Its default is 30000.",
+                    "evidence_ids": [live[0].evidence_id],
+                }
+                text = _output("answer", [first, second])
+            else:
+                text = _output("answer", [first], limitation="Still no default found.")
+            return BedrockTextResponse(text, "end_turn")
+
+    better = Limited(improves=True)
+    better.router_reply = "unused"
+    result = run_runtime_event(
+        _event(request_id="req_limit-1", question="what does down-after-milliseconds do?"),
+        better,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] == "answer" and len(cast(list[object], result["claims"])) == 2
+    assert result["message"] is None, "the limitation was resolved"
+    assert len(better.model_calls) == 2 and len(better.live_calls) == 1
+
+    same = Limited(improves=False)
+    same.router_reply = "unused"
+    kept = run_runtime_event(
+        _event(request_id="req_limit-2", question="what does down-after-milliseconds do?"),
+        same,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert kept["outcome"] == "answer" and len(cast(list[object], kept["claims"])) == 1
+    assert kept["message"] == "The evidence does not include sentinel.conf."
+    # Two model calls: the round ran, did not improve, and the loop stopped rather than spending
+    # its second round on the same limitation.
+    assert len(same.model_calls) == 2
