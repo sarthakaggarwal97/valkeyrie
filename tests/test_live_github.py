@@ -30,9 +30,11 @@ from valkeyrie.live_github import (  # noqa: PLC2701
     LatestReleaseQuery,
     LiveGitHubError,
     LiveGitHubQuery,
+    PathHistoryQuery,
     ProjectQuery,
     PullRequestQuery,
     ReleaseListQuery,
+    RunJobsQuery,
     WorkflowRunQuery,
     WorkflowRunsQuery,
     _code_search,
@@ -338,12 +340,20 @@ def test_every_rest_query_is_one_fixed_bounded_get_and_normalized(
     # The primary read is exactly one fixed bounded GET. An issue or pull request additionally
     # reads its discussion, each equally bounded; those are additive and never replace it.
     assert calls[0] == (source_url, REQUEST_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES)
+    # The check-runs listing on a pull request head is the one additive read with a larger bound:
+    # sixty-four check runs with their output summaries exceed the default.
     assert all(
-        timeout == REQUEST_TIMEOUT_SECONDS and limit == MAX_RESPONSE_BYTES
-        for _, timeout, limit in calls[1:]
+        timeout == REQUEST_TIMEOUT_SECONDS
+        and (limit == MAX_RESPONSE_BYTES or ("/check-runs?" in url and limit > MAX_RESPONSE_BYTES))
+        for url, timeout, limit in calls[1:]
     )
     assert all(
-        "/comments?" in url or "/reviews?" in url or "/releases" in url or "/commits?" in url
+        "/comments?" in url
+        or "/reviews?" in url
+        or "/releases" in url
+        or "/commits?" in url
+        or "/files?" in url
+        or "/check-runs?" in url
         for url, _, _ in calls[1:]
     )
     assert observation.source_url == source_url
@@ -397,6 +407,12 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
         "authors_of_listed": {"madolson": 2},
         "labels": [],
         "review": None,
+        "updated_before": None,
+        "reviewed_by": None,
+        "no_label": False,
+        "base": None,
+        "merged": False,
+        "mentions_number": None,
         "url": "https://github.com/valkey-io/valkey/issues?q=is%3Aissue+release+status",
         "finding": (
             'The search found 2 issues in valkey-io/valkey matching "release" and "status".'
@@ -1874,6 +1890,10 @@ def test_an_issue_and_a_pull_request_carry_their_recent_discussion() -> None:
                     }
                 ]
             )
+        if "/files?" in url:
+            return _response([{"filename": "src/replication.c"}])
+        if "/check-runs?" in url:
+            return _response({"total_count": 0, "check_runs": []})
         if url.endswith("/pulls/7"):
             return _response(_pull_request(number=7))
         if url.endswith("/issues/7"):
@@ -2427,3 +2447,137 @@ def test_compare_lists_the_commits_between_two_refs_with_the_exact_count() -> No
             fetch=lambda *a: _response(dup),
             observed_clock=lambda: OBSERVED,
         )
+
+
+def test_run_jobs_name_the_failing_job_and_its_failing_step() -> None:
+    value = {
+        "total_count": 3,
+        "jobs": [
+            {
+                "name": "test-valgrind-test (unit)",
+                "status": "completed",
+                "conclusion": "failure",
+                "html_url": "https://github.com/valkey-io/valkey/actions/runs/1/job/2",
+                "steps": [
+                    {"name": "Set up job", "conclusion": "success"},
+                    {"name": "test", "conclusion": "failure"},
+                ],
+            },
+            {"name": "build", "status": "completed", "conclusion": "success", "steps": []},
+            {"name": "lint", "status": "completed", "conclusion": "skipped", "steps": []},
+        ],
+    }
+    calls: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(url)
+        return _response(value)
+
+    observation = read_live_github(
+        RunJobsQuery("valkey", 1), fetch=fetch, observed_clock=lambda: OBSERVED
+    )
+    assert calls == [
+        "https://api.github.com/repos/valkey-io/valkey/actions/runs/1/jobs?per_page=100"
+    ]
+    payload = _decoded(observation)
+    assert observation.object_type == "workflow_run"
+    assert payload["kind"] == "run_jobs"
+    assert str(payload["finding"]) == (
+        "Run 1 in valkey-io/valkey has 3 jobs; 1 failed: test-valgrind-test (unit) "
+        "(failed at step: test)."
+    )
+    with pytest.raises(LiveGitHubError):
+        read_live_github(RunJobsQuery("valkey", 0), fetch=fetch, observed_clock=lambda: OBSERVED)
+
+
+def test_path_history_tallies_who_has_been_changing_a_file() -> None:
+    def commit(sha: str, login: str | None, date: str) -> dict[str, object]:
+        return {
+            "sha": sha,
+            "author": None if login is None else {"login": login},
+            "commit": {"message": f"change by {login}\n\nbody", "author": {"date": date}},
+        }
+
+    value = [
+        commit("a" * 40, "zuiderkwast", "2026-09-27T10:00:00Z"),
+        commit("b" * 40, "roshkhatri", "2026-09-15T10:00:00Z"),
+        commit("c" * 40, "roshkhatri", "2026-09-02T10:00:00Z"),
+        commit("d" * 40, None, "2026-08-30T10:00:00Z"),
+    ]
+    calls: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(url)
+        return _response(value)
+
+    observation = read_live_github(
+        PathHistoryQuery("valkey", "src/replication.c", 10),
+        fetch=fetch,
+        observed_clock=lambda: OBSERVED,
+    )
+    assert calls == [
+        "https://api.github.com/repos/valkey-io/valkey/commits?path=src%2Freplication.c&per_page=10"
+    ]
+    payload = _decoded(observation)
+    assert observation.object_type == "compare" and payload["kind"] == "path_history"
+    assert payload["authors"] == {"roshkhatri": 2, "zuiderkwast": 1}
+    assert str(payload["finding"]).endswith("were authored by: roshkhatri (2), zuiderkwast (1).")
+    assert payload["url"] == "https://github.com/valkey-io/valkey/commits/HEAD/src/replication.c"
+    for bad in (PathHistoryQuery("valkey", "../x"), PathHistoryQuery("valkey", "src/a.c", 0)):
+        with pytest.raises(LiveGitHubError):
+            read_live_github(bad, fetch=fetch, observed_clock=lambda: OBSERVED)
+
+
+def test_an_open_pull_request_carries_its_readiness_files_and_check_conclusions() -> None:
+    """Mergeable state and requested reviewers come from the object; the files and the checks on
+    the head are additive reads that degrade to None on failure, never failing the read."""
+    pr = _pull_request(number=7)
+    pr["mergeable_state"] = "blocked"
+    pr["requested_reviewers"] = [{"login": "JimB123"}, {"login": "murphyjacob4"}]
+    pr["changed_files"] = 12
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        if url.endswith("/pulls/7"):
+            return _response(pr)
+        if "/files?" in url:
+            return _response([{"filename": "src/aof.c"}, {"filename": "src/forkless.c"}])
+        if "/check-runs?" in url:
+            assert max_bytes > MAX_RESPONSE_BYTES
+            return _response(
+                {
+                    "total_count": 3,
+                    "check_runs": [
+                        {"name": "DCO", "conclusion": "failure"},
+                        {"name": "build", "conclusion": "success"},
+                        {"name": "sanitizer", "conclusion": None},
+                    ],
+                }
+            )
+        return _response([])
+
+    payload = _decoded(
+        read_live_github(
+            PullRequestQuery("valkey", 7), fetch=fetch, observed_clock=lambda: OBSERVED
+        )
+    )
+    assert payload["mergeable_state"] == "blocked"
+    assert payload["requested_reviewers"] == ["JimB123", "murphyjacob4"]
+    assert payload["files"] == ["src/aof.c", "src/forkless.c"]
+    assert payload["checks"] == {
+        "total": 3,
+        "by_conclusion": {"failure": 1, "success": 1, "pending": 1},
+        "failing": ["DCO"],
+    }
+
+    def failing(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        if url.endswith("/pulls/7"):
+            return _response(pr)
+        raise GitHubReadError("down")
+
+    degraded = _decoded(
+        read_live_github(
+            PullRequestQuery("valkey", 7), fetch=failing, observed_clock=lambda: OBSERVED
+        )
+    )
+    assert degraded["files"] is None and degraded["checks"] is None
+    assert degraded["mergeable_state"] == "blocked"

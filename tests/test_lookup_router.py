@@ -615,3 +615,38 @@ def test_the_router_may_ask_for_the_review_queue_ci_runs_oldest_items_and_a_comp
     ):
         with pytest.raises(LookupRouterError, match=reason):
             parse_lookup_plan('{"lookups":[' + bad + "]}")
+
+
+def test_the_router_may_ask_for_stale_reviewed_unlabelled_backport_jobs_and_path_history() -> None:
+    from valkeyrie.live_github import IssueSearchQuery, PathHistoryQuery, RunJobsQuery
+    from valkeyrie.lookup_router import LookupRouterError, parse_lookup_plan
+
+    plan = parse_lookup_plan(
+        '{"lookups":['
+        '{"kind":"search","scope":"pull-request","state":"open","updated_before":"2026-08-29"},'
+        '{"kind":"search","scope":"pull-request","reviewed_by":"hpatro"},'
+        '{"kind":"search","scope":"issue","state":"open","no_label":true},'
+        '{"kind":"search","scope":"pull-request","base":"8.1","merged":true,"mentions_number":4534},'
+        '{"kind":"ci_jobs","repository":"valkey","run_id":36502585735},'
+        '{"kind":"path_history","repository":"valkey","path":"src/replication.c"}]}'
+    )
+    stale, reviewed, triage, backport, jobs, history = plan.live
+    assert isinstance(stale, IssueSearchQuery) and stale.updated_before == "2026-08-29"
+    assert isinstance(reviewed, IssueSearchQuery) and reviewed.reviewed_by == "hpatro"
+    assert isinstance(triage, IssueSearchQuery) and triage.no_label is True
+    assert isinstance(backport, IssueSearchQuery)
+    assert (backport.base, backport.merged, backport.mentions_number) == ("8.1", True, 4534)
+    assert jobs == RunJobsQuery("valkey", 36502585735)
+    assert history == PathHistoryQuery("valkey", "src/replication.c")
+
+    for bad, reason in (
+        ('{"kind":"search","scope":"issue","base":"8.1"}', "pull requests only"),
+        ('{"kind":"search","scope":"issue","merged":true}', "pull requests only"),
+        ('{"kind":"search","scope":"pull-request","no_label":"yes"}', "flags must be booleans"),
+        ('{"kind":"search","scope":"pull-request","updated_before":"2026-02-30"}', "malformed"),
+        ('{"kind":"search","scope":"pull-request","base":"../x"}', "base is malformed"),
+        ('{"kind":"ci_jobs","repository":"valkey","run_id":"36502585735"}', "run_id is malformed"),
+        ('{"kind":"path_history","repository":"valkey","path":"../etc"}', "malformed"),
+    ):
+        with pytest.raises(LookupRouterError, match=reason):
+            parse_lookup_plan('{"lookups":[' + bad + "]}")

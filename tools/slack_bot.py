@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import threading
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -242,8 +243,9 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
     _react(client, event, _WORKING)
     try:
         conversation = _thread_history(event, client)
+        started = time.monotonic()
         result = _ask(question, event, conversation)
-        text = _format(result)
+        text = _format(result, seconds=time.monotonic() - started)
     except Exception:
         # Log the detail, tell the channel only that it failed.
         log.exception("answer failed")
@@ -385,7 +387,7 @@ def _turns_before(
     return turns[-MAX_HISTORY_TURNS:]
 
 
-def _format(result: dict[str, Any]) -> str:
+def _format(result: dict[str, Any], *, seconds: float | None = None) -> str:
     """Render a response by its outcome. The runtime explains itself in `message`."""
     outcome = result.get("outcome", "unknown")
     claims = result.get("claims") or []
@@ -403,8 +405,15 @@ def _format(result: dict[str, Any]) -> str:
             # Citations are application-authored from validated GitHub URLs, so the link markup is
             # built here; the label is still escaped since it carries a path.
             sources = "\n\n*Sources*\n" + "\n".join(f"  {_source_link(c)}" for c in citations)
-        tail = (f"\n\n_{_plain(message)}_" if message else "") + (
-            f"\n\n_{_MORE_HELP if message else _FOLLOW_UP}_"
+        # A complete answer ends with what it checked. Only an answer with a stated limitation gets
+        # the pointer to the human channels: on a complete one it was noise under every reply.
+        checked = f"Checked {len(citations)} source{'s' if len(citations) != 1 else ''}" + (
+            f" in {seconds:.0f}s" if seconds is not None else ""
+        )
+        tail = (
+            (f"\n\n_{_plain(message)}_" if message else "")
+            + (f"\n\n_{_MORE_HELP}_" if message else "")
+            + f"\n\n_{checked}._"
         )
         budget = MAX_REPLY_CHARS - len(sources) - len(tail) - 80
         rendered: list[str] = []
@@ -413,7 +422,7 @@ def _format(result: dict[str, Any]) -> str:
         for claim in claims:
             if not claim.get("text"):
                 continue
-            line = _itemized(_linked(_plain(claim["text"]), repository))
+            line = _grouped(_itemized(_linked(_plain(claim["text"]), repository)))
             if rendered and used + len(line) > budget:
                 left = sum(1 for c in claims[claims.index(claim) :] if c.get("text"))
                 rendered.append(f"• _{left} more claim(s) did not fit in one Slack message._")
@@ -439,7 +448,6 @@ def _format(result: dict[str, Any]) -> str:
 
 # Closing pointers. Short by design: a paragraph of boilerplate under every answer trains people to
 # stop reading the part that matters.
-_FOLLOW_UP = "Ask a follow-up in this thread if you need more detail."
 _MORE_HELP = (
     "For more than I can ground: ask in the Valkey Slack help channels, "
     "open a GitHub Discussion in valkey-io, or read the topic pages on valkey.io."
@@ -515,6 +523,31 @@ def _itemized(text: str) -> str:
     pieces = [text[a:b] for a, b in zip(starts, [*starts[1:], len(text)], strict=True)]
     items = [re.sub(r"[\s,;]*(?:\band\b)?[\s,;]*$", "", piece).rstrip(".") for piece in pieces]
     lines = [f"• {lead}" if lead else "• The items:"] + [f"    ◦ {item}" for item in items]
+    return "\n".join(lines)
+
+
+# "9.0: ...; 9.1: ..." or "valkey-glide: ...; valkey-py: ...": two or more segments, each opening
+# with a short label and a colon, joined by semicolons. A version, a repository or a client name.
+_GROUP_LABEL = re.compile(r"^(?:[A-Za-z][\w.+-]{0,30}|\d+(?:\.\d+){1,2}(?:-rc\d+)?):\s")
+MIN_GROUPS = 2
+
+
+def _grouped(text: str) -> str:
+    """A comparison written as "label: text; label: text" becomes one indented line per label.
+
+    Applied to a single bullet only (an itemized claim already has structure). The label is
+    bolded so the eye finds the sides of the comparison; the text after it is untouched.
+    """
+    if "\n" in text or not text.startswith("• "):
+        return text
+    body = text[2:]
+    segments = [s.strip() for s in body.split("; ") if s.strip()]
+    if len(segments) < MIN_GROUPS or not all(_GROUP_LABEL.match(s) for s in segments):
+        return text
+    lines = ["•"]
+    for segment in segments:
+        label, _, rest = segment.partition(": ")
+        lines.append(f"    ◦ *{label}:* {rest.rstrip('.')}")
     return "\n".join(lines)
 
 

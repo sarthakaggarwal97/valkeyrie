@@ -25,6 +25,7 @@ import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from typing import Final, Literal
 
 from valkeyrie.live_github import (
@@ -43,10 +44,12 @@ from valkeyrie.live_github import (
     IssueQuery,
     IssueSearchQuery,
     LiveGitHubQuery,
+    PathHistoryQuery,
     ProjectQuery,
     PullRequestQuery,
     ReleaseByTagQuery,
     ReleaseListQuery,
+    RunJobsQuery,
     WorkflowRunsQuery,
 )
 
@@ -63,6 +66,8 @@ _KINDS: Final[frozenset[str]] = frozenset(
         "releases",
         "release_notes",
         "ci_runs",
+        "ci_jobs",
+        "path_history",
         "compare",
         "project_board",
         "search",
@@ -135,6 +140,15 @@ ROUTER_SYSTEM: Final = (
     "branch with their conclusions. Use for what is failing or red on a branch, whether CI is "
     "green, and which workflows ran most recently. It lists runs; a named run's detail is "
     "workflow_run.\n"
+    '- {"kind":"ci_jobs","repository":"valkey","run_id":36502585735}: the jobs of one workflow run '
+    "and the step each failing job failed at. Use after ci_runs names a failed run, or when the "
+    'asker gives a run id: "why did the Daily run fail" is ci_runs to find it, then '
+    "ci_jobs.\n"
+    '- {"kind":"path_history","repository":"valkey","path":"src/replication.c"}: the '
+    "recent commits touching a path and who authored them. Use for who works on or should review "
+    "a part of the "
+    "code, together with a file lookup of MAINTAINERS.md for the declared owners and, for a pull "
+    "request, its pull_request read, which lists the files it changes.\n"
     '- {"kind":"compare","repository":"valkey","base":"9.1.0","head":"unstable"}: the commits in '
     "head that are not in base, with the exact count. Use for what changed since a version or "
     "tag, what is on a branch that a release does not have, and how far two refs have diverged. "
@@ -187,8 +201,17 @@ ROUTER_SYSTEM: Final = (
     'For pull requests an optional "review" of "required" (no review yet, the review queue), '
     '"approved", or "changes_requested" selects by review state, and it waives the terms: "which '
     'pull requests need review" is scope pull-request with review required and state open. An '
-    'optional "order":"oldest" lists the earliest-created first, for which issues or pull requests '
-    "have been open the longest. "
+    'optional "order":"oldest" lists the earliest-created first, for which issues or pull '
+    'requests have been open the longest. "updated_before":"YYYY-MM-DD" selects items not touched '
+    'since that day, least recently updated first: stale pull requests. "reviewed_by":"login" '
+    "selects pull "
+    "requests that user reviewed, for what someone has reviewed rather than authored. "
+    '"no_label":true selects items with no label at all: the triage queue. "base":"8.1" selects '
+    'pull requests targeting that branch and "merged":true merged ones; "mentions_number":4534 '
+    'selects items whose title or body names that number. A backport question ("was #4534 '
+    'backported to 8.1") is scope pull-request, base 8.1, merged true, mentions_number 4534: the '
+    "backport sweep into that branch names its source numbers in its body, and finding zero such "
+    "pull requests establishes it was not. "
     'An optional "state" of "open" or "closed" and up to three "labels" filter by issue state and '
     'repository label, and both waive the terms: "how many open bugs are there" is state open '
     "with label bug, not the words open and bugs. Valkey labels include bug, enhancement, "
@@ -237,6 +260,24 @@ ROUTER_SYSTEM: Final = (
     "examples/node/cluster_example.ts and standalone_example.ts. For any other language or client, "
     "use a directory lookup first to find the file, then read it. Real code from the library "
     "beats prose describing it.\n"
+    "\n"
+    "- WHAT IS BLOCKING a release: a search for open items with label release-blocker in the "
+    "repository AND the release's project_board; the blockers are the labelled items plus what "
+    "the board still has open.\n"
+    "- IS a pull request READY TO MERGE, or what is holding it: the pull_request read alone. It "
+    "carries the reviews, the mergeable state, the reviewers still requested, and the "
+    "conclusions of the checks on its head; nothing else is needed.\n"
+    "- WHO SHOULD REVIEW a pull request or a change: the pull_request read (its files), a "
+    "path_history for the main file it touches, and a file lookup of MAINTAINERS.md; the answer "
+    "is who owns the area and who has been changing it.\n"
+    "- DRAFT RELEASE NOTES or summarize what merged since a release: a compare from that release's "
+    "tag to the branch, and a pull-request search with since set to the release date and "
+    "merged true; the commit subjects carry the pull request numbers and the search carries the "
+    "titles and labels.\n"
+    "- IS THERE ALREADY AN ISSUE about something, or should I file one: an issue search for the "
+    "topic in the repository, both scopes, before anything else. The answer names what exists.\n"
+    "- WHY DID a workflow or CI run FAIL: ci_runs for the branch to find the failed run, then, "
+    "when the asker names a run id or the shortfall names one, ci_jobs for that run.\n"
     "\n"
     "When a SHORTFALL is supplied, a first attempt already ran with the lookups it chose and the "
     "answer reported that the evidence was insufficient; the shortfall is the answer's own words "
@@ -548,9 +589,24 @@ def _live_lookup(kind: str, item: Mapping[str, object]) -> LiveGitHubQuery | Non
                 "labels",
                 "review",
                 "order",
+                "updated_before",
+                "reviewed_by",
+                "no_label",
+                "base",
+                "merged",
+                "mentions_number",
             },
         )
         return _search(item)
+    if kind == "ci_jobs":
+        _only_keys(item, {"kind", "repository", "run_id"})
+        run_id = item.get("run_id")
+        if type(run_id) is not int or not 0 < run_id < 10**15:
+            raise LookupRouterError("ci jobs run_id is malformed")
+        return RunJobsQuery(_repository(item), run_id)
+    if kind == "path_history":
+        _only_keys(item, {"kind", "repository", "path"})
+        return PathHistoryQuery(_repository(item), _file_path(item))
     if kind == "ci_runs":
         _only_keys(item, {"kind", "repository", "branch"})
         branch = item.get("branch", "unstable")
@@ -665,6 +721,22 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
     order = item.get("order")
     if order is not None and order != "oldest":
         raise LookupRouterError("search order must be oldest")
+    updated_before = _window_day(item.get("updated_before"))
+    reviewed_by = item.get("reviewed_by")
+    if reviewed_by is not None and (
+        not isinstance(reviewed_by, str) or _LOGIN.fullmatch(reviewed_by) is None
+    ):
+        raise LookupRouterError("search reviewed_by is malformed")
+    no_label = item.get("no_label", False)
+    merged = item.get("merged", False)
+    if type(no_label) is not bool or type(merged) is not bool:
+        raise LookupRouterError("search flags must be booleans")
+    base = item.get("base")
+    if base is not None and (not isinstance(base, str) or _RELEASE_TAG.fullmatch(base) is None):
+        raise LookupRouterError("search base is malformed")
+    mentions = item.get("mentions_number")
+    if mentions is not None and (type(mentions) is not int or not 0 < mentions < 10**7):
+        raise LookupRouterError("search mentions_number is malformed")
     labels_value = item.get("labels", [])
     if not isinstance(labels_value, Sequence) or isinstance(labels_value, str):
         raise LookupRouterError("search labels must be an array")
@@ -676,7 +748,19 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
             raise LookupRouterError("search label is malformed")
         if label not in labels:
             labels.append(label)
-    unscoped = since is None and author is None and state is None and not labels and review is None
+    unscoped = not (
+        since
+        or author
+        or state
+        or labels
+        or review
+        or updated_before
+        or reviewed_by
+        or no_label
+        or base
+        or merged
+        or mentions
+    )
     terms = item.get("terms", [])
     if not isinstance(terms, Sequence) or isinstance(terms, str):
         raise LookupRouterError("search terms must be an array")
@@ -711,6 +795,8 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
         raise LookupRouterError("search scope must be pull-request or issue")
     if review is not None and scope != "pull-request":
         raise LookupRouterError("search review applies to pull requests only")
+    if (reviewed_by is not None or base is not None or merged) and scope != "pull-request":
+        raise LookupRouterError("search reviewed_by, base and merged apply to pull requests only")
     # Same page as the supplement. A search carries whole issue bodies, and the model often
     # chooses two to four searches; at twenty items each they overran the evidence budget so
     # far that only one survived it. Five recent items per search lets them all be evidence.
@@ -719,7 +805,11 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
         repository=repositories[0],
         repositories=tuple(repositories[1:]),
         # A window lists many short items (a period summary); a topic search a few whole ones.
-        per_page=WINDOW_PER_PAGE if (since or author or review or order) else SUPPLEMENT_PER_PAGE,
+        per_page=(
+            WINDOW_PER_PAGE
+            if (since or author or review or order or updated_before or reviewed_by or no_label)
+            else SUPPLEMENT_PER_PAGE
+        ),
         kind=scope,
         since=since,
         until=until,
@@ -729,6 +819,12 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
         labels=tuple(labels),
         review=review,
         order=order,
+        updated_before=updated_before,
+        reviewed_by=reviewed_by,
+        no_label=no_label,
+        base=base,
+        merged=merged,
+        mentions_number=mentions,
     )
 
 
@@ -748,6 +844,12 @@ def _window_day(value: object) -> str | None:
         return None
     if not isinstance(value, str) or _SINCE.fullmatch(value) is None:
         raise LookupRouterError("search window is malformed")
+    # A real calendar day, not merely the shape of one: the live layer refuses 2026-02-30 after
+    # the plan is accepted, and refusing it here keeps the parser the boundary it claims to be.
+    try:
+        date.fromisoformat(value)
+    except ValueError as error:
+        raise LookupRouterError("search window is malformed") from error
     return value
 
 

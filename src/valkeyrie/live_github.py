@@ -69,6 +69,24 @@ class IssueSearchQuery:
     # "oldest": ascending by creation, so "which issues have been open longest" reads from the
     # right end. Default is GitHub's best match, or newest-first when a window or author is set.
     order: str | None = None
+    # Items not updated since this day (updated:<DATE): the stale ones. Waives the terms.
+    updated_before: str | None = None
+    # Pull requests this login reviewed (reviewed-by:). "What has X reviewed" is activity that the
+    # author search cannot see. Waives the terms.
+    reviewed_by: str | None = None
+    # Items with no label at all (no:label): the triage queue. Waives the terms.
+    no_label: bool = False
+    # Pull requests targeting this branch (base:). A backport sweep into 8.1 is a merged pull
+    # request with base 8.1 whose body names the source numbers, so "was #4534 backported to 8.1"
+    # is base 8.1, merged, term 4534.
+    base: str | None = None
+    # Merged pull requests only (is:merged). A window on merged dates implies it already.
+    merged: bool = False
+    # A pull request or issue NUMBER the items must mention in their title or body. The backport
+    # sweep into a release branch lists its source numbers in its body, so "was #4534 backported
+    # to 8.1" is base 8.1, merged, mentions_number 4534. A bare number is not a search term (the
+    # term rule requires a letter), which is why this is its own field.
+    mentions_number: int | None = None
     # GitHub requires an explicit is:issue or is:pull-request on authenticated
     # search/issues requests and returns 422 without one. Anonymous requests are not yet
     # enforced, which is why this was invisible until the runtime started authenticating.
@@ -214,8 +232,35 @@ class CompareQuery:
     per_page: int = 25
 
 
+@dataclass(frozen=True)
+class RunJobsQuery:
+    """The jobs of one workflow run, with the step that failed in each failing job.
+
+    A run listing says Codecov failed; this says which job and which step. That is the difference
+    between "CI is red" and "the valgrind unit job failed at its test step".
+    """
+
+    repository: str
+    run_id: int
+
+
+@dataclass(frozen=True)
+class PathHistoryQuery:
+    """The most recent commits that touched a path, with their authors.
+
+    "Who should review a change to src/replication.c" starts with who has been changing it.
+    """
+
+    repository: str
+    path: str
+    per_page: int = 10
+
+
 MAX_WORKFLOW_RUNS: Final = 20
 MAX_COMPARE_COMMITS: Final = 50
+MAX_RUN_JOBS: Final = 100
+MAX_PATH_COMMITS: Final = 30
+MAX_PR_FILES: Final = 100
 
 
 LiveGitHubQuery: TypeAlias = (
@@ -231,6 +276,8 @@ LiveGitHubQuery: TypeAlias = (
     | AdvisoryQuery
     | WorkflowRunQuery
     | WorkflowRunsQuery
+    | RunJobsQuery
+    | PathHistoryQuery
     | CompareQuery
     | CheckRunQuery
     | ProjectQuery
@@ -816,6 +863,10 @@ def read_live_github(
         )
     if isinstance(query, PullRequestQuery) and payload.get("merged_at") is not None:
         payload = _with_release_membership(payload, query.repository, fetch or fetch_public_github)
+    if isinstance(query, PullRequestQuery) and payload.get("merged_at") is None:
+        payload = _with_readiness(
+            payload, query.repository, query.number, fetch or fetch_public_github
+        )
     if (
         isinstance(query, IssueSearchQuery)
         and query.since is not None
@@ -1432,6 +1483,71 @@ def _with_discussion(
     return enriched
 
 
+def _logins(value: object) -> list[str]:
+    """Logins of a list of user objects; anything else is an empty list."""
+    if not isinstance(value, list):
+        return []
+    return [_text(item, "login", 255) for item in value if isinstance(item, Mapping)]
+
+
+def _with_readiness(
+    payload: dict[str, object], repository: str, number: int, fetch: GitHubFetcher
+) -> dict[str, object]:
+    """Add the files an open pull request changes and the conclusions of the checks on its head.
+
+    "Is it ready to merge" is answered by four facts: the review verdicts (already read), the
+    mergeable state (in the object), whether checks pass, and who is still asked to review (in
+    the object). The checks are read here, on the head commit. The files are read for "who should
+    review this": ownership starts from what the change touches. Best effort and additive.
+    """
+    enriched = dict(payload)
+    try:
+        listing = _response_object(
+            fetch(
+                f"{_API_ROOT}/repos/{OWNER}/{repository}/pulls/{number}/files?per_page={MAX_PR_FILES}",
+                REQUEST_TIMEOUT_SECONDS,
+                MAX_RESPONSE_BYTES,
+            ),
+            source="REST",
+        )
+        files = []
+        for raw in _list(listing, "items")[:MAX_PR_FILES]:
+            entry = _object(raw, "pull request file")
+            files.append(_text(entry, "filename", 1024))
+        enriched["files"] = files
+    except (GitHubReadError, LiveGitHubError):
+        enriched["files"] = None
+    head = payload.get("head_sha")
+    if isinstance(head, str):
+        try:
+            checks = _response_object(
+                fetch(
+                    f"{_API_ROOT}/repos/{OWNER}/{repository}/commits/{head}/check-runs?per_page=100",
+                    REQUEST_TIMEOUT_SECONDS,
+                    MAX_FILE_RESPONSE_BYTES,
+                ),
+                source="REST",
+                maximum_bytes=MAX_FILE_RESPONSE_BYTES,
+            )
+            tally: dict[str, int] = {}
+            failing: list[str] = []
+            for raw in _list(checks, "check_runs"):
+                run = _object(raw, "check run")
+                conclusion = run.get("conclusion")
+                key = conclusion if isinstance(conclusion, str) else "pending"
+                tally[key] = tally.get(key, 0) + 1
+                if key in {"failure", "timed_out", "action_required", "startup_failure"}:
+                    failing.append(_text(run, "name", 255))
+            enriched["checks"] = {
+                "total": _integer(checks, "total_count"),
+                "by_conclusion": tally,
+                "failing": failing[:20],
+            }
+        except (GitHubReadError, LiveGitHubError):
+            enriched["checks"] = None
+    return enriched
+
+
 def _discussion_items(
     url: str, fetch: GitHubFetcher, *, state: bool
 ) -> list[dict[str, object]] | None:
@@ -1698,11 +1814,37 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
             raise LiveGitHubError("search review state applies to pull requests only")
         if query.order is not None and query.order != "oldest":
             raise LiveGitHubError("search order must be oldest or absent")
+        updated_before = _search_since(query.updated_before)
+        reviewed_by = _search_author(query.reviewed_by)
+        if (reviewed_by is not None or query.base is not None or query.merged) and (
+            query.kind != "pull-request"
+        ):
+            raise LiveGitHubError("reviewed_by, base and merged apply to pull requests only")
+        base = None if query.base is None else _tag(query.base)
+        if base is not None and ("/" in base or ".." in base):
+            raise LiveGitHubError("search base branch is malformed")
+        if type(query.no_label) is not bool or type(query.merged) is not bool:
+            raise LiveGitHubError("search flags must be booleans")
+        mentions = query.mentions_number
+        if mentions is not None and (type(mentions) is not int or not 0 < mentions < 10**7):
+            raise LiveGitHubError("search mentions_number must be a positive integer")
         if until is not None and since is None:
             raise LiveGitHubError("search window end requires a start")
         if until is not None and since is not None and until < since:
             raise LiveGitHubError("search window end precedes its start")
-        scoped_without_terms = bool(since or author or state or labels or review)
+        scoped_without_terms = bool(
+            since
+            or author
+            or state
+            or labels
+            or review
+            or updated_before
+            or reviewed_by
+            or query.no_label
+            or base
+            or query.merged
+            or mentions
+        )
         terms = _search_terms(query.terms, minimum=0 if scoped_without_terms else MIN_SEARCH_TERMS)
         search_repository = _optional_repository(query.repository)
         per_page = _search_per_page(query.per_page)
@@ -1733,6 +1875,24 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
             # GitHub spells the qualifier review:required / approved / changes_requested.
             window.append(f"review:{review}")
             parameters = {"sort": "updated", "order": "desc"}
+        if reviewed_by is not None:
+            window.append(f"reviewed-by:{reviewed_by}")
+            parameters = {"sort": "updated", "order": "desc"}
+        if query.no_label:
+            window.append("no:label")
+            parameters = {"sort": "updated", "order": "desc"}
+        if base is not None:
+            window.append(f"base:{base}")
+        if query.merged and since is None:
+            window.append("is:merged")
+        if mentions is not None:
+            # As a word: GitHub matches it in the title and body, which is where a sweep lists
+            # its sources. Quoted with the hash so "4534" does not also match "45340".
+            window.append(f'"#{mentions}"')
+        if updated_before is not None:
+            # The least recently touched first: that is what "stale" means.
+            window.append(f"updated:<{updated_before}")
+            parameters = {"sort": "updated", "order": "asc"}
         if author is not None:
             window.append(f"author:{author}")
             # Authorship alone has nothing to rank by; newest first is what "their work" wants.
@@ -1777,6 +1937,12 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
                 window=query.window,
                 review=review,
                 order=query.order,
+                updated_before=updated_before,
+                reviewed_by=reviewed_by,
+                no_label=query.no_label,
+                base=base,
+                merged=query.merged,
+                mentions_number=mentions,
             ),
         )
     if isinstance(query, LatestReleaseQuery):
@@ -1883,6 +2049,25 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
             "workflow_run",
             lambda value: _workflow_runs(value, repository, branch, per_page),
         )
+    if isinstance(query, RunJobsQuery):
+        repository = _repository(query.repository)
+        run_id = query.run_id
+        if type(run_id) is not int or run_id <= 0:
+            raise LiveGitHubError("run id must be a positive integer")
+        url = (
+            f"{_API_ROOT}/repos/{OWNER}/{repository}/actions/runs/{run_id}/jobs"
+            f"?per_page={MAX_RUN_JOBS}"
+        )
+        return url, "workflow_run", lambda value: _run_jobs(value, repository, run_id)
+    if isinstance(query, PathHistoryQuery):
+        repository = _repository(query.repository)
+        path = _repository_path(query.path)
+        per_page = query.per_page
+        if type(per_page) is not int or not 1 <= per_page <= MAX_PATH_COMMITS:
+            raise LiveGitHubError("path history page size is outside its bound")
+        encoded = urlencode({"path": path, "per_page": str(per_page)})
+        url = f"{_API_ROOT}/repos/{OWNER}/{repository}/commits?{encoded}"
+        return url, "compare", lambda value: _path_history(value, repository, path, per_page)
     if isinstance(query, CompareQuery):
         repository = _repository(query.repository)
         base = _tag(query.base)
@@ -2001,6 +2186,14 @@ def _pull_request(value: Mapping[str, object], repository: str, number: int) -> 
         "title": _text(value, "title", 1024),
         "body": _nullable_text(value, "body", 128 * 1024),
         "draft": _boolean(value, "draft"),
+        # Readiness. mergeable_state is GitHub's own summary (clean, blocked, dirty, unstable,
+        # behind, unknown); requested reviewers are who is still expected to look. Both are
+        # absent from search items and present on the object, so they are optional here.
+        "mergeable_state": _nullable_text(value, "mergeable_state", 32)
+        if "mergeable_state" in value
+        else None,
+        "requested_reviewers": _logins(value.get("requested_reviewers")),
+        "changed_files": _integer(value, "changed_files") if "changed_files" in value else None,
         "locked": _boolean(value, "locked"),
         "user": _login(value),
         "labels": _labels(value),
@@ -2073,6 +2266,12 @@ def _issue_search(
     window: str | None = None,
     review: str | None = None,
     order: str | None = None,
+    updated_before: str | None = None,
+    reviewed_by: str | None = None,
+    no_label: bool = False,
+    base: str | None = None,
+    merged: bool = False,
+    mentions_number: int | None = None,
 ) -> dict[str, object]:
     incomplete = _boolean(value, "incomplete_results")
     items = _list(value, "items")
@@ -2090,7 +2289,9 @@ def _issue_search(
         _search_item(
             _object(item, "search item"),
             repositories,
-            compact=since is not None or author is not None or review is not None,
+            compact=bool(
+                since or author or review or updated_before or reviewed_by or no_label or base
+            ),
         )
         for item in items
     ]
@@ -2116,11 +2317,19 @@ def _issue_search(
         "sort": (
             "oldest_first"
             if order == "oldest"
+            else "least_recently_updated"
+            if updated_before
             else "updated"
-            if (since or author or review)
+            if (since or author or review or reviewed_by or no_label)
             else SEARCH_SORT
         ),
         "review": review,
+        "updated_before": updated_before,
+        "reviewed_by": reviewed_by,
+        "no_label": no_label,
+        "base": base,
+        "merged": merged,
+        "mentions_number": mentions_number,
         "since": since,
         "until": until,
         "author": author,
@@ -2151,6 +2360,12 @@ def _issue_search(
             window,
             review,
             order,
+            updated_before,
+            reviewed_by,
+            no_label,
+            base,
+            merged,
+            mentions_number,
         ),
     }
 
@@ -2178,6 +2393,12 @@ def _search_finding(
     window: str | None = None,
     review: str | None = None,
     order: str | None = None,
+    updated_before: str | None = None,
+    reviewed_by: str | None = None,
+    no_label: bool = False,
+    base: str | None = None,
+    merged: bool = False,
+    mentions_number: int | None = None,
 ) -> str:
     span = f"from {since} through {until}" if until else f"on or after {since}"
     if since is None:
@@ -2194,6 +2415,18 @@ def _search_finding(
         what = f"{what} labelled " + " and ".join(f'"{label}"' for label in labels)
     if author is not None:
         what = f"{what} authored by {author}"
+    if merged and since is None:
+        what = f"merged {what}"
+    if base is not None:
+        what = f"{what} targeting branch {base}"
+    if reviewed_by is not None:
+        what = f"{what} reviewed by {reviewed_by}"
+    if no_label:
+        what = f"{what} with no label"
+    if updated_before is not None:
+        what = f"{what} not updated since {updated_before}"
+    if mentions_number is not None:
+        what = f"{what} that mention #{mentions_number}"
     if review is not None:
         described = {
             "required": "awaiting review (no review yet)",
@@ -2217,8 +2450,10 @@ def _search_finding(
     ordering = (
         "oldest (earliest created)"
         if order == "oldest"
+        else "least recently updated"
+        if updated_before
         else "most recently updated"
-        if (since or author or review)
+        if (since or author or review or reviewed_by or no_label)
         else "best matching"
     )
     listed = f" The {shown} {ordering} are listed." if shown < total_count else ""
@@ -2472,6 +2707,102 @@ def _workflow_runs(
         "per_page": per_page,
         "total_count": total,
         "runs": runs,
+        "finding": finding,
+    }
+
+
+def _run_jobs(value: Mapping[str, object], repository: str, run_id: int) -> dict[str, object]:
+    total = _integer(value, "total_count")
+    items = _list(value, "jobs")
+    if len(items) > MAX_RUN_JOBS:
+        raise LiveGitHubError("GitHub run jobs exceed the page bound")
+    jobs = []
+    for item in items:
+        job = _object(item, "job")
+        steps = _list(job, "steps") if "steps" in job else []
+        failed_steps = []
+        for raw in steps:
+            step = _object(raw, "step")
+            if step.get("conclusion") in {"failure", "timed_out", "cancelled"}:
+                failed_steps.append(_text(step, "name", 255))
+        conclusion = job.get("conclusion")
+        jobs.append(
+            {
+                "name": _text(job, "name", 255),
+                "status": _text(job, "status", 64),
+                "conclusion": None if conclusion is None else _text(job, "conclusion", 64),
+                "failed_steps": failed_steps,
+                "url": _text(job, "html_url", 512)
+                if isinstance(job.get("html_url"), str)
+                else None,
+            }
+        )
+    failing = [j for j in jobs if j["conclusion"] in {"failure", "timed_out", "startup_failure"}]
+    described = "; ".join(
+        f"{j['name']}"
+        + (
+            f" (failed at step: {', '.join(cast(list[str], j['failed_steps']))})"
+            if j["failed_steps"]
+            else ""
+        )
+        for j in failing
+    )
+    finding = f"Run {run_id} in {OWNER}/{repository} has {total} jobs; {len(failing)} failed" + (
+        f": {described}." if failing else "."
+    )
+    return {
+        "api_version": _API_VERSION,
+        "kind": "run_jobs",
+        "repository": repository,
+        "run_id": run_id,
+        "url": f"{_WEB_ROOT}/{OWNER}/{repository}/actions/runs/{run_id}",
+        "total_count": total,
+        "jobs": jobs,
+        "finding": finding,
+    }
+
+
+def _path_history(
+    value: Mapping[str, object], repository: str, path: str, per_page: int
+) -> dict[str, object]:
+    items = _list(value, "items")
+    if len(items) > per_page:
+        raise LiveGitHubError("GitHub path history exceeds the requested page bound")
+    commits = []
+    for item in items:
+        entry = _object(item, "commit entry")
+        inner = _object(entry.get("commit"), "commit body")
+        author = entry.get("author")
+        login = _text(author, "login", 255) if isinstance(author, Mapping) else None
+        message = _text(inner, "message", 65536)
+        commits.append(
+            {
+                "sha": _sha(entry, "sha"),
+                "author": login,
+                "subject": message.splitlines()[0][:200] if message else "",
+                "date": _timestamp(_object(inner.get("author"), "commit author"), "date"),
+            }
+        )
+    tally: dict[str, int] = {}
+    for commit in commits:
+        if commit["author"]:
+            login = str(commit["author"])
+            tally[login] = tally.get(login, 0) + 1
+    ranked = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
+    who = ", ".join(f"{login} ({n})" for login, n in ranked) or "no attributed authors"
+    finding = (
+        f"The {len(commits)} most recent commits touching {path} in {OWNER}/{repository} were "
+        f"authored by: {who}."
+    )
+    return {
+        "api_version": _API_VERSION,
+        "kind": "path_history",
+        "repository": repository,
+        "path": path,
+        "url": f"{_WEB_ROOT}/{OWNER}/{repository}/commits/HEAD/{path}",
+        "per_page": per_page,
+        "commits": commits,
+        "authors": dict(ranked),
         "finding": finding,
     }
 

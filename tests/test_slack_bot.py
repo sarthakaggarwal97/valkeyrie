@@ -216,21 +216,58 @@ def test_a_source_is_labelled_by_what_it_is_and_the_commit_lives_in_the_link() -
     assert slack_bot._source_link("something unexpected") == "something unexpected"
 
 
-def test_an_answer_ends_by_saying_where_to_go_next() -> None:
-    """An answer with a stated limitation is the case where someone most needs somewhere else to
-    go, so that one names the human channels; the rest just say the thread is open."""
-    answered = slack_bot._format({"outcome": "answer", "claims": [{"text": "HSET sets fields."}]})
-    assert answered.endswith(f"_{slack_bot._FOLLOW_UP}_")
+def test_a_complete_answer_ends_with_what_it_checked_and_only_a_limited_one_points_elsewhere() -> (
+    None
+):
+    """The pointer to human channels was noise under every complete answer; it now appears only
+    when the answer states a limitation. Every answer ends with how many sources it checked and
+    how long it took, which replaces the eyes reaction that the Slack scopes never allowed."""
+    answered = slack_bot._format(
+        {
+            "outcome": "answer",
+            "claims": [{"text": "HSET sets fields."}],
+            "citations": [
+                "valkey-doc/commands/hset.md@"
+                + "a" * 40
+                + ": https://github.com/valkey-io/valkey-doc/blob/a/x"
+            ],
+        },
+        seconds=12.4,
+    )
+    assert answered.endswith("_Checked 1 source in 12s._")
+    assert "Slack help channels" not in answered
     limited = slack_bot._format(
         {
             "outcome": "answer",
             "claims": [{"text": "Upgrade replicas first."}],
+            "citations": [],
             "message": "The evidence does not list every breaking change.",
         }
     )
     assert "does not list every breaking change" in limited
-    assert limited.endswith(f"_{slack_bot._MORE_HELP}_")
+    assert f"_{slack_bot._MORE_HELP}_" in limited
+    assert limited.endswith("_Checked 0 sources._")
     assert "Slack help channels" in slack_bot._MORE_HELP
+
+
+def test_a_comparison_written_as_labelled_segments_renders_one_line_per_side() -> None:
+    """ "9.0: ...; 9.1: ..." is two sides of a comparison; one bullet with both is hard to scan."""
+    text = "• 9.0: added hash field expiration; 9.1: added ACL roles and the JSON module."
+    lines = slack_bot._grouped(text).split("\n")
+    assert lines == [
+        "•",
+        "    ◦ *9.0:* added hash field expiration",
+        "    ◦ *9.1:* added ACL roles and the JSON module",
+    ]
+    clients = "• valkey-glide: supports HSETEX since 2.6; valkey-py: does not yet."
+    assert slack_bot._grouped(clients).count("    ◦ *") == 2
+    # One segment, a colon that is not a label, or an already itemized claim: untouched.
+    for plain in (
+        "• Note: this is one sentence; with a semicolon.",
+        "• In 9.0 we added expiration; in 9.1 roles.",
+        "• lead\n    ◦ #1 a\n    ◦ #2 b",
+    ):
+        assert slack_bot._grouped(plain) == plain
 
 
 def test_the_reply_is_assembled_whole_claim_by_whole_claim_under_the_slack_limit() -> None:
