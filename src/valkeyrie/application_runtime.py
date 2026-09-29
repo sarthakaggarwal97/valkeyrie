@@ -946,7 +946,10 @@ def _execute_plan(
             resolved_from_followup=plan.get("resolved_from_followup") is True,
             previous_answer=_plan_previous_answer(plan),
         )
-    except Exception:
+    except Exception as error:  # noqa: BLE001 - a model outage is a partial, not a crash
+        # Two production partials in a row carried this message and nothing else: the cause
+        # was unknowable after the fact. Type and message only; the evidence is not logged.
+        _LOG.warning("model call failed: %s: %s", type(error).__name__, str(error)[:300])
         return RuntimeResult(
             "partial",
             request_id,
