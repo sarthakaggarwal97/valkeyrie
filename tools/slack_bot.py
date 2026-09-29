@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import threading
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -408,10 +409,11 @@ def _format(result: dict[str, Any]) -> str:
         budget = MAX_REPLY_CHARS - len(sources) - len(tail) - 80
         rendered: list[str] = []
         used = 0
+        repository = _sole_repository(citations)
         for claim in claims:
             if not claim.get("text"):
                 continue
-            line = f"• {_plain(claim['text'])}"
+            line = f"• {_linked(_plain(claim['text']), repository)}"
             if rendered and used + len(line) > budget:
                 left = sum(1 for c in claims[claims.index(claim) :] if c.get("text"))
                 rendered.append(f"• _{left} more claim(s) did not fit in one Slack message._")
@@ -480,6 +482,54 @@ def _source_link(citation: str) -> str:
         # repo/path@commit -> repo/path, since the link carries the commit already.
         label = label.split("@", 1)[0]
     return f"<{url}|{_plain(label)}>"
+
+
+_REPOSITORY_IN_URL = re.compile(
+    r"https://(?:api\.)?github\.com/(?:repos/)?valkey-io/([A-Za-z0-9._-]+)"
+    r"|repo(?:%3A|:)valkey-io(?:%2F|/)([A-Za-z0-9._-]+)"
+)
+_REFERENCE = re.compile(
+    r"(?<![\w/#])#(\d{1,6})\b"  # #4797
+    r"|\b(run) (\d{4,12})\b"  # run 13052
+    r"|\b([0-9a-f]{40})\b"  # a full commit hash
+)
+
+
+def _sole_repository(citations: Sequence[str]) -> str | None:
+    """The one valkey-io repository every source names, or None when they name none or several.
+
+    Inline links are derived from the evidence's own repository, never guessed from the text: a
+    "#4797" in an answer grounded in valkey-glide must not link into valkey. When the sources
+    span repositories the numbers stay plain text, which is honest rather than wrong.
+    """
+    names: set[str] = set()
+    for citation in citations:
+        for match in _REPOSITORY_IN_URL.finditer(citation):
+            names.add(match.group(1) or match.group(2))
+    return names.pop() if len(names) == 1 else None
+
+
+def _linked(text: str, repository: str | None) -> str:
+    """Pull request and issue numbers, run ids and commit hashes as links into the repository.
+
+    A number a maintainer cannot click is a number they have to retype. GitHub redirects
+    /issues/N to /pull/N when N is a pull request, so one form serves both. A hash is shown
+    short with the full one in the link. Applied after escaping, so it never touches the model's
+    own text as markup; and only when the sources name exactly one repository.
+    """
+    if repository is None:
+        return text
+    base = f"https://github.com/valkey-io/{repository}"
+
+    def link(match: re.Match[str]) -> str:
+        if match.group(1):
+            return f"<{base}/issues/{match.group(1)}|#{match.group(1)}>"
+        if match.group(2):
+            return f"run <{base}/actions/runs/{match.group(3)}|{match.group(3)}>"
+        sha = match.group(4)
+        return f"<{base}/commit/{sha}|{sha[:10]}>"
+
+    return _REFERENCE.sub(link, text)
 
 
 def _plain(text: str) -> str:

@@ -2097,10 +2097,19 @@ def _issue_search(
     identities = [(item["repository"], item["number"]) for item in normalized]
     if len(identities) != len(set(identities)):
         raise LiveGitHubError("GitHub issue search contains duplicate items")
+    # The same search, on GitHub's own page, so the citation is somewhere a person can click.
+    # Only for a single repository: the allowlist admits github.com/valkey-io/<repo>/ paths and
+    # nothing wider, and a cross-repository search has no such page.
+    web_url = None
+    if repositories and len(repositories) == 1 and search_query:
+        page = "pulls" if kind == "pull-request" else "issues"
+        own = " ".join(part for part in search_query.split() if not part.startswith("repo:"))
+        web_url = f"{_WEB_ROOT}/{OWNER}/{repositories[0]}/{page}?{urlencode({'q': own})}"
     return {
         "api_version": _API_VERSION,
         "kind": "issue_search",
         "owner": OWNER,
+        "url": web_url,
         "repository": repositories[0] if repositories and len(repositories) == 1 else None,
         "repositories": list(repositories) if repositories else None,
         "terms": list(terms),
@@ -2457,6 +2466,8 @@ def _workflow_runs(
         "api_version": _API_VERSION,
         "kind": "workflow_runs",
         "repository": repository,
+        "url": f"{_WEB_ROOT}/{OWNER}/{repository}/actions?"
+        + urlencode({"query": f"branch:{branch}"}),
         "branch": branch,
         "per_page": per_page,
         "total_count": total,

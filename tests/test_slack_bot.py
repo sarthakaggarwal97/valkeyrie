@@ -330,3 +330,50 @@ def test_the_working_reaction_comes_off_even_when_answering_or_posting_fails(
             {**event, "ts": "2.0", "event_ts": "2.0"}, failing_say, client=object()
         )
     assert reactions == ["add", "remove"]
+
+
+def test_numbers_hashes_and_run_ids_become_links_into_the_one_repository_the_sources_name() -> None:
+    """A number a maintainer cannot click is a number they retype. Links are derived from the
+    evidence's own repository, never guessed: with sources in one repository they link there; with
+    none or several they stay plain text."""
+    one = [
+        "live GitHub issue observed 2026-09-29T00:00:00Z: https://github.com/valkey-io/valkey/pulls?q=is%3Apr"
+    ]
+    sha = "ae819a9419bb519f1cfbab04f2213899adf78e84"
+    base = "https://github.com/valkey-io/valkey"
+    text = slack_bot._linked(
+        slack_bot._plain(f"#4797 Forkless Full-Sync, run 13052 on {sha} & #4644"),
+        slack_bot._sole_repository(one),
+    )
+    assert text == (
+        f"<{base}/issues/4797|#4797> Forkless Full-Sync, "
+        f"run <{base}/actions/runs/13052|13052> on "
+        f"<{base}/commit/{sha}|{sha[:10]}> "
+        f"&amp; <{base}/issues/4644|#4644>"
+    )
+    # The repository is read from API, web and search-qualifier forms alike.
+    assert (
+        slack_bot._sole_repository(
+            ["x: https://api.github.com/repos/valkey-io/valkey-glide/actions/runs?branch=main"]
+        )
+        == "valkey-glide"
+    )
+    assert (
+        slack_bot._sole_repository(
+            ["x: https://api.github.com/search/issues?q=repo%3Avalkey-io%2Fvalkey-py+is%3Aissue"]
+        )
+        == "valkey-py"
+    )
+    # Several repositories, or none: no inline links, the text is untouched.
+    several = one + [
+        "valkey-glide/README.md@"
+        + "a" * 40
+        + ": https://github.com/valkey-io/valkey-glide/blob/a/README.md"
+    ]
+    assert slack_bot._sole_repository(several) is None
+    assert slack_bot._linked("#4797 and run 13052", None) == "#4797 and run 13052"
+    # A number inside a path or an anchor is not a reference.
+    assert (
+        slack_bot._linked("see src/commands/#12 or /pull/#13", "valkey")
+        == "see src/commands/#12 or /pull/#13"
+    )

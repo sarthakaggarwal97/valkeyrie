@@ -397,6 +397,7 @@ def test_issue_search_is_one_fixed_encoded_get_and_normalizes_complete_items() -
         "authors_of_listed": {"madolson": 2},
         "labels": [],
         "review": None,
+        "url": "https://github.com/valkey-io/valkey/issues?q=is%3Aissue+release+status",
         "finding": (
             'The search found 2 issues in valkey-io/valkey matching "release" and "status".'
         ),
@@ -2244,6 +2245,11 @@ def test_review_state_and_oldest_order_are_search_qualifiers_that_waive_the_term
     assert "sort=updated&order=desc" in calls[0]
     payload = _decoded(review)
     assert payload["review"] == "required"
+    # The citation points at the same search on GitHub's own page, without the repo: qualifier
+    # the page already implies, so a person can click through to the list.
+    assert payload["url"] == (
+        "https://github.com/valkey-io/valkey/pulls?q=is%3Apull-request+review%3Arequired"
+    )
     assert "awaiting review (no review yet)" in str(payload["finding"])
     assert "most recently updated are listed" in str(payload["finding"])
 
@@ -2324,6 +2330,7 @@ def test_workflow_runs_list_the_latest_on_a_branch_and_say_what_failed() -> None
     assert observation.object_type == "workflow_run"
     payload = _decoded(observation)
     assert payload["kind"] == "workflow_runs" and payload["total_count"] == 2500
+    assert payload["url"] == "https://github.com/valkey-io/valkey/actions?query=branch%3Aunstable"
     assert [r["name"] for r in cast(list[dict[str, object]], payload["runs"])] == [
         "Codecov",
         "CI",
