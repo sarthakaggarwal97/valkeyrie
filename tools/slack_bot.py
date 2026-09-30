@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from slack_bolt import App, Assistant
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -80,7 +81,17 @@ log = logging.getLogger("valkeyrie-slack")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import actions  # noqa: E402
 
-lambda_client = boto3.client("lambda", region_name="us-east-1")
+# The function may run for its full timeout when an answer chains several lookups. boto3's default
+# client gives up reading after 60 seconds and RETRIES the invoke with the same payload; the retry
+# reaches the runtime while the first invocation still holds the request lease, and the user gets
+# "request lease is still active" instead of the answer that lands seconds later. Reproduced on the
+# first sixty-plus-second answer. Read past the function's timeout, and never retry: the runtime's
+# own replay is the retry, and the question is not idempotent in time.
+lambda_client = boto3.client(
+    "lambda",
+    region_name="us-east-1",
+    config=Config(read_timeout=180, connect_timeout=20, retries={"max_attempts": 0}),
+)
 
 
 # A question takes twenty to forty seconds to answer, and for all that time the thread looked dead.
