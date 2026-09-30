@@ -501,3 +501,51 @@ def test_issue_and_pr_words_before_a_number_are_linked_and_long_claims_get_a_lea
     lines = slack_bot._led(one_sentence).split("\n")
     assert lines[0].startswith("• There are open fix PRs") and lines[0].endswith("crash-log tests")
     assert lines[1] == "    A search for open PRs matching fix test failure returned 217 results."
+
+
+def test_the_assistant_surface_answers_through_the_same_path_with_a_status_and_a_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message in Slack's AI panel needs no mention. It shows a status while working, answers
+    through the same _ask/_format path, titles a new conversation, and dedupes redeliveries."""
+    calls: dict[str, list[object]] = {"say": [], "status": [], "title": []}
+    monkeypatch.setattr(slack_bot, "_thread_history", lambda event, client: [])
+    monkeypatch.setattr(slack_bot, "_answered", {})
+    monkeypatch.setattr(
+        slack_bot,
+        "_ask",
+        lambda q, e, c=None: {
+            "outcome": "answer",
+            "claims": [{"text": f"Answer to: {q}"}],
+            "citations": [],
+        },
+    )
+    payload = {
+        "user": "U1",
+        "text": "What does HSET do?",
+        "ts": "9.0",
+        "channel": "D1",
+        "team": None,
+    }
+    slack_bot.answer_assistant_message(
+        payload,
+        lambda text=None, **kw: calls["say"].append(text),
+        lambda status: calls["status"].append(status),
+        lambda title: calls["title"].append(title),
+        client=object(),
+    )
+    assert calls["status"] == ["reading Valkey sources..."]
+    assert calls["title"] == ["What does HSET do?"]
+    assert calls["say"] and "Answer to: What does HSET do?" in str(calls["say"][0])
+    # A redelivery of the same event is answered once.
+    slack_bot.answer_assistant_message(
+        payload,
+        lambda **kw: calls["say"].append("again"),
+        lambda s: None,
+        lambda t: None,
+        client=object(),
+    )
+    assert "again" not in calls["say"]
+    # Suggested prompts are real questions the bot answers today.
+    assert all(p["message"].endswith("?") for p in slack_bot.SUGGESTED_PROMPTS)
+    assert len(slack_bot.SUGGESTED_PROMPTS) == 4

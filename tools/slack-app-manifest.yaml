@@ -1,0 +1,37 @@
+# The Slack app manifest additions Valkeyrie needs for the assistant surface. Apply in the Slack
+# app configuration (Features > App Manifest). Everything else about the app is unchanged; this
+# adds the Agents & AI Apps feature, the scopes it requires, and the events it delivers.
+#
+# What it buys: the bot appears in Slack's AI panel with suggested prompts, answers in DMs with no
+# mention, and shows a status line while it works. The mention path keeps working as before.
+features:
+  assistant_view:
+    assistant_description: >-
+      Answers questions about Valkey from its repositories and live GitHub state, with sources:
+      commands, configuration, governance, releases, CI, pull requests and what is happening.
+    suggested_prompts:
+      - title: What happened lately
+        message: What happened in Valkey in the last two weeks?
+      - title: Review queue
+        message: Which pull requests need review?
+      - title: CI on unstable
+        message: Why is CI failing on unstable? Are there fixes open already?
+      - title: A config option
+        message: What does maxmemory-policy do and what is its default?
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - assistant:write        # assistant panel: status, title, suggested prompts
+      - im:history             # read the DM the assistant conversation lives in
+      - channels:history       # thread history for follow-ups (already needed by the mention path)
+      - groups:history
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - assistant_thread_started
+      - assistant_thread_context_changed
+      - message.im
+  socket_mode_enabled: true

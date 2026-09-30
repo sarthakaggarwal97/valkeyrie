@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
-from slack_bolt import App
+from slack_bolt import App, Assistant
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 FUNCTION = "valkeyrie-development-application"
@@ -254,6 +254,81 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
     finally:
         _unreact(client, event, _WORKING)
     say(text=text, thread_ts=thread, unfurl_links=False)
+
+
+assistant = Assistant()
+
+SUGGESTED_PROMPTS = [
+    {"title": "What happened lately", "message": "What happened in Valkey in the last two weeks?"},
+    {"title": "Review queue", "message": "Which pull requests need review?"},
+    {
+        "title": "CI on unstable",
+        "message": "Why is CI failing on unstable? Are there fixes open already?",
+    },
+    {
+        "title": "A config option",
+        "message": "What does maxmemory-policy do and what is its default?",
+    },
+]
+
+
+@assistant.thread_started
+def greet_assistant_thread(say: Any, set_suggested_prompts: Any) -> None:
+    """The first thing a person sees in the assistant panel: what to ask, with examples."""
+    say(
+        "I answer questions about Valkey from its repositories and live GitHub state, with "
+        "sources. Ask about commands, configuration, governance, releases, CI, or what is "
+        "happening in the project."
+    )
+    set_suggested_prompts(prompts=SUGGESTED_PROMPTS)
+
+
+@assistant.user_message
+def answer_assistant_message(
+    payload: dict[str, Any], say: Any, set_status: Any, set_title: Any, client: Any
+) -> None:
+    """A message typed in the assistant panel or DM: the same answer path as a mention.
+
+    The status line is the progress signal a mention never had (the reactions scopes were never
+    granted); Slack clears it when the reply posts. The request id derives from the event the
+    same way, so a redelivery replays rather than re-infers.
+    """
+    if EXPECTED_TEAM and payload.get("team") not in {EXPECTED_TEAM, None}:
+        log.warning("ignoring assistant message from unexpected team %s", payload.get("team"))
+        return
+    if payload.get("bot_id") or payload.get("subtype"):
+        return
+    question = (payload.get("text") or "").strip()
+    if not question:
+        say("Ask me a Valkey question, for example: what is the TSC?")
+        return
+    if len(question.encode("utf-8")) > MAX_QUESTION_BYTES:
+        say(f"That is over my {MAX_QUESTION_BYTES // 1024} KB limit for one message.")
+        return
+    key = _event_key(payload)
+    with _answered_lock:
+        if key in _answered:
+            return
+        _answered[key] = True
+        while len(_answered) > MAX_ANSWERED_EVENTS:
+            _answered.pop(next(iter(_answered)))
+    set_status("reading Valkey sources...")
+    try:
+        conversation = _thread_history(payload, client)
+        started = time.monotonic()
+        result = _ask(question, payload, conversation)
+        text = _format(result, seconds=time.monotonic() - started)
+    except Exception:
+        log.exception("assistant answer failed")
+        say("Something went wrong answering that. The failure is logged.")
+        return
+    if not payload.get("thread_ts") or payload.get("thread_ts") == payload.get("ts"):
+        # The panel names each conversation; the question, cut short, is the natural title.
+        try:
+            set_title(question[:60])
+        except Exception as error:  # noqa: BLE001 - a title is decoration
+            log.debug("could not set assistant thread title (%s)", error)
+    say(text=text, unfurl_links=False)
 
 
 def _ask(
@@ -665,6 +740,12 @@ def main() -> None:
     # bot token fails at startup rather than on the first mention.
     app = App(token=os.environ["SLACK_BOT_TOKEN"], request_verification_enabled=False)
     app.event("app_mention")(answer_mention)
+    # The assistant surface: Slack's AI panel and DMs, with no mention needed, a visible status
+    # while the bot works, and suggested prompts for someone who has never used it. Same answer
+    # path behind it; only the way in differs. Needs the manifest's Agents & AI Apps feature and
+    # the assistant:write scope; without them Slack never sends these events and the mention
+    # path continues to work alone.
+    app.use(assistant)
     # A reaction on one of the bot's own answers is the only quality signal that comes from the
     # people asking rather than from expectations someone wrote down. Needs the reactions:read
     # scope and the reaction_added event subscription; without them no event arrives and nothing
