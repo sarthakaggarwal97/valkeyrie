@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -370,8 +371,12 @@ def run_runtime_event(
     root: Path,
     manifest: Mapping[str, object],
     completion_clock: Callable[[], str] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, object]:
     """Run one exact private action and return a bounded JSON-compatible value.
+
+    ``deadline`` is a ``time.monotonic()`` instant by which the answer must be complete. Lookup
+    rounds run only while a round fits before it. Callers that omit it get the fixed round bound.
 
     ``completion_clock`` supplies the instant a request finished. Callers that must reproduce a
     recorded run omit it, and the event's own ``completed_at`` is used, which is what every
@@ -398,6 +403,7 @@ def run_runtime_event(
             root=root,
             manifest=manifest,
             completion_clock=completion_clock,
+            deadline=deadline,
         )
     except (ApplicationRuntimeError, DraftingError) as error:
         result = RuntimeResult("error", request_id, str(error))
@@ -505,6 +511,7 @@ def _answer(
     root: Path,
     manifest: Mapping[str, object],
     completion_clock: Callable[[], str] | None = None,
+    deadline: float | None = None,
 ) -> RuntimeResult:
     expected = {
         "action",
@@ -590,6 +597,7 @@ def _answer(
             completed_at=completed_at,
             manifest=manifest,
             completion_clock=completion_clock,
+            deadline=deadline,
         )
 
     provisional = route_question(
@@ -840,6 +848,7 @@ def _answer(
             completed_at=completed_at,
             manifest=manifest,
             completion_clock=completion_clock,
+            deadline=deadline,
         )
     return _execute_plan(
         services,
@@ -849,6 +858,7 @@ def _answer(
         fence=1,
         completed_at=completed_at,
         completion_clock=completion_clock,
+        deadline=deadline,
     )
 
 
@@ -873,6 +883,7 @@ def _resume_existing(
     completed_at: str,
     manifest: Mapping[str, object],
     completion_clock: Callable[[], str] | None = None,
+    deadline: float | None = None,
 ) -> RuntimeResult:
     replayed = _replayed_result(item, request_digest, manifest, request_id=request_id)
     if replayed is not None:
@@ -904,6 +915,7 @@ def _resume_existing(
         fence=recovered_fence,
         completed_at=completed_at,
         completion_clock=completion_clock,
+        deadline=deadline,
     )
 
 
@@ -916,6 +928,7 @@ def _execute_plan(
     fence: int,
     completed_at: str,
     completion_clock: Callable[[], str] | None = None,
+    deadline: float | None = None,
 ) -> RuntimeResult:
     generation_id = _plan_generation_id(plan)
     # The date the retry's router sees is the one the first router saw, pinned in the plan. The
@@ -1020,7 +1033,8 @@ def _execute_plan(
         # request moved on without us and nothing further is written.
         recorded = plan.get("retry_attempted")
         rounds = int(recorded) if isinstance(recorded, (int, bool)) else 0
-        while rounds < MAX_RETRY_ROUNDS:
+        limit = MAX_RETRY_ROUNDS if deadline is None else MAX_RETRY_ROUNDS_WITH_DEADLINE
+        while rounds < limit and _room_for_a_round(deadline):
             if outcome == "abstention":
                 shortfall, generic, improving = message or "", True, False
             elif outcome == "answer" and message:
@@ -1545,10 +1559,15 @@ def _routed_evidence(
     return evidence, None, None, "live", question
 
 
-# How many times the answer may send the router back for more evidence. Each round is a router
-# call, up to six bounded reads, a plan revision and a model call, so two is the budget that
-# keeps the worst case inside the function timeout with room for the first pass.
+# How many times the answer may send the router back for more evidence. The real bound is TIME:
+# a round runs only while the deadline leaves room for it (a router call, bounded reads, a plan
+# revision, a model call: measured 20 to 25 s). The count is the safety net when no deadline is
+# supplied, as in tests and recorded runs; a live deployment passes the function's own deadline
+# so a chain of lookups ("A calls B, read B, B calls C, read C") can run as far as the time
+# allows and never past it. Every round must still ADD evidence or it does not run.
 MAX_RETRY_ROUNDS: Final = 2
+MAX_RETRY_ROUNDS_WITH_DEADLINE: Final = 6
+ROUND_SECONDS: Final = 25.0
 
 
 @dataclass(frozen=True)
@@ -1600,7 +1619,7 @@ def _retry_with_supplement(
     Controls are rechecked immediately before the second inference, as they are before the
     first.
     """
-    if rounds >= MAX_RETRY_ROUNDS:
+    if rounds >= MAX_RETRY_ROUNDS_WITH_DEADLINE:
         return None
     question = cast(str, plan["question"])
     queries = _shortfall_lookups(services, question, shortfall, today=today)
@@ -1672,6 +1691,11 @@ def _retry_with_supplement(
     # Whatever the model said this round comes back: an answer to adopt, or an abstention whose
     # reason is the NEXT round's shortfall. The loop decides what to keep.
     return _Retry(next_revision, revised, widened, output=output)
+
+
+def _room_for_a_round(deadline: float | None) -> bool:
+    """Whether a lookup round fits before the deadline (monotonic seconds), or always when none."""
+    return deadline is None or time.monotonic() + ROUND_SECONDS < deadline
 
 
 def _evidence_content_key(item: RuntimeEvidence) -> str:

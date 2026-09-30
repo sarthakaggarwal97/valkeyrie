@@ -44,9 +44,11 @@ def _run(monkeypatch: pytest.MonkeyPatch, event: dict[str, object]) -> tuple[dic
         root: object,
         manifest: object,
         completion_clock: object = None,
+        deadline: object = None,
     ) -> dict[str, object]:
         captured["request"] = request
         captured["completion_clock"] = completion_clock
+        captured["deadline"] = deadline
         return {"outcome": "answer", "claims": [], "citations": [], "generation_id": None}
 
     monkeypatch.setattr("infra.application_handler.run_runtime_event", fake_run)
@@ -183,9 +185,11 @@ def test_a_raw_runtime_event_is_not_treated_as_http(monkeypatch: pytest.MonkeyPa
         root: object,
         manifest: object,
         completion_clock: object = None,
+        deadline: object = None,
     ) -> dict[str, object]:
         captured["request"] = request
         captured["completion_clock"] = completion_clock
+        captured["deadline"] = deadline
         return {"outcome": "answer"}
 
     monkeypatch.setattr("infra.application_handler.run_runtime_event", fake_run)
@@ -195,3 +199,27 @@ def test_a_raw_runtime_event_is_not_treated_as_http(monkeypatch: pytest.MonkeyPa
 
     assert captured["request"] is raw, "the raw event must be passed through unchanged"
     assert "statusCode" not in result
+
+
+def test_the_deadline_comes_from_lambdas_own_clock_minus_a_reserve() -> None:
+    """Lookup rounds run only while a round fits before the function's deadline. Without a Lambda
+    context there is no deadline, and the fixed round bound applies."""
+    import time
+
+    from infra.application_handler import DEADLINE_RESERVE_SECONDS, _deadline
+
+    class Context:
+        def get_remaining_time_in_millis(self) -> int:
+            return 90_000
+
+    before = time.monotonic()
+    deadline = _deadline(Context())
+    assert deadline is not None
+    assert abs((deadline - before) - (90 - DEADLINE_RESERVE_SECONDS)) < 0.5
+    assert _deadline(object()) is None
+
+    class Broken:
+        def get_remaining_time_in_millis(self) -> int:
+            raise RuntimeError("no clock")
+
+    assert _deadline(Broken()) is None

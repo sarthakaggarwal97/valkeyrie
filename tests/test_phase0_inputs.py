@@ -368,7 +368,7 @@ def test_each_active_prompt_owns_its_required_boundary() -> None:
             "do not pad with adjacent facts the",
             "the first claim answers the question directly",
             "draws a conclusion from the others",
-            "keep a simple fact to 40 words or",
+            "one idea in\none sentence",
             "one exception for code",
             "one fence per claim at most",
             "do not restate the question",

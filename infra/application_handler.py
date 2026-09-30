@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -64,7 +65,28 @@ def handler(
         root=_ROOT,
         manifest=manifest,
         completion_clock=_completion_now,
+        deadline=_deadline(_context),
     )
+
+
+def _deadline(context: object) -> float | None:
+    """The instant this invocation must finish by, from Lambda's own clock, minus a reserve.
+
+    The reserve covers the completing write and the response; a round that would run past it is
+    not started. Without a Lambda context (a local caller) there is no deadline and the fixed
+    round bound applies.
+    """
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if not callable(remaining):
+        return None
+    try:
+        millis = int(remaining())
+    except Exception:  # noqa: BLE001 - a broken context means no deadline, not a crash
+        return None
+    return float(time.monotonic() + millis / 1000.0 - DEADLINE_RESERVE_SECONDS)
+
+
+DEADLINE_RESERVE_SECONDS = 8.0
 
 
 def _completion_now() -> str:

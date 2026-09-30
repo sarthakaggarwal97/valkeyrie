@@ -3899,3 +3899,86 @@ def test_an_english_question_answered_in_another_language_is_redrawn_once(
     )
     assert refused["outcome"] == "error" and len(stubborn.model_calls) == 2
     assert "En el momento" not in json.dumps(refused)
+
+
+def test_rounds_are_bounded_by_time_when_a_deadline_is_given_and_by_count_otherwise(
+    manifest: dict[str, object],
+) -> None:
+    """With a deadline, a round runs only if ROUND_SECONDS fit before it, up to a higher cap; a
+    deadline already too close runs no round at all. Without one, the fixed two-round cap holds."""
+    import time
+
+    from valkeyrie.application_runtime import (
+        MAX_RETRY_ROUNDS,
+        MAX_RETRY_ROUNDS_WITH_DEADLINE,
+        ROUND_SECONDS,
+        _room_for_a_round,
+    )
+    from valkeyrie.live_github import FileQuery
+
+    assert _room_for_a_round(None) is True
+    assert _room_for_a_round(time.monotonic() + ROUND_SECONDS * 2) is True
+    assert _room_for_a_round(time.monotonic() + ROUND_SECONDS / 2) is False
+
+    class Endless(FakeServices):
+        """Abstains forever, each time naming a different missing file, so every round adds."""
+
+        def route(self, *, system: str, question: str) -> str:
+            if "shortfall" not in question:
+                return '{"lookups":[{"kind":"corpus_search"}]}'
+            n = sum(1 for q in self.live_calls if isinstance(q, FileQuery))
+            return f'{{"lookups":[{{"kind":"file","repository":"valkey","path":"src/f{n}.c"}}]}}'
+
+        def read_live(self, query: object) -> LiveObservation:
+            self.live_calls.append(query)
+            if isinstance(query, FileQuery):
+                return _live_observation(
+                    kind="file",
+                    object_type="file",
+                    source_url=f"https://api.github.com/repos/valkey-io/valkey/contents/{query.path}",
+                    url=f"https://github.com/valkey-io/valkey/blob/unstable/{query.path}",
+                )
+            raise RuntimeError("search down")
+
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            self.model_calls.append(dict(kwargs))
+            n = len(self.model_calls)
+            return BedrockTextResponse(
+                _output("abstention", reason=f"The evidence does not include src/f{n}.c."),
+                "end_turn",
+            )
+
+    fixed = Endless()
+    fixed.router_reply = "unused"
+    run_runtime_event(
+        _event(request_id="req_rounds-fixed", question="trace expiry"),
+        fixed,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert len(fixed.model_calls) == 1 + MAX_RETRY_ROUNDS
+
+    timed = Endless()
+    timed.router_reply = "unused"
+    run_runtime_event(
+        _event(request_id="req_rounds-timed", question="trace expiry"),
+        timed,
+        root=ROOT,
+        manifest=manifest,
+        deadline=time.monotonic() + 3600,
+    )
+    # More rounds than the fixed cap, and fewer than the hard cap: the evidence package holds at
+    # most five live records, so the sixth file adds nothing after bounding and the chain stops.
+    assert MAX_RETRY_ROUNDS + 1 < len(timed.model_calls) <= 1 + MAX_RETRY_ROUNDS_WITH_DEADLINE
+    assert len(timed.model_calls) == 1 + 5
+
+    tight = Endless()
+    tight.router_reply = "unused"
+    run_runtime_event(
+        _event(request_id="req_rounds-tight", question="trace expiry"),
+        tight,
+        root=ROOT,
+        manifest=manifest,
+        deadline=time.monotonic() + 1,
+    )
+    assert len(tight.model_calls) == 1, "no round fits before a deadline one second away"

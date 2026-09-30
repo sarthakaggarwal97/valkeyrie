@@ -270,3 +270,36 @@
   question: give me a full java program to connect with valkey in cluster mode?
   expect: answer
   because: "Failed four ways: out of output tokens, a listing not a read, a 4 KB claim cap, and a code comment tripping a prose screen."
+
+- id: reason-trace-expiry
+  question: What happens when a key expires in Valkey? Trace the code path.
+  expect: answer
+  cites: src/expire.c
+  because: |
+    Reasoning over source. The router chains a code search for the symbol into file windows around
+    it, and the answer states the call path with each hop cited. Before the reasoning intents the
+    corpus alone gave prose about expiry with no path.
+
+- id: reason-ci-root-cause
+  question: Why did the most recent failed run on unstable fail, and which job and step broke?
+  expect: answer
+  cites: actions
+  because: |
+    Root cause from CI. The run listing carries the failing jobs and steps of its failed runs, so
+    the answer names them in one round instead of reporting that a run failed.
+
+- id: reason-pasted-info
+  question: |
+    Here is my INFO memory, what is wrong and what should I change?
+    used_memory:9663676416
+    maxmemory:10737418240
+    maxmemory_policy:noeviction
+    mem_fragmentation_ratio:1.83
+    active_defrag_running:0
+    evicted_keys:0
+  expect: answer
+  cites: valkey.conf
+  because: |
+    Diagnosis from pasted output. The paste is the asker's situation, not a search string: the
+    router reads valkey.conf around the options the metrics name and the answer relates the numbers
+    (fragmentation 1.83 with defrag off, 90% of maxmemory under noeviction) to the defaults.
