@@ -608,7 +608,7 @@ def _day(match: re.Match[str]) -> str:
     year, month, day = match.group(1), int(match.group(2)), int(match.group(3))
     if not 1 <= month <= 12:
         return match.group(0)
-    return f"{int(match.group(3))} {_MONTHS[month - 1]} {year}"
+    return f"{day} {_MONTHS[month - 1]} {year}"
 
 
 def _spoken(text: str) -> str:
