@@ -199,12 +199,12 @@ def test_a_source_is_labelled_by_what_it_is_and_the_commit_lives_in_the_link() -
         (
             "live GitHub release observed 2026-09-24T15:25:25Z: "
             "https://github.com/valkey-io/valkey/releases/tag/9.0.0",
-            "release (9.0.0)",
+            "release 9.0.0",
         ),
         (
             "live GitHub pull_request observed 2026-09-24T15:26:53Z: "
             "https://github.com/valkey-io/valkey/pull/3853",
-            "pull request (#3853)",
+            "PR #3853",
         ),
         (
             "live GitHub issue_search observed 2026-09-24T15:26:53Z: "
@@ -235,7 +235,7 @@ def test_a_complete_answer_ends_with_what_it_checked_and_only_a_limited_one_poin
         },
         seconds=12.4,
     )
-    assert answered.endswith("_Checked 1 source in 12s._")
+    assert answered.endswith("_Checked 1 source in 12 s._")
     assert "Slack help channels" not in answered
     limited = slack_bot._format(
         {
@@ -245,9 +245,10 @@ def test_a_complete_answer_ends_with_what_it_checked_and_only_a_limited_one_poin
             "message": "The evidence does not list every breaking change.",
         }
     )
-    assert "does not list every breaking change" in limited
-    assert f"_{slack_bot._MORE_HELP}_" in limited
-    assert limited.endswith("_Checked 0 sources._")
+    # The limitation is spoken as a person would say it, and the pointer rides on the footer.
+    assert "_I couldn't find every breaking change._" in limited
+    assert slack_bot._MORE_HELP in limited
+    assert "_Checked 0 sources. For more:" in limited
     assert "Slack help channels" in slack_bot._MORE_HELP
 
 
@@ -308,7 +309,7 @@ def test_the_reply_is_assembled_whole_claim_by_whole_claim_under_the_slack_limit
     }
     assert len(slack_bot._format(heavy)) < 40_000
     assert "more claim(s) did not fit" in text
-    assert "*Sources*" in text
+    assert "_Sources:_" in text
     # A normal answer is untouched.
     small = {
         **result,
@@ -482,9 +483,9 @@ def test_identical_source_lines_render_once() -> None:
 
 def test_a_file_read_at_a_release_tag_names_the_tag() -> None:
     live = "live GitHub file observed 2026-10-01T00:00:00Z: https://github.com/valkey-io/valkey/blob/{}/valkey.conf"
-    assert slack_bot._source_link(live.format("9.0.0")).endswith("|file (valkey.conf at 9.0.0)>")
-    assert slack_bot._source_link(live.format("a" * 40)).endswith("|file (valkey.conf)>")
-    assert slack_bot._source_link(live.format("HEAD")).endswith("|file (valkey.conf)>")
+    assert slack_bot._source_link(live.format("9.0.0")).endswith("|valkey.conf at 9.0.0 (live)>")
+    assert slack_bot._source_link(live.format("a" * 40)).endswith("|valkey.conf (live)>")
+    assert slack_bot._source_link(live.format("HEAD")).endswith("|valkey.conf (live)>")
 
 
 def test_board_and_directory_citations_are_labelled_by_what_they_are() -> None:
@@ -495,14 +496,14 @@ def test_board_and_directory_citations_are_labelled_by_what_they_are() -> None:
             "live GitHub controller_status observed 2026-10-01T00:00:00Z: "
             "https://github.com/orgs/valkey-io/projects/91"
         )
-        == "<https://github.com/orgs/valkey-io/projects/91|project board (91)>"
+        == "<https://github.com/orgs/valkey-io/projects/91|project board 91>"
     )
     assert (
         slack_bot._source_link(
             "live GitHub directory observed 2026-10-01T00:00:00Z: "
             "https://github.com/valkey-io/valkey/tree/HEAD/src/commands"
         )
-        == "<https://github.com/valkey-io/valkey/tree/HEAD/src/commands|directory (src/commands)>"
+        == "<https://github.com/valkey-io/valkey/tree/HEAD/src/commands|src/commands listing>"
     )
 
 
@@ -677,3 +678,114 @@ def test_the_assistant_surface_answers_through_the_same_path_with_a_status_and_a
     # Suggested prompts are real questions the bot answers today.
     assert all(p["message"].endswith("?") for p in slack_bot.SUGGESTED_PROMPTS)
     assert len(slack_bot.SUGGESTED_PROMPTS) == 4
+
+
+def test_prose_is_spoken_and_the_first_claim_leads() -> None:
+    """Rendered for a reader, not an auditor: the direct answer stands as a plain line above the
+    supporting bullets, dates read as dates, and the model's "at observation time" and "the
+    evidence" become the words a colleague would use. Code and Valkey names are untouched."""
+    spoken = slack_bot._spoken
+    assert spoken("At observation time, valkey had 559 open issues.") == (
+        "When I checked, valkey had 559 open issues."
+    )
+    assert spoken("It was merged on 2026-09-15T21:15:53Z and released 2026-10-01.") == (
+        "It was merged on 15 Sep 2026 and released 1 Oct 2026."
+    )
+    assert spoken("The evidence does not include the job logs.") == "I couldn't find the job logs."
+    assert spoken("The evidence contains no benchmark.") == "I found no benchmark."
+    assert spoken("The evidence covers only Valkey; it says nothing about X.") == (
+        "What I read covers only Valkey; it says nothing about X."
+    )
+    assert spoken("a decision the evidence cannot settle") == "a decision my reading cannot settle"
+    assert spoken("Given these facts, GT suits counters.") == "So GT suits counters."
+    # Not touched: a version, a login at sentence start, code, a date glued to other text.
+    assert spoken("madolson is the chair.") == "madolson is the chair."
+    assert spoken("Use 9.0.6 or 2026-09-01.x builds.") == "Use 9.0.6 or 2026-09-01.x builds."
+    assert spoken("```\n2026-09-15T21:15:53Z\n```") == "```\n2026-09-15T21:15:53Z\n```"
+
+    result = {
+        "outcome": "answer",
+        "claims": [
+            {"claim_id": "c1", "text": "The default is noeviction.", "evidence_ids": ["e1"]},
+            {"claim_id": "c2", "text": "Writes then fail with OOM.", "evidence_ids": ["e1"]},
+        ],
+        "citations": [
+            "valkey/valkey.conf@"
+            + "a" * 40
+            + ": https://github.com/valkey-io/valkey/blob/"
+            + "a" * 40
+            + "/valkey.conf"
+        ],
+    }
+    text = slack_bot._format(result, seconds=3.0)
+    lines = text.split("\n")
+    assert lines[0] == "The default is noeviction." and lines[1] == ""
+    assert lines[2] == "\u2022 Writes then fail with OOM."
+    assert "_Sources:_ <" in text and text.endswith("_Checked 1 source in 3 s._")
+    # One claim: a sentence, no bullet at all.
+    single = slack_bot._format({**result, "claims": result["claims"][:1]}, seconds=3.0)
+    assert single.startswith("The default is noeviction.\n\n_Sources:_")
+
+
+def test_a_long_enumeration_is_listed_and_a_long_two_thought_sentence_is_broken() -> None:
+    """Both from "what did 9.0 add": a 300-character sentence listing ten features is read down a
+    list, not across a paragraph; "X, so Y" over 220 characters is two thoughts on two lines."""
+    features = (
+        "New features in 9.0 include extended CLIENT command filtering, GEOSEARCH BYPOLYGON, "
+        "MPTCP support, TLS certificate-based automatic client authentication, valkey-cli "
+        "--hotkeys-count, the DELIFEQ command, dynamic modification of io-threads, SHUTDOWN SAFE, "
+        "negative client command filters, and an auto-failover-on-shutdown config."
+    )
+    lines = slack_bot._led(features).split("\n")
+    assert lines[0] == "• New features in 9.0 include" and len(lines) == 11
+    assert lines[1] == "    ◦ extended CLIENT command filtering" and lines[-1].endswith("config")
+    # Commas inside parentheses do not split an item.
+    scans = (
+        "Cluster additions include manual failover on shutdown, CLUSTER FLUSHSLOT, prefetching in "
+        "hashtable scan (SCAN, HSCAN, SSCAN, ZSCAN), cluster-manual-failover-timeout, and new "
+        "cluster-announce-client-(port|tls-port) configs, plus a bound on tracking eviction time."
+    )
+    assert "(SCAN, HSCAN, SSCAN, ZSCAN)" in slack_bot._led(scans)
+    # A noun that looks like a listing verb ("features") does not start the list early.
+    assert "    ◦ in 9.0 include" not in slack_bot._led(features)
+    cause = (
+        "The root cause it fixes is a stale fail report plus epoch-7 slot-claim gossip making a "
+        "demoting node freeze the event loop, so an unintended immediate failover left slot 609 "
+        "owned by the wrong node and cascading test failures followed."
+    )
+    broken = slack_bot._led(cause).split("\n")
+    assert len(broken) == 2 and broken[1].startswith("    So an unintended")
+    # A qualifier about the whole list follows it on its own line instead of posing as an item.
+    supported = (
+        "Currently supported versions and their initial releases are 9.1 (2026-05-19), "
+        "9.0 (2025-10-21), 8.1 (2025-03-31), 8.0 (2024-09-15), and 7.2 (2024-04-16), each with "
+        "maintenance and security end dates per the documented policy."
+    )
+    listed = slack_bot._led(supported).split("\n")
+    assert listed[1:6] == [
+        "    ◦ 9.1 (2026-05-19)",
+        "    ◦ 9.0 (2025-10-21)",
+        "    ◦ 8.1 (2025-03-31)",
+        "    ◦ 8.0 (2024-09-15)",
+        "    ◦ 7.2 (2024-04-16)",
+    ]
+    assert (
+        listed[6] == "    Each with maintenance and security end dates per the documented policy."
+    )
+    # A contrast stays whole.
+    contrast = (
+        "Sentinel provides high availability for non-clustered Valkey through external monitoring "
+        "processes that fail over a primary-replica group, while Valkey Cluster is a distributed "
+        "deployment mode that combines horizontal scaling by sharding with built-in failover."
+    )
+    assert slack_bot._led(contrast) == f"• {contrast}"
+
+
+def test_a_continuation_does_not_capitalize_a_lower_case_name() -> None:
+    assert slack_bot._sentence_case("mem_not_counted_for_evict shows it") == (
+        "mem_not_counted_for_evict shows it"
+    )
+    assert (
+        slack_bot._sentence_case("valkey-cli follows redirects") == "valkey-cli follows redirects"
+    )
+    assert slack_bot._sentence_case("so the backlog overflows") == "So the backlog overflows"

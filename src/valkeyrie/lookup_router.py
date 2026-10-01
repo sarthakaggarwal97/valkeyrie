@@ -222,6 +222,8 @@ ROUTER_SYSTEM: Final = (
     'since that day, least recently updated first: stale pull requests. "reviewed_by":"login" '
     "selects pull "
     "requests that user reviewed, for what someone has reviewed rather than authored. "
+    '"Which pull request added or introduced X" is a pull-request search for the terms of X '
+    'with "merged":true: the answer is a merged change, and an open search cannot contain it. '
     '"no_label":true selects items with no label at all: the triage queue. "base":"8.1" selects '
     'pull requests targeting that branch and "merged":true merged ones; "mentions_number":4534 '
     'selects items whose title or body names that number. A backport question ("was #4534 '

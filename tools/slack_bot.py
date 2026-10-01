@@ -492,28 +492,41 @@ def _format(result: dict[str, Any], *, seconds: float | None = None) -> str:
             # built here; the label is still escaped since it carries a path.
             # Two windows of the same file at the same commit render identically; one line.
             links = list(dict.fromkeys(_source_link(c) for c in citations))
-            sources = "\n\n*Sources*\n" + "\n".join(f"  {link}" for link in links)
+            labels = sum(len(_label_of(link)) for link in links)
+            if len(links) <= 3 and labels <= 120:
+                # A few short sources fit on one line; a heading over one link was three rows
+                # of chrome under a one-sentence answer.
+                sources = "\n\n_Sources:_ " + " \u00b7 ".join(links)
+            else:
+                sources = "\n\n_Sources_\n" + "\n".join(f"  {link}" for link in links)
         # A complete answer ends with what it checked. Only an answer with a stated limitation gets
         # the pointer to the human channels: on a complete one it was noise under every reply.
         checked = f"Checked {len(citations)} source{'s' if len(citations) != 1 else ''}" + (
-            f" in {seconds:.0f}s" if seconds is not None else ""
+            f" in {seconds:.0f} s" if seconds is not None else ""
         )
         tail = (
-            (f"\n\n_{_plain(message)}_" if message else "")
-            + (f"\n\n_{_MORE_HELP}_" if message else "")
-            + f"\n\n_{checked}._"
+            (f"\n\n_{_spoken(_plain(message))}_" if message else "")
+            + f"\n\n_{checked}."
+            + (f" {_MORE_HELP}" if message else "")
+            + "_"
         )
         budget = MAX_REPLY_CHARS - len(sources) - len(tail) - 80
         rendered: list[str] = []
         used = 0
         repository = _sole_repository(citations)
-        for claim in claims:
-            if not claim.get("text"):
-                continue
-            line = _grouped(_itemized(_led(_linked(_plain(claim["text"]), repository))))
+        texts = [c for c in claims if c.get("text")]
+        for position, claim in enumerate(texts):
+            body = _spoken(_linked(_plain(claim["text"]), repository))
+            if position == 0 and _is_a_lead(body, len(texts)):
+                # The first claim answers the question in one sentence (the prompt asks for
+                # exactly that). Set as a plain line, it reads as the answer; as the first of
+                # six identical bullets it read as one more fact.
+                line = body + ("\n" if len(texts) > 1 else "")
+            else:
+                line = _grouped(_itemized(_led(body)))
             if rendered and used + len(line) > budget:
-                left = sum(1 for c in claims[claims.index(claim) :] if c.get("text"))
-                rendered.append(f"• _{left} more claim(s) did not fit in one Slack message._")
+                left = len(texts) - position
+                rendered.append(f"\u2022 _{left} more claim(s) did not fit in one Slack message._")
                 break
             rendered.append(line)
             used += len(line) + 1
@@ -530,16 +543,142 @@ def _format(result: dict[str, Any], *, seconds: float | None = None) -> str:
         detail = _plain(message) if message else "Some evidence could not be retrieved."
         return f"{detail}\nI won't guess at the rest. Try asking without the live-status wording."
     if message:
-        return _plain(message)
+        # An abstention is the one reply with nothing to click; it gets the pointer to people.
+        return f"{_spoken(_plain(message))}\n\n_{_MORE_HELP}_"
     return f"I don't have grounded evidence for that ({outcome})."
 
 
 # Closing pointers. Short by design: a paragraph of boilerplate under every answer trains people to
 # stop reading the part that matters.
-_MORE_HELP = (
-    "For more than I can ground: ask in the Valkey Slack help channels, "
-    "open a GitHub Discussion in valkey-io, or read the topic pages on valkey.io."
+_MORE_HELP = "For more: the Valkey Slack help channels, GitHub Discussions, or valkey.io."
+
+# Spoken forms for the phrases the model writes from its instructions. "The evidence does not
+# include X" is true and reads like a form letter; "I couldn't find X" says the same thing the way
+# a colleague would. Only exact stems are rewritten, so nothing about Valkey itself is reworded.
+_SPOKEN: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bAt (?:the )?observation(?: time)?,?\s*"), "When I checked, "),
+    (re.compile(r"\bat (?:the )?observation time\b"), "when I checked"),
+    (
+        re.compile(r"\b[Aa]s of the (?:latest |last |most recent )?observation\b"),
+        "when I last checked",
+    ),
+    (re.compile(r"\b[Aa]s observed on (\d{4}-\d{2}-\d{2})\b"), r"when I checked on \1"),
+    (
+        re.compile(
+            r"^The (?:supplied |available |retrieved |provided )?evidence "
+            r"(?:does not|doesn\u2019t|doesn't) (?:include|contain|show|name|document|cover|list|"
+            r"state|specify|mention|identify|record|say)\b"
+        ),
+        "I couldn't find",
+    ),
+    (
+        re.compile(
+            r"^The (?:supplied |available |retrieved |provided )?evidence "
+            r"(?:contains|includes|shows|has|names|lists|offers|provides) no\b"
+        ),
+        "I found no",
+    ),
+    (
+        re.compile(r"\b[Gg]iven (?:the |this |all the )?(?:supplied |available )?evidence,?\s*"),
+        "From what I read, ",
+    ),
+    # Any other mention of "the evidence" is the model talking about its reading material; a
+    # person says "what I read" at the start of a sentence (singular, so a following "it" agrees)
+    # and "my reading" inside one ("a decision my reading cannot settle", "in my reading").
+    (
+        re.compile(
+            r"\bThe (?:supplied |available |retrieved |provided |cited )?evidence\b(?: here)?"
+        ),
+        "What I read",
+    ),
+    (
+        re.compile(
+            r"\bthe (?:supplied |available |retrieved |provided |cited )?evidence\b(?: here)?"
+        ),
+        "my reading",
+    ),
+    (re.compile(r"\bGiven these [a-z]+,?\s*"), "So "),
 )
+_ISO_INSTANT = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b")
+_ISO_DAY = re.compile(r"(?<![\w:/.-])(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?![\w:/-]|\.\w)")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _day(match: re.Match[str]) -> str:
+    year, month, day = match.group(1), int(match.group(2)), int(match.group(3))
+    if not 1 <= month <= 12:
+        return match.group(0)
+    return f"{int(match.group(3))} {_MONTHS[month - 1]} {year}"
+
+
+def _spoken(text: str) -> str:
+    """Prose as a person would say it: spoken stems, and dates as "15 Sep 2026" rather than
+    "2026-09-15T21:15:53Z". Code fences are left exactly as written."""
+    pieces = text.split("```")
+    for index in range(0, len(pieces), 2):
+        piece = pieces[index]
+        for pattern, replacement in _SPOKEN:
+            piece = pattern.sub(replacement, piece)
+        piece = _ISO_INSTANT.sub(_day, piece)
+        piece = _ISO_DAY.sub(_day, piece)
+        pieces[index] = piece
+    return "```".join(pieces)
+
+
+def _is_a_lead(body: str, count: int) -> bool:
+    """Whether the first claim can stand as the answer line: one sentence, not a list, short
+    enough to read at a glance. Otherwise it is rendered like the rest."""
+    if count == 1:
+        return True
+    if "\n" in body or len(body) > LEAD_MAX_CHARS:
+        return False
+    if len(_ITEM_REFERENCE.findall(body)) >= MIN_ITEMS_TO_LIST:
+        return False
+    return len(_SENTENCE_BREAK.split(body)) == 1
+
+
+def _live_label(kind: str, name: str, url: str) -> str:
+    """A live source named the way a person would point at it: "PR search: is:open fix test
+    failure" rather than "issue (PR search: is:open fix test failure)", "valkey.conf (live)" rather
+    than "file (valkey.conf)", "#3853" rather than "issue (#3853)"."""
+    if kind == "issue":
+        if name.startswith(("PR search:", "issue search:")):
+            return name.replace("PR search:", "PRs matching", 1).replace(
+                "issue search:", "issues matching", 1
+            )
+        return name or "issue"
+    if kind == "pull request":
+        return f"PR {name}" if name else "pull request"
+    if kind == "release":
+        return f"release {name}" if name else "releases"
+    if kind == "workflow run":
+        if name.startswith("runs "):
+            return f"workflow runs on {name.removeprefix('runs ').removeprefix('branch:')}"
+        return name or "workflow run"
+    if kind == "file":
+        return f"{name} (live)" if name else "file"
+    if kind == "directory":
+        if name in ("", "/"):
+            repository = re.search(r"github\.com/valkey-io/([^/]+)", url)
+            return f"{repository.group(1)} root listing" if repository else "root listing"
+        return f"{name} listing"
+    if kind == "compare":
+        return name or "compare"
+    if kind == "controller status":
+        return f"project board {name}" if name else "project board"
+    if kind == "generic":
+        if name.startswith("@"):
+            return f"{name}'s profile"
+        if name.endswith(" files"):
+            return f"files changed by {name.removesuffix(' files')}"
+        if "/commits/" in url:
+            return f"commits on {url.rsplit('/commits/', 1)[1]}"
+        return name or "GitHub"
+    return f"{kind} ({name})" if name else kind
+
+
+def _label_of(link: str) -> str:
+    return link.rsplit("|", 1)[-1].rstrip(">")
 
 
 def _names(url: str) -> str:
@@ -623,11 +762,7 @@ def _source_link(citation: str) -> str:
         return _plain(citation)
     if label.startswith("live GitHub"):
         kind = label.removeprefix("live GitHub").split(" observed ")[0].strip().replace("_", " ")
-        if kind == "generic":
-            kind = "GitHub"
-        if kind == "controller status":
-            kind = "project board"
-        label = f"{kind} ({_names(url)})" if _names(url) else kind
+        label = _live_label(kind, _names(url), url)
     else:
         # repo/path@commit -> repo/path, since the link carries the commit already.
         label = label.split("@", 1)[0]
@@ -761,10 +896,91 @@ def _led(text: str) -> str:
     clauses = [c.strip() for c in _CLAUSE_BREAK.split(text) if c.strip()]
     if len(clauses) >= 2:
         first, rest = clauses[0], clauses[1:]
-        return "\n".join(
-            [f"• {first}"] + [f"    {clause[0].upper()}{clause[1:]}" for clause in rest]
-        )
+        return "\n".join([f"• {first}"] + [f"    {_sentence_case(clause)}" for clause in rest])
+    enumerated = _enumerated(text)
+    if enumerated is not None:
+        return enumerated
+    # A long single sentence with a strong conjunction is two thoughts: "X, so Y", "X, while Y".
+    # The second starts its own indented line. Only when both halves are substantial.
+    for match in _STRONG_JOIN.finditer(text):
+        head, tail = text[: match.start()].rstrip(), text[match.end() :].strip()
+        if len(head) >= 60 and len(tail) >= 60:
+            return f"• {head}\n    {_sentence_case(match.group(1))} {tail}"
     return f"• {text}"
+
+
+# "while" and "whereas" are left joined: a contrast reads as one thought, split it reads as two.
+_STRONG_JOIN = re.compile(r",\s+(so|but|which means|although)\s+")
+_ENUMERATION_LEAD = re.compile(
+    r"^(.{3,160}?\b(?:includes?|including|such as|are|were|adds?|added|"
+    r"supports?|provides?|offers?|gained|brings?|comprises?)(?:\s+the\s+following)?:?)\s+"
+    r"(.{80,})$"
+)
+
+
+def _split_items(text: str) -> list[str]:
+    """Split on commas outside brackets and quotes; a final ", and X" is one more item."""
+    items: list[str] = []
+    depth = 0
+    current = []
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            items.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    items.append("".join(current))
+    cleaned = []
+    for item in items:
+        item = item.strip().rstrip(".")
+        item = re.sub(r"^(?:and|or)\s+", "", item)
+        if item:
+            cleaned.append(item)
+    return cleaned
+
+
+def _enumerated(text: str) -> str | None:
+    """ "New features in 9.0 include A, B, C, D, E, F, G and H." is a list a reader scans down,
+    not across. Five or more short items after a listing verb become sub-bullets. A sentence
+    whose items are long clauses, or that has a second sentence, is left alone."""
+    match = _ENUMERATION_LEAD.match(text.rstrip())
+    if match is None:
+        return None
+    lead, body = match.group(1), match.group(2)
+    if _SENTENCE_BREAK.search(body) or ";" in body:
+        return None
+    items = _split_items(body)
+    # "..., and 7.2 (16 Apr 2024), each with maintenance and security end dates" ends in a
+    # qualifier about the whole list, not one more item; it follows the list as a line of its own.
+    trailer = None
+    if len(items) >= 2 and _TRAILER.match(items[-1]):
+        trailer = items.pop()
+    if len(items) < 5 or any(len(item) > 70 or len(item) < 2 for item in items):
+        return None
+    lines = [f"• {lead.rstrip(':')}"] + [f"    \u25e6 {item}" for item in items]
+    if trailer:
+        lines.append(f"    {_sentence_case(trailer)}.")
+    return "\n".join(lines)
+
+
+def _sentence_case(text: str) -> str:
+    """Capitalize a continuation's first word unless it is a name that is spelled lower-case:
+    "mem_not_counted_for_evict in INFO memory" must not become "Mem_not_counted_for_evict"."""
+    first = text.split(" ", 1)[0]
+    if not first or not first[0].isalpha() or not first.isalpha():
+        return text
+    return text[0].upper() + text[1:]
+
+
+_TRAILER = re.compile(
+    r"^(?:each|all|both|plus|with|which|respectively|among others|and more|as well as|where|"
+    r"so|though|although|but|while|whereas|none of|most of|some of|many of)\b",
+    re.IGNORECASE,
+)
 
 
 def _grouped(text: str) -> str:
