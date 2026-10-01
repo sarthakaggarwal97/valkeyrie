@@ -456,6 +456,11 @@ def test_a_claim_enumerating_numbered_items_is_rendered_as_sub_bullets() -> None
     numbers = "It is stated to fix issues #4138, #4137, #4136, #4135, and #858."
     lines = slack_bot._itemized(f"• {numbers}").split("\n")
     assert lines == ["• It is stated to fix issues", "    ◦ #4138, #4137, #4136, #4135, #858"]
+    # The subject reference stays in the lead: "PR #4795 ... closing issues" is the bullet.
+    subject = "PR #4795 changes one test file, closing issues #4138, #4137, #4136, #4135 and #858."
+    lines = slack_bot._itemized(f"• {subject}").split("\n")
+    assert lines[0] == "• PR #4795 changes one test file, closing issues", lines
+    assert lines[1:] == ["    ◦ #4138, #4137, #4136, #4135, #858"], lines
     # A reference that completes the preceding words stays in its item. "re-enables the tests
     # disabled in #858" was split so that "#858" became a line of its own under "disabled in".
     production = (

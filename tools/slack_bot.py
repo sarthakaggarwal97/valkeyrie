@@ -665,6 +665,10 @@ def _itemized(text: str) -> str:
     ]
     if len(starts) < MIN_ITEMS_TO_LIST:
         return f"• {text}"
+    # "PR #4795 changes X, closing issues #1, #2, #3, #4": the first reference is the subject of
+    # the sentence, not an item. A lead of one or two words takes the first piece into itself.
+    if len(text[: starts[0]].split()) <= 2 and len(starts) > MIN_ITEMS_TO_LIST:
+        starts = starts[1:]
     lead = text[: starts[0]].strip()
     pieces = [text[a:b] for a, b in zip(starts, [*starts[1:], len(text)], strict=True)]
     items = [re.sub(r"[\s,;]*(?:\band\b)?[\s,;]*$", "", piece).rstrip(".") for piece in pieces]
