@@ -275,8 +275,11 @@ def _validated_https_url(value: object) -> str:
             or re.fullmatch(r"/users/[A-Za-z0-9-]{1,39}", parts.path) is not None
         )
     elif parts.netloc == "github.com":
-        allowed = parts.path.startswith("/valkey-io/") or parts.path.startswith(
-            "/orgs/valkey-io/projects/"
+        allowed = (
+            parts.path.startswith("/valkey-io/")
+            or parts.path.startswith("/orgs/valkey-io/projects/")
+            # A user's profile page, from the generic catalog's validated login.
+            or re.fullmatch(r"/[A-Za-z0-9-]{1,39}", parts.path) is not None
         )
     else:
         allowed = False

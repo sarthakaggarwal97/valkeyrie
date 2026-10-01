@@ -563,6 +563,16 @@ def _names(url: str) -> str:
         return path.split("/compare/", 1)[1]
     if "/commits/HEAD/" in path:
         return f"history of {path.split('/commits/HEAD/', 1)[1]}"
+    if "/commit/" in path:
+        return f"commit {path.rsplit('/', 1)[-1][:10]}"
+    if path.endswith("/files") and "/pull/" in path:
+        return f"#{path.split('/pull/', 1)[1].split('/', 1)[0]} files"
+    if path.endswith("/graphs/contributors"):
+        return "contributors"
+    if path.count("/") == 1 and not path.startswith("/valkey-io") and not parsed.query:
+        # A bare /login path is a user profile; github.com/search?q=... is not.
+        if path[1:] not in {"search", "features", "about", "pricing", "login"}:
+            return f"@{path[1:]}"
     parts = [part for part in path.split("/") if part]
     for marker, render in (
         ("tag", lambda rest: rest[0] if rest else ""),
@@ -592,6 +602,8 @@ def _source_link(citation: str) -> str:
         return _plain(citation)
     if label.startswith("live GitHub"):
         kind = label.removeprefix("live GitHub").split(" observed ")[0].strip().replace("_", " ")
+        if kind == "generic":
+            kind = "GitHub"
         label = f"{kind} ({_names(url)})" if _names(url) else kind
     else:
         # repo/path@commit -> repo/path, since the link carries the commit already.
@@ -636,7 +648,16 @@ def _itemized(text: str) -> str:
     lead = text[: starts[0]].strip()
     pieces = [text[a:b] for a, b in zip(starts, [*starts[1:], len(text)], strict=True)]
     items = [re.sub(r"[\s,;]*(?:\band\b)?[\s,;]*$", "", piece).rstrip(".") for piece in pieces]
-    lines = [f"• {lead}" if lead else "• The items:"] + [f"    ◦ {item}" for item in items]
+    # "#4442 and #4375 fixing the link failure" is two references sharing one description. Split
+    # at the references, the first became a bare number. A bare reference joins the next item so
+    # both numbers keep the words that were about them.
+    merged: list[str] = []
+    for item in items:
+        if merged and _ITEM_REFERENCE.fullmatch(merged[-1]):
+            merged[-1] = f"{merged[-1]} and {item}"
+        else:
+            merged.append(item)
+    lines = [f"• {lead}" if lead else "• The items:"] + [f"    ◦ {item}" for item in merged]
     return "\n".join(lines)
 
 

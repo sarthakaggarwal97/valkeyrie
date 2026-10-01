@@ -443,6 +443,14 @@ def test_a_claim_enumerating_numbered_items_is_rendered_as_sub_bullets() -> None
     itemized = slack_bot._itemized(f"• {prose}")
     assert itemized.split("\n")[1] == "    ◦ #1 first, then we waited"
     assert itemized.split("\n")[-1] == "    ◦ #4 fourth, and finally it merged"
+    # Two references sharing one description keep it: a bare number joins the next item.
+    shared = (
+        "Fixes include #4444 tolerating a fork failure, #4442 and #4375 fixing the link failure, "
+        "and #4292 the failure detector."
+    )
+    lines = slack_bot._itemized(f"• {shared}").split("\n")
+    assert "#4442 and #4375 fixing the link failure" in lines[2]
+    assert len(lines) == 4
     # A semicolon-joined list (the valkey-search answer's shape) also splits.
     semi = "#1472 Filtering improvements; #1365 Fix ThreadPool; #1397 Bug fix; #1400 Docs."
     assert slack_bot._itemized(f"• {semi}").count("    ◦ ") == 4

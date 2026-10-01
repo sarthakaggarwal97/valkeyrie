@@ -2483,8 +2483,10 @@ def _live_github_url(value: object) -> None:
             or parsed.path == "/graphql"
         )
     elif parsed.netloc == "github.com":
-        allowed = parsed.path.startswith("/valkey-io/") or parsed.path.startswith(
-            "/orgs/valkey-io/projects/"
+        allowed = (
+            parsed.path.startswith("/valkey-io/")
+            or parsed.path.startswith("/orgs/valkey-io/projects/")
+            or re.fullmatch(r"/[A-Za-z0-9-]{1,39}", parsed.path) is not None
         )
     else:
         allowed = False

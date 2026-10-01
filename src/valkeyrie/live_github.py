@@ -3000,6 +3000,16 @@ def _generic(
         ]
         kept["items_shown"] = len(cast(list[object], kept["items"]))
         kept["items_total_in_page"] = len(raw_items)
+    # A page a person can open, derived from the placeholders, so the citation is clickable.
+    repo = filled.get("repository")
+    web = {
+        "commit": f"{_WEB_ROOT}/{OWNER}/{repo}/commit/{filled.get('sha')}",
+        "pull_request_patch": f"{_WEB_ROOT}/{OWNER}/{repo}/pull/{filled.get('number')}/files",
+        "release_assets": f"{_WEB_ROOT}/{OWNER}/{repo}/releases/tag/{filled.get('ref')}",
+        "contributors": f"{_WEB_ROOT}/{OWNER}/{repo}/graphs/contributors",
+        "user": f"{_WEB_ROOT}/{filled.get('login')}",
+        "branch": f"{_WEB_ROOT}/{OWNER}/{repo}/tree/{filled.get('ref')}",
+    }.get(name)
     return {
         "api_version": _API_VERSION,
         "kind": "generic_read",
@@ -3007,6 +3017,7 @@ def _generic(
         "purpose": template.purpose,
         "placeholders": dict(filled),
         "source": url,
+        **({"url": web} if web else {}),
         **kept,
     }
 
