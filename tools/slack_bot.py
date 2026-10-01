@@ -911,10 +911,9 @@ def _led(text: str) -> str:
 
 # "while" and "whereas" are left joined: a contrast reads as one thought, split it reads as two.
 _STRONG_JOIN = re.compile(r",\s+(so|but|which means|although)\s+")
-_ENUMERATION_LEAD = re.compile(
-    r"^(.{3,160}?\b(?:includes?|including|such as|are|were|adds?|added|"
-    r"supports?|provides?|offers?|gained|brings?|comprises?)(?:\s+the\s+following)?:?)\s+"
-    r"(.{80,})$"
+_LISTING_VERB = re.compile(
+    r"\b(?:includes?|including|such as|are|were|adds?|added|supports?|provides?|offers?|gained|"
+    r"brings?|comprises?)(?:\s+the\s+following)?:?(?=\s)"
 )
 
 
@@ -947,24 +946,33 @@ def _enumerated(text: str) -> str | None:
     """ "New features in 9.0 include A, B, C, D, E, F, G and H." is a list a reader scans down,
     not across. Five or more short items after a listing verb become sub-bullets. A sentence
     whose items are long clauses, or that has a second sentence, is left alone."""
-    match = _ENUMERATION_LEAD.match(text.rstrip())
-    if match is None:
+    text = text.rstrip()
+    if _SENTENCE_BREAK.search(text) or ";" in text:
         return None
-    lead, body = match.group(1), match.group(2)
-    if _SENTENCE_BREAK.search(body) or ";" in body:
-        return None
-    items = _split_items(body)
-    # "..., and 7.2 (16 Apr 2024), each with maintenance and security end dates" ends in a
-    # qualifier about the whole list, not one more item; it follows the list as a line of its own.
-    trailer = None
-    if len(items) >= 2 and _TRAILER.match(items[-1]):
-        trailer = items.pop()
-    if len(items) < 5 or any(len(item) > 70 or len(item) < 2 for item in items):
-        return None
-    lines = [f"• {lead.rstrip(':')}"] + [f"    \u25e6 {item}" for item in items]
-    if trailer:
-        lines.append(f"    {_sentence_case(trailer)}.")
-    return "\n".join(lines)
+    # The first word that looks like a listing verb may be a noun ("Maintenance support and
+    # security support end dates are: ..."); every candidate is tried and the first that yields a
+    # clean list wins.
+    for verb in _LISTING_VERB.finditer(text):
+        lead, body = text[: verb.end()], text[verb.end() :].strip()
+        if not 3 <= len(lead) <= 160 or len(body) < 80:
+            continue
+        items = _split_items(body)
+        # "..., and 7.2 (16 Apr 2024), each with maintenance and security end dates" ends in a
+        # qualifier about the whole list, not one more item; it follows the list on its own line.
+        trailer = None
+        if len(items) >= 2 and _TRAILER.match(items[-1]):
+            trailer = items.pop()
+        if len(items) < 5 or any(len(item) > 70 or len(item) < 2 for item in items):
+            continue
+        if _LISTING_VERB.search(items[0]):
+            # The list starts at a later verb; this one was a noun ("security support end
+            # dates are: ...").
+            continue
+        lines = [f"• {lead.rstrip(':')}"] + [f"    \u25e6 {item}" for item in items]
+        if trailer:
+            lines.append(f"    {_sentence_case(trailer)}.")
+        return "\n".join(lines)
+    return None
 
 
 def _sentence_case(text: str) -> str:

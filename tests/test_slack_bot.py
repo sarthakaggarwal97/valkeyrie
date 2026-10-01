@@ -772,6 +772,16 @@ def test_a_long_enumeration_is_listed_and_a_long_two_thought_sentence_is_broken(
     assert (
         listed[6] == "    Each with maintenance and security end dates per the documented policy."
     )
+    # A noun that spells like a listing verb earlier in the sentence does not start the list.
+    dates = (
+        "Maintenance support and security support end dates are: 9.1 maintenance 19 May 2029 "
+        "and security 19 May 2031, 9.0 both 21 Oct 2028, 8.1 maintenance 31 Mar 2028 and "
+        "security 31 Mar 2030, 8.0 both 15 Sep 2027, 7.2 maintenance 16 Apr 2027 and security "
+        "16 Apr 2029."
+    )
+    rows = slack_bot._led(dates).split("\n")
+    assert rows[0] == "• Maintenance support and security support end dates are" and len(rows) == 6
+    assert rows[1] == "    ◦ 9.1 maintenance 19 May 2029 and security 19 May 2031"
     # A contrast stays whole.
     contrast = (
         "Sentinel provides high availability for non-clustered Valkey through external monitoring "
