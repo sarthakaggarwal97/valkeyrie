@@ -648,13 +648,20 @@ def _itemized(text: str) -> str:
     lead = text[: starts[0]].strip()
     pieces = [text[a:b] for a, b in zip(starts, [*starts[1:], len(text)], strict=True)]
     items = [re.sub(r"[\s,;]*(?:\band\b)?[\s,;]*$", "", piece).rstrip(".") for piece in pieces]
+
     # "#4442 and #4375 fixing the link failure" is two references sharing one description. Split
     # at the references, the first became a bare number. A bare reference joins the next item so
     # both numbers keep the words that were about them.
+    def bare(item: str) -> bool:
+        return all(_ITEM_REFERENCE.fullmatch(part.strip()) for part in item.split(","))
+
     merged: list[str] = []
     for item in items:
-        if merged and _ITEM_REFERENCE.fullmatch(merged[-1]):
-            merged[-1] = f"{merged[-1]} and {item}"
+        if merged and bare(merged[-1]):
+            # A bare reference followed by another bare reference is a list of numbers (nine fixed
+            # issues); joined with commas they are one line. Followed by text, it shares that text.
+            joiner = ", " if bare(item) else " and "
+            merged[-1] = f"{merged[-1]}{joiner}{item}"
         else:
             merged.append(item)
     lines = [f"• {lead}" if lead else "• The items:"] + [f"    ◦ {item}" for item in merged]

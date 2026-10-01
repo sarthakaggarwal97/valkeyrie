@@ -451,6 +451,10 @@ def test_a_claim_enumerating_numbered_items_is_rendered_as_sub_bullets() -> None
     lines = slack_bot._itemized(f"• {shared}").split("\n")
     assert "#4442 and #4375 fixing the link failure" in lines[2]
     assert len(lines) == 4
+    # A run of bare numbers is one line, not one line each.
+    numbers = "It is stated to fix issues #4138, #4137, #4136, #4135, and #858."
+    lines = slack_bot._itemized(f"• {numbers}").split("\n")
+    assert lines == ["• It is stated to fix issues", "    ◦ #4138, #4137, #4136, #4135, #858"]
     # A semicolon-joined list (the valkey-search answer's shape) also splits.
     semi = "#1472 Filtering improvements; #1365 Fix ThreadPool; #1397 Bug fix; #1400 Docs."
     assert slack_bot._itemized(f"• {semi}").count("    ◦ ") == 4
