@@ -1402,6 +1402,7 @@ def _directory(
             "path": path,
             "ref": ref,
             "is_file": True,
+            "url": _directory_web_url(repository, path, ref),
             "entries": [],
             "entry_count": 0,
             "exhaustive": True,
@@ -1435,6 +1436,7 @@ def _directory(
         "path": path,
         "ref": ref,
         "is_file": False,
+        "url": _directory_web_url(repository, path, ref),
         "entries": entries,
         "entry_count": len(items),
         # Whether the listing is the WHOLE directory. A truncated listing that claimed to be
@@ -1445,6 +1447,13 @@ def _directory(
             + ("." if exhaustive else f", of which the first {len(entries)} are listed.")
         ),
     }
+
+
+def _directory_web_url(repository: str, path: str, ref: str | None) -> str:
+    """The page a person opens for a listing; the API url is what was read, not what to cite."""
+    segments = "/".join(quote(part, safe="") for part in path.split("/") if part)
+    base = f"{_WEB_ROOT}/{OWNER}/{repository}/tree/{quote(ref or 'HEAD', safe='')}"
+    return f"{base}/{segments}" if segments else base
 
 
 def _tree(

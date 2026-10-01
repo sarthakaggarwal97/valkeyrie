@@ -490,7 +490,9 @@ def _format(result: dict[str, Any], *, seconds: float | None = None) -> str:
         if citations:
             # Citations are application-authored from validated GitHub URLs, so the link markup is
             # built here; the label is still escaped since it carries a path.
-            sources = "\n\n*Sources*\n" + "\n".join(f"  {_source_link(c)}" for c in citations)
+            # Two windows of the same file at the same commit render identically; one line.
+            links = list(dict.fromkeys(_source_link(c) for c in citations))
+            sources = "\n\n*Sources*\n" + "\n".join(f"  {link}" for link in links)
         # A complete answer ends with what it checked. Only an answer with a stated limitation gets
         # the pointer to the human channels: on a complete one it was noise under every reply.
         checked = f"Checked {len(citations)} source{'s' if len(citations) != 1 else ''}" + (
@@ -565,6 +567,12 @@ def _names(url: str) -> str:
         return f"history of {path.split('/commits/HEAD/', 1)[1]}"
     if "/commit/" in path:
         return f"commit {path.rsplit('/', 1)[-1][:10]}"
+    if "/orgs/valkey-io/projects/" in path:
+        return path.rsplit("/", 1)[-1]
+    if "/tree/" in path:
+        # /valkey-io/valkey/tree/HEAD/src/commands -> src/commands
+        tail = path.split("/tree/", 1)[1].split("/", 1)
+        return tail[1] if len(tail) == 2 else "/"
     if path.endswith("/files") and "/pull/" in path:
         return f"#{path.split('/pull/', 1)[1].split('/', 1)[0]} files"
     if path.endswith("/graphs/contributors"):
@@ -604,6 +612,8 @@ def _source_link(citation: str) -> str:
         kind = label.removeprefix("live GitHub").split(" observed ")[0].strip().replace("_", " ")
         if kind == "generic":
             kind = "GitHub"
+        if kind == "controller status":
+            kind = "project board"
         label = f"{kind} ({_names(url)})" if _names(url) else kind
     else:
         # repo/path@commit -> repo/path, since the link carries the commit already.
@@ -671,7 +681,12 @@ def _itemized(text: str) -> str:
         return f"• {text}"
     # "PR #4795 changes X, closing issues #1, #2, #3, #4": the first reference is the subject of
     # the sentence, not an item. A lead of one or two words takes the first piece into itself.
-    if len(text[: starts[0]].split()) <= 2 and len(starts) > MIN_ITEMS_TO_LIST:
+    lead_words = text[: starts[0]].split()
+    if (
+        1 <= len(lead_words) <= 2
+        and lead_words[-1].lower().rstrip(":") in {"pr", "issue", "commit", "run", "request"}
+        and len(starts) > MIN_ITEMS_TO_LIST
+    ):
         starts = starts[1:]
     lead = text[: starts[0]].strip()
     pieces = [text[a:b] for a, b in zip(starts, [*starts[1:], len(text)], strict=True)]
@@ -704,7 +719,13 @@ MIN_GROUPS = 2
 
 
 # A sentence end followed by a capital letter or a link: where a long claim can break.
-_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+(?=[A-Z<])")
+# A sentence ends at . ! or ? followed by a capital, but not at an ellipsis: "'=== ... BUG REPORT
+# START'" is one quoted log line, and splitting it put "BUG REPORT START" on its own row.
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])(?<!\.\.\.)\s+(?=[A-Z<])")
+# "; " joins clauses, except when the semicolon ends an HTML entity: Slack text carries < > & as
+# &lt; &gt; &amp;, and "MAXBYTES &lt;bytes&gt; [LIMIT" split at "&gt;" left "&gt" broken on one row
+# and "[LIMIT" on the next.
+_CLAUSE_BREAK = re.compile(r"(?<!&lt)(?<!&gt)(?<!&amp)(?<!&quot)(?<!&#39); ")
 LEAD_MAX_CHARS = 220
 
 
@@ -721,7 +742,7 @@ def _led(text: str) -> str:
     if len(sentences) >= 2:
         return f"• {sentences[0]}\n    {sentences[1]}"
     # One long sentence: its semicolon-joined clauses are separate points and read as such.
-    clauses = [c.strip() for c in text.split("; ") if c.strip()]
+    clauses = [c.strip() for c in _CLAUSE_BREAK.split(text) if c.strip()]
     if len(clauses) >= 2:
         first, rest = clauses[0], clauses[1:]
         return "\n".join(
@@ -739,7 +760,7 @@ def _grouped(text: str) -> str:
     if "\n" in text or not text.startswith("• "):
         return text
     body = text[2:]
-    segments = [s.strip() for s in body.split("; ") if s.strip()]
+    segments = [s.strip() for s in _CLAUSE_BREAK.split(body) if s.strip()]
     if len(segments) < MIN_GROUPS or not all(_GROUP_LABEL.match(s) for s in segments):
         return text
     lines = ["•"]

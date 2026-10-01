@@ -792,12 +792,14 @@ def test_a_project_artifact_may_be_called_the_source_of_truth() -> None:
     # Saying what the evidence does NOT include is a limitation, not an authority claim. This
     # sentence was drawn by the model for "who should review PR #4795" and refused, so the user
     # saw an error instead of the suggestions.
-    _screened_model_text(
+    for disclaimer in (
         "The evidence does not include CODEOWNERS or formal reviewer-assignment rules, so these "
         "are inferred suggestions, not an official assignment.",
-        "limitation",
-        4096,
-    )
+        # "Is Valkey faster than Redis" was refused on this one, and the user saw an error.
+        "The evidence includes no official head-to-head Valkey versus Redis benchmark results.",
+        "The sources contain no canonical statement of the release cadence.",
+    ):
+        _screened_model_text(disclaimer, "limitation", 4096)
     for refused in (
         "According to the canonical documentation, use HSET.",
         "The canonical source confirms this.",

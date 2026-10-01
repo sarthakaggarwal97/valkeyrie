@@ -2733,3 +2733,23 @@ def test_the_generic_reader_is_a_closed_catalog_with_typed_placeholders_and_a_fi
     items = cast(list[dict[str, object]], contributors["items"])
     assert len(items) == MAX_GENERIC_ITEMS and items[0] == {"login": "u0", "contributions": 100}
     assert contributors["items_shown"] == 50 and contributors["items_total_in_page"] == 60
+
+
+def test_a_directory_listing_cites_the_tree_page_not_the_api() -> None:
+    """The listing of src/commands was cited as api.github.com/.../contents/src/commands, a URL
+    that renders JSON in a browser. The payload carries the tree page as its url."""
+    from valkeyrie.live_github import DirectoryQuery
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        return _response(
+            [{"name": "get.json", "path": "src/commands/get.json", "type": "file", "size": 10}]
+        )
+
+    payload = _decoded(
+        read_live_github(
+            DirectoryQuery("valkey", "src/commands", None),
+            fetch=fetch,
+            observed_clock=lambda: OBSERVED,
+        )
+    )
+    assert payload["url"] == "https://github.com/valkey-io/valkey/tree/HEAD/src/commands"

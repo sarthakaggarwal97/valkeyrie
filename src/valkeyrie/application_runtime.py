@@ -1945,6 +1945,15 @@ def _evidence(
             continue
         seen.add(item.evidence_id)
         kept.append(item)
+    # Ten hierarchical parents of 7 KB each are 68 KB: measured for "compare cluster and Sentinel
+    # for high availability", where every retrieved parent was a long topic page. Refusing the
+    # package failed the whole question with a raw internal message. Retrieval is ranked, best
+    # first, so the records worth giving up are the last ones; shed from the tail until the bound
+    # holds, keeping at least the best record.
+    while (
+        sum(len(item.text.encode("utf-8")) for item in kept) > _MAX_EVIDENCE_BYTES and len(kept) > 1
+    ):
+        kept.pop()
     result = tuple(kept)
     if sum(len(item.text.encode("utf-8")) for item in result) > _MAX_EVIDENCE_BYTES:
         raise ApplicationRuntimeError("retrieval evidence exceeds its byte bound")

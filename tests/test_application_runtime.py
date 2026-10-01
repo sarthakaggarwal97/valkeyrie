@@ -3982,3 +3982,31 @@ def test_rounds_are_bounded_by_time_when_a_deadline_is_given_and_by_count_otherw
         deadline=time.monotonic() + 1,
     )
     assert len(tight.model_calls) == 1, "no round fits before a deadline one second away"
+
+
+def test_retrieval_over_the_byte_bound_sheds_its_weakest_records() -> None:
+    """Ten 7 KB hierarchical parents are 68 KB. The whole question used to fail with the raw
+    message "retrieval evidence exceeds its byte bound"; retrieval is ranked, so the tail goes."""
+    from valkeyrie.application_runtime import _MAX_EVIDENCE_BYTES, _evidence
+
+    records = tuple(
+        {
+            "text": f"{index:02d}" + "x" * 7_000,
+            "metadata": {
+                "generation_id": GENERATION,
+                "evidence_id": f"ev_{index:02d}",
+                "repository": "valkey-doc",
+                "path": f"topics/{index}.md",
+                "commit": COMMIT,
+                "authority": "canonical",
+                "version_scope": "unstable",
+                "content_digest": "sha256:" + "c" * 64,
+                "immutable_url": f"https://github.com/valkey-io/valkey-doc/blob/{COMMIT}/topics/{index}.md",
+            },
+        }
+        for index in range(10)
+    )
+    kept = _evidence(records, GENERATION)
+    assert 0 < len(kept) < 10
+    assert [item.evidence_id for item in kept] == [f"ev_{index:02d}" for index in range(len(kept))]
+    assert sum(len(item.text.encode()) for item in kept) <= _MAX_EVIDENCE_BYTES

@@ -417,6 +417,77 @@ def test_numbers_hashes_and_run_ids_become_links_into_the_one_repository_the_sou
     )
 
 
+def test_long_bullets_do_not_split_inside_entities_or_at_an_ellipsis() -> None:
+    """Three production bullets. Slack text carries < > & as entities, and "; " inside "&gt; " is
+    not a clause boundary; "=== ... BUG REPORT START" is one quoted line, not two sentences."""
+    xadd = (
+        "As proposed, XADD key MAXBYTES &lt;bytes&gt; [LIMIT &lt;count&gt;] trims the stream so "
+        "roughly at most &lt;bytes&gt; of listpack bytes remain, computed as the sum of lpBytes() "
+        "over the radix-tree nodes; it is a trimming threshold, not a memory cap."
+    )
+    led = slack_bot._led(xadd)
+    assert "&gt;\n" not in led and "&gt\n" not in led and "&lt;bytes&gt; [LIMIT" in led
+    assert led.count("\n") == 1, led  # the one real clause boundary still splits
+    pr = (
+        "The only matching pull request, open #47 AZAffinity &amp; AZAffinityReplicasAndPrimary "
+        "Implementation, makes an internal HELLO 3 call during initialization to retrieve the "
+        "availabilityZone, rather than adding general RESP3 support."
+    )
+    assert "&amp\n" not in slack_bot._led(pr)
+    crash = (
+        "Include the full crash report from the server log, cutting and pasting everything from "
+        "the line '=== ... BUG REPORT START: Cut &amp; paste starting from here ===' to "
+        "'=== ... REPORT END. Make sure to include from START to END. ===' ."
+    )
+    assert "...\n" not in slack_bot._led(crash)
+
+
+def test_a_two_word_list_lead_keeps_its_first_item_in_the_list() -> None:
+    """ "They are #3645 fix..., #4424 ..." listed eight items under a lead that had swallowed the
+    first; only a lead naming the TYPE of the first reference ("PR #4795 ...") takes it."""
+    listing = (
+        "They are #3645 fix module writes, #4424 resolve slot, #4567 fix benchmark, "
+        "#4754 compressed preambles, #4759 inline parser."
+    )
+    lines = slack_bot._itemized(f"• {listing}").split("\n")
+    assert lines[0] == "• They are" and lines[1].startswith("    ◦ #3645 fix module writes"), lines
+
+
+def test_identical_source_lines_render_once() -> None:
+    url = "https://github.com/valkey-io/valkey/blob/" + "a" * 40 + "/src/blocked.c"
+    result = slack_bot._format(
+        {
+            "outcome": "answer",
+            "claims": [{"claim_id": "c1", "text": "A claim.", "evidence_ids": ["e1"]}],
+            "citations": [
+                f"valkey/src/blocked.c@{'a' * 40}: {url}",
+                f"valkey/src/blocked.c@{'a' * 40}: {url}",
+            ],
+        },
+        seconds=1.0,
+    )
+    assert result.count("src/blocked.c>") == 1, result
+
+
+def test_board_and_directory_citations_are_labelled_by_what_they_are() -> None:
+    """A project board cited as "controller status" and a listing cited by its API URL were both
+    read in production; the label is what a person would call it, the link a page they can open."""
+    assert (
+        slack_bot._source_link(
+            "live GitHub controller_status observed 2026-10-01T00:00:00Z: "
+            "https://github.com/orgs/valkey-io/projects/91"
+        )
+        == "<https://github.com/orgs/valkey-io/projects/91|project board (91)>"
+    )
+    assert (
+        slack_bot._source_link(
+            "live GitHub directory observed 2026-10-01T00:00:00Z: "
+            "https://github.com/valkey-io/valkey/tree/HEAD/src/commands"
+        )
+        == "<https://github.com/valkey-io/valkey/tree/HEAD/src/commands|directory (src/commands)>"
+    )
+
+
 def test_a_claim_enumerating_numbered_items_is_rendered_as_sub_bullets() -> None:
     """Twenty "#N title" items joined by commas is a paragraph no one can scan; four or more become
     one line each. Fewer, or prose between them, stay exactly as written."""

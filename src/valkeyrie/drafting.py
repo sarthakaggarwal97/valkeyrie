@@ -180,7 +180,9 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             # the review-suggestion answer to "I couldn't produce a reliable answer".
             r"\b(?:this|the|my|our)\s+(?:supplied\s+|retrieved\s+|provided\s+|cited\s+)?"
             r"(?:evidence|context|sources?|documents?|records?)\b"
-            r"(?!\s+(?:does|do|did)\s+not\b|\s+(?:lacks?|omits?|has\s+no|have\s+no)\b)[^.;:!?]*"
+            r"(?!\s+(?:does|do|did)\s+not\b|\s+(?:lacks?|omits?)\b"
+            r"|\s+(?:has|have|includes?|contains?|shows?|names?|offers?|provides?)\s+no\b)"
+            r"[^.;:!?]*"
             r"\b(?:canonical|authoritative|official|source\s+of\s+truth)\b"
             r"|\b(?:canonical|authoritative|official)\b[^.;:!?]*"
             r"\b(?:supplied|retrieved|provided|cited)\s+(?:evidence|context|sources?)\b"
