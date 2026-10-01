@@ -174,8 +174,13 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             # library" and "the command JSON is the authoritative reference for arity" are facts
             # about Valkey, and "according to valkey.conf, the default is no" is ordinary
             # attribution: all three were refused, and the user lost the answer entirely.
+            # A limitation that says what the evidence does NOT include is about what is missing,
+            # not about authority: "the evidence does not include CODEOWNERS, so these are
+            # inferred suggestions, not an official assignment" was refused, and the user lost
+            # the review-suggestion answer to "I couldn't produce a reliable answer".
             r"\b(?:this|the|my|our)\s+(?:supplied\s+|retrieved\s+|provided\s+|cited\s+)?"
-            r"(?:evidence|context|sources?|documents?|records?)\b[^.;:!?]*"
+            r"(?:evidence|context|sources?|documents?|records?)\b"
+            r"(?!\s+(?:does|do|did)\s+not\b|\s+(?:lacks?|omits?|has\s+no|have\s+no)\b)[^.;:!?]*"
             r"\b(?:canonical|authoritative|official|source\s+of\s+truth)\b"
             r"|\b(?:canonical|authoritative|official)\b[^.;:!?]*"
             r"\b(?:supplied|retrieved|provided|cited)\s+(?:evidence|context|sources?)\b"

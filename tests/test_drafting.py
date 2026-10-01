@@ -789,10 +789,21 @@ def test_a_project_artifact_may_be_called_the_source_of_truth() -> None:
         "The command JSON is the authoritative reference for command arity.",
     ):
         _screened_model_text(allowed_role, "claim text", 4096)
+    # Saying what the evidence does NOT include is a limitation, not an authority claim. This
+    # sentence was drawn by the model for "who should review PR #4795" and refused, so the user
+    # saw an error instead of the suggestions.
+    _screened_model_text(
+        "The evidence does not include CODEOWNERS or formal reviewer-assignment rules, so these "
+        "are inferred suggestions, not an official assignment.",
+        "limitation",
+        4096,
+    )
     for refused in (
         "According to the canonical documentation, use HSET.",
         "The canonical source confirms this.",
         "This evidence is the authoritative source for the answer.",
+        "The evidence here is official.",
+        "Our sources include the official documentation, so this is settled.",
     ):
         with pytest.raises(DraftingError, match="source-authority declaration"):
             _screened_model_text(refused, "claim text", 4096)

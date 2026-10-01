@@ -455,6 +455,9 @@ def test_a_claim_enumerating_numbered_items_is_rendered_as_sub_bullets() -> None
     numbers = "It is stated to fix issues #4138, #4137, #4136, #4135, and #858."
     lines = slack_bot._itemized(f"• {numbers}").split("\n")
     assert lines == ["• It is stated to fix issues", "    ◦ #4138, #4137, #4136, #4135, #858"]
+    # The renderer sees the LINKED form, which is what reached Slack as nine one-number lines.
+    linked = slack_bot._itemized("• " + slack_bot._linked(numbers, "valkey")).split("\n")
+    assert len(linked) == 2 and linked[1].count("|#") == 5
     # A semicolon-joined list (the valkey-search answer's shape) also splits.
     semi = "#1472 Filtering improvements; #1365 Fix ThreadPool; #1397 Bug fix; #1400 Docs."
     assert slack_bot._itemized(f"• {semi}").count("    ◦ ") == 4

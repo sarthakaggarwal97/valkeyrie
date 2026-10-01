@@ -627,6 +627,9 @@ _REFERENCE = re.compile(
 
 
 _ITEM_REFERENCE = re.compile(r"(?<![\w/])(?:<[^|>]+\|)?#\d{1,6}\b")
+# The same reference including a link's closing marker, for deciding whether an item is ONLY
+# references.
+_WHOLE_REFERENCE = re.compile(r"(?<![\w/])(?:<[^|>]+\|#\d{1,6}>|#\d{1,6}\b)")
 MIN_ITEMS_TO_LIST = 4
 
 
@@ -653,7 +656,8 @@ def _itemized(text: str) -> str:
     # at the references, the first became a bare number. A bare reference joins the next item so
     # both numbers keep the words that were about them.
     def bare(item: str) -> bool:
-        return all(_ITEM_REFERENCE.fullmatch(part.strip()) for part in item.split(","))
+        # Only references and separators: "#4138", "<url|#4138>", "#4138, #4137".
+        return bool(item.strip()) and not _WHOLE_REFERENCE.sub("", item).strip(" ,").strip()
 
     merged: list[str] = []
     for item in items:
