@@ -634,6 +634,9 @@ _WHOLE_REFERENCE = re.compile(r"(?<![\w/])(?:<[^|>]+\|#\d{1,6}>|#\d{1,6}\b)")
 _LIST_SEPARATOR_BEFORE = re.compile(
     r"(?:^|[,;:]|\band\b|\bor\b|\binclud(?:e|es|ing)|\bissues|\bfixes)\s*$"
 )
+# Text right after a reference that continues into another: "tracked in #4138, #4137" is a list
+# even though its first reference follows a preposition.
+_BEGINS_A_LIST = re.compile(r">?\s*(?:,|\band\b|\bor\b)\s*(?:<[^|>]+\|)?#\d")
 # Text ending in a preposition the reference completes ("disabled in #", "the fix from PR #").
 _COMPLETES_PHRASE_BEFORE = re.compile(
     r"\b(?:in|from|by|of|to|at|for|with|see|than|under|via)\s*(?:PR|pull request|issue)?\s*$",
@@ -661,6 +664,7 @@ def _itemized(text: str) -> str:
         m.start()
         for m in _ITEM_REFERENCE.finditer(text)
         if _LIST_SEPARATOR_BEFORE.search(text[: m.start()])
+        or _BEGINS_A_LIST.match(text[m.end() :])
         or not _COMPLETES_PHRASE_BEFORE.search(text[: m.start()])
     ]
     if len(starts) < MIN_ITEMS_TO_LIST:

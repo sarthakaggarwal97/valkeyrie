@@ -461,6 +461,15 @@ def test_a_claim_enumerating_numbered_items_is_rendered_as_sub_bullets() -> None
     lines = slack_bot._itemized(f"• {subject}").split("\n")
     assert lines[0] == "• PR #4795 changes one test file, closing issues", lines
     assert lines[1:] == ["    ◦ #4138, #4137, #4136, #4135, #858"], lines
+    # After a preposition, a reference that begins a list still starts the items.
+    tracked = "The PR fixes cascading failures tracked in #4138, #4137, #4136, #4135 and #858."
+    lines = slack_bot._itemized(f"• {tracked}").split("\n")
+    assert lines == [
+        "• The PR fixes cascading failures tracked in",
+        "    ◦ #4138, #4137, #4136, #4135, #858",
+    ]
+    linked_tracked = slack_bot._itemized("• " + slack_bot._linked(tracked, "valkey")).split("\n")
+    assert linked_tracked[0] == "• The PR fixes cascading failures tracked in", linked_tracked
     # A reference that completes the preceding words stays in its item. "re-enables the tests
     # disabled in #858" was split so that "#858" became a line of its own under "disabled in".
     production = (
