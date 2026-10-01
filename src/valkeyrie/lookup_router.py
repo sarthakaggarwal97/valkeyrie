@@ -159,7 +159,7 @@ ROUTER_SYSTEM: Final = (
         f"{name} ({', '.join(f'{k}:{v}' for k, v in tpl.kinds.items())}) for {tpl.purpose}"
         for name, tpl in GENERIC_TEMPLATES.items()
     )
-    + ". Use pull_request_patch when asked what a pull request changes or "
+    + ". Use pull_request_patch when asked what a pull request changes, which files it touches, or "
     "whether a change is safe; commit for a hash the asker names; contributors for who "
     "contributes most overall; user for who a person is; release_assets for download sizes and "
     "counts.\n"
@@ -216,7 +216,9 @@ ROUTER_SYSTEM: Final = (
     '"approved", or "changes_requested" selects by review state, and it waives the terms: "which '
     'pull requests need review" is scope pull-request with review required and state open. An '
     'optional "order":"oldest" lists the earliest-created first, for which issues or pull '
-    'requests have been open the longest. "updated_before":"YYYY-MM-DD" selects items not touched '
+    'requests have been open the longest, and "order":"newest" the most recently created '
+    'first, for "the latest five issues" (without it a search is ranked by best match, not by '
+    'date). "updated_before":"YYYY-MM-DD" selects items not touched '
     'since that day, least recently updated first: stale pull requests. "reviewed_by":"login" '
     "selects pull "
     "requests that user reviewed, for what someone has reviewed rather than authored. "
@@ -432,6 +434,30 @@ def validate_conversation(conversation: object) -> tuple[ConversationTurn, ...]:
     return tuple(accepted)
 
 
+def _dated_anchors(today: str) -> str:
+    """Today and the days a relative phrase means, worked out here rather than by the model.
+
+    "Which PRs merged yesterday" was routed as merged:2025-09-30..2025-09-30 on 2026-10-01: the
+    model took the month and day and lost the year. Every date a question is likely to need is
+    stated, so the router copies one instead of computing it.
+    """
+    from datetime import date, timedelta
+
+    day = date.fromisoformat(today)
+    month_start = day.replace(day=1)
+    last_month_end = month_start - timedelta(days=1)
+    return (
+        f"Today is {day.isoformat()} ({day.strftime('%A')}). Yesterday was "
+        f"{(day - timedelta(days=1)).isoformat()}. Seven days ago was "
+        f"{(day - timedelta(days=7)).isoformat()}, thirty days ago "
+        f"{(day - timedelta(days=30)).isoformat()}. "
+        f"This month began {month_start.isoformat()}; last month was "
+        f"{last_month_end.replace(day=1).isoformat()} to {last_month_end.isoformat()}. "
+        f"This year began {day.replace(month=1, day=1).isoformat()}. Copy these dates; do not "
+        f"compute others from memory."
+    )
+
+
 def _router_prompt(
     question: str,
     history: Sequence[ConversationTurn],
@@ -448,7 +474,7 @@ def _router_prompt(
     """
     # The date is a fact the model cannot know and a window needs; it travels beside the
     # question as data, never inside it.
-    dated = f"Today is {today}.\n{question}" if today else question
+    dated = f"{_dated_anchors(today)}\n{question}" if today else question
     if not history and shortfall is None:
         return dated
     document: dict[str, object] = {"current_question": question}
@@ -771,8 +797,8 @@ def _search(item: Mapping[str, object]) -> IssueSearchQuery | None:
     if review is not None and review not in {"required", "approved", "changes_requested"}:
         raise LookupRouterError("search review must be required, approved or changes_requested")
     order = item.get("order")
-    if order is not None and order != "oldest":
-        raise LookupRouterError("search order must be oldest")
+    if order is not None and order not in {"oldest", "newest"}:
+        raise LookupRouterError("search order must be oldest or newest")
     updated_before = _window_day(item.get("updated_before"))
     reviewed_by = item.get("reviewed_by")
     if reviewed_by is not None and (

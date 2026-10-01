@@ -469,6 +469,13 @@ def test_identical_source_lines_render_once() -> None:
     assert result.count("src/blocked.c>") == 1, result
 
 
+def test_a_file_read_at_a_release_tag_names_the_tag() -> None:
+    live = "live GitHub file observed 2026-10-01T00:00:00Z: https://github.com/valkey-io/valkey/blob/{}/valkey.conf"
+    assert slack_bot._source_link(live.format("9.0.0")).endswith("|file (valkey.conf at 9.0.0)>")
+    assert slack_bot._source_link(live.format("a" * 40)).endswith("|file (valkey.conf)>")
+    assert slack_bot._source_link(live.format("HEAD")).endswith("|file (valkey.conf)>")
+
+
 def test_board_and_directory_citations_are_labelled_by_what_they_are() -> None:
     """A project board cited as "controller status" and a listing cited by its API URL were both
     read in production; the label is what a person would call it, the link a page they can open."""

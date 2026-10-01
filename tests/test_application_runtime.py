@@ -2012,7 +2012,9 @@ def test_the_model_router_chooses_lookups_the_keyword_router_could_not(
     )
 
     # The router sees the event's day beside the question: a date window needs it.
-    assert services.route_calls == ["Today is 2026-08-19.\ndid anything happen with number 8"]
+    assert len(services.route_calls) == 1
+    assert services.route_calls[0].startswith("Today is 2026-08-19 (Wednesday).")
+    assert services.route_calls[0].endswith("\ndid anything happen with number 8")
     assert services.live_calls == [IssueQuery("valkey", 8)]
     # The keyword path was never consulted: no retrieval happened.
     assert services.retrieve_calls == []
@@ -2194,7 +2196,8 @@ def test_conversation_is_optional_and_bounded_at_the_event_boundary(
     assert (
         run_runtime_event(_event(), services, root=ROOT, manifest=manifest)["outcome"] == "answer"
     )
-    assert services.route_calls[0] == "Today is 2026-08-19.\n" + str(_event()["question"])
+    assert services.route_calls[0].startswith("Today is 2026-08-19 (Wednesday).")
+    assert services.route_calls[0].endswith("\n" + str(_event()["question"]))
 
     # Malformed history is refused at the boundary, not silently accepted.
     for bad in (
@@ -2254,7 +2257,8 @@ def test_a_failed_answer_is_replayable_on_redelivery(manifest: dict[str, object]
     second = run_runtime_event(_event(), services, root=ROOT, manifest=manifest)
     assert second["outcome"] == "error"
     assert second["message"] == first["message"]
-    assert len(services.model_calls) == 1
+    # Two draws: a rejected first draw is redrawn once, and the second was rejected too.
+    assert len(services.model_calls) == 2
 
 
 class _AbstainsUntilGitHub(FakeServices):
@@ -3253,6 +3257,11 @@ def test_a_question_about_this_service_is_answered_by_the_application(
         "What are your capabilities?",
         "hi, what can you do?",
         "what kind of questions can I ask?",
+        # From the sweep: each had gone to the model and come back as a deflection.
+        "What sources do you use to answer?",
+        "Who built you?",
+        "Are your answers up to date?",
+        "How current is your information?",
     ):
         services = FakeServices()
         result = run_runtime_event(
@@ -3272,6 +3281,8 @@ def test_a_question_about_this_service_is_answered_by_the_application(
         "what support does valkey-glide provide for RESP3?",
         "who are the maintainers?",
         "what can Valkey do in caching?",
+        "Who built the hashtable?",
+        "Are the docs up to date for 9.0?",
     ):
         result = run_runtime_event(
             _event(
@@ -3472,7 +3483,7 @@ def test_an_abstention_names_its_shortfall_and_the_router_supplies_the_missing_l
     assert second["current_question"] == "what is the default of repl-diskless-sync?"
     # The date the FIRST router saw (event now), pinned in the plan, not completed_at.
     assert second["today"] == "2026-08-19"
-    assert services.route_calls[0].startswith("Today is 2026-08-19.")
+    assert services.route_calls[0].startswith("Today is 2026-08-19 (Wednesday).")
     assert cast(dict[str, object], services.requests["req_shortfall-1"]["plan"])["routed_on"] == (
         "2026-08-19"
     )
@@ -4010,3 +4021,65 @@ def test_retrieval_over_the_byte_bound_sheds_its_weakest_records() -> None:
     assert 0 < len(kept) < 10
     assert [item.evidence_id for item in kept] == [f"ev_{index:02d}" for index in range(len(kept))]
     assert sum(len(item.text.encode()) for item in kept) <= _MAX_EVIDENCE_BYTES
+
+
+def test_any_rejected_first_draw_is_redrawn_once(manifest: dict[str, object]) -> None:
+    """Two production errors from one sweep: a draw whose claim object carried "evidence_ids"
+    twice, and a draw whose limitation tripped a screen. Each is a draw, not a plan; the next
+    draw answered. One redraw for any rejection; a second rejection is final."""
+
+    class DuplicateKeyFirst(FakeServices):
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            self.model_calls.append(dict(kwargs))
+            evidence = cast(tuple[RuntimeEvidence, ...], kwargs["evidence"])
+            eid = evidence[0].evidence_id
+            if len(self.model_calls) == 1:
+                text = (
+                    '{"outcome":"answer","claims":[{"claim_id":"c1","text":"Dual channel is off '
+                    f'by default.","evidence_ids":["{eid}"],"evidence_ids":["{eid}"]}}],'
+                    '"limitation":null}'
+                )
+                return BedrockTextResponse(text, "end_turn")
+            return BedrockTextResponse(
+                _output(
+                    "answer",
+                    [{"claim_id": "c1", "text": "It is off by default.", "evidence_ids": [eid]}],
+                ),
+                "end_turn",
+            )
+
+    services = DuplicateKeyFirst()
+    result = run_runtime_event(
+        _event(request_id="req_redraw-1", question="Is dual channel replication on by default?"),
+        services,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert result["outcome"] == "answer" and len(services.model_calls) == 2
+
+    class ScreenedTwice(FakeServices):
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            self.model_calls.append(dict(kwargs))
+            evidence = cast(tuple[RuntimeEvidence, ...], kwargs["evidence"])
+            return BedrockTextResponse(
+                _output(
+                    "answer",
+                    [
+                        {
+                            "claim_id": "c1",
+                            "text": "According to the canonical documentation, it is off.",
+                            "evidence_ids": [evidence[0].evidence_id],
+                        }
+                    ],
+                ),
+                "end_turn",
+            )
+
+    twice = ScreenedTwice()
+    refused = run_runtime_event(
+        _event(request_id="req_redraw-2", question="Is dual channel replication on by default?"),
+        twice,
+        root=ROOT,
+        manifest=manifest,
+    )
+    assert refused["outcome"] == "error" and len(twice.model_calls) == 2

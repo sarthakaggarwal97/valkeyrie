@@ -2298,9 +2298,9 @@ def test_review_state_and_oldest_order_are_search_qualifiers_that_waive_the_term
             fetch=fetch,
             observed_clock=lambda: OBSERVED,
         )
-    with pytest.raises(LiveGitHubError, match="order must be oldest"):
+    with pytest.raises(LiveGitHubError, match="order must be oldest, newest"):
         read_live_github(
-            IssueSearchQuery(terms=("a", "b"), repository="valkey", order="newest"),
+            IssueSearchQuery(terms=("a", "b"), repository="valkey", order="recent"),
             fetch=fetch,
             observed_clock=lambda: OBSERVED,
         )
@@ -2753,3 +2753,76 @@ def test_a_directory_listing_cites_the_tree_page_not_the_api() -> None:
         )
     )
     assert payload["url"] == "https://github.com/valkey-io/valkey/tree/HEAD/src/commands"
+
+
+def test_file_windows_prefer_the_definition_of_a_function_over_its_first_mention() -> None:
+    """t_string.c mentions setGenericCommand in a comment, a prototype and a call before defining
+    it; the window around the first mention showed the model nothing of the function."""
+    from valkeyrie.live_github import _file_windows
+
+    lines = (
+        ["/* setGenericCommand handles SET and its options. */"]
+        + ["void setGenericCommand(client *c, int flags, robj *key);"]
+        + ["x"] * 60
+        + ["static void helper(client *c) {", "    setGenericCommand(c, 0, NULL);", "}"]
+        + ["x"] * 60
+        + ["void setGenericCommand(client *c, int flags, robj *key) {", "    /* body */", "}"]
+        + ["x"] * 60
+    )
+    windows = _file_windows(lines, ("setGenericCommand",))
+    first = cast(str, windows[0]["text"])
+    assert "robj *key) {" in first and "/* body */" in first, windows[0]
+    # The earlier mentions are still carried, after the definition.
+    assert any("handles SET" in cast(str, w["text"]) for w in windows[1:])
+
+
+def test_newest_order_sorts_a_search_by_creation_date_descending() -> None:
+    """ "The five most recent open issues" listed by best match and said so in its limitation."""
+    calls: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(url)
+        return _response({"total_count": 0, "incomplete_results": False, "items": []})
+
+    read_live_github(
+        IssueSearchQuery(terms=(), repository="valkey", state="open", order="newest"),
+        fetch=fetch,
+        observed_clock=lambda: OBSERVED,
+    )
+    assert "sort=created" in calls[0] and "order=desc" in calls[0], calls
+
+
+def test_recent_commits_template_reads_a_branch_newest_first_with_a_web_url() -> None:
+    from valkeyrie.live_github import GenericReadQuery
+
+    calls: list[str] = []
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append(url)
+        return _response(
+            [
+                {
+                    "sha": "f" * 40,
+                    "html_url": "https://github.com/valkey-io/valkey/commit/" + "f" * 40,
+                    "commit": {
+                        "message": "fix: a thing\n\nbody",
+                        "author": {"name": "A", "date": "2026-10-01T14:18:22Z", "email": "drop"},
+                    },
+                    "author": {"login": "drop"},
+                }
+            ]
+        )
+
+    payload = _decoded(
+        read_live_github(
+            GenericReadQuery("recent_commits", {"repository": "valkey", "ref": "unstable"}),
+            fetch=fetch,
+            observed_clock=lambda: OBSERVED,
+        )
+    )
+    assert calls == [
+        "https://api.github.com/repos/valkey-io/valkey/commits?sha=unstable&per_page=20"
+    ]
+    assert payload["url"] == "https://github.com/valkey-io/valkey/commits/unstable"
+    items = cast(list[dict[str, object]], payload["items"])
+    assert items[0]["commit.author.name"] == "A" and "email" not in json.dumps(items)

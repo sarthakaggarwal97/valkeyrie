@@ -251,6 +251,14 @@ _CAPABILITY: Final = re.compile(
     r"|how\s+(?:can|do)\s+you\s+help"
     r"|who\s+(?:are|r)\s+(?:you|u)\b"
     r"|what\s+are\s+you\b"
+    # Three more ways the sweep asked about the service itself, each of which had been sent to
+    # the model, which has no evidence about this service: "insufficient validated evidence" was
+    # the reply to "what sources do you use".
+    r"|who\s+(?:built|made|created|wrote|trained|runs|maintains)\s+(?:you|valkeyrie)\b"
+    r"|(?:what|which)\s+(?:sources?|data|corpus|repositor(?:y|ies))\s+(?:do|did|does|are)\s+you"
+    r"|(?:are|is)\s+(?:you|your\s+(?:answers?|data|information|knowledge))\s+"
+    r"(?:up[\s-]to[\s-]date|current|fresh|recent|stale|outdated)"
+    r"|how\s+(?:current|fresh|up[\s-]to[\s-]date|recent)\s+(?:is|are)\s+your"
     r")",
     re.IGNORECASE,
 )
@@ -274,6 +282,9 @@ _CAPABILITY_REPLY: Final = (
     " the project public sources. Separately, configured operators can dispatch a small reviewed"
     " catalog of GitHub workflows on personal repositories by starting a message with run; bare"
     " run lists them.\n"
+    "The indexed material is refreshed weekly from the repositories; GitHub reads are live, and"
+    " each cites the moment it was observed. I am Valkeyrie, run by Valkey project contributors"
+    " on Amazon Bedrock models; I have no knowledge of my own beyond those sources.\n"
     "Naming a repository, version or command gets you a sharper answer, and if the evidence"
     " does not support something I say so instead of guessing."
 )
@@ -978,11 +989,14 @@ def _execute_plan(
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
         outcome, claims, citations, message = _accept_output(normalized.response_text, evidence)
         _require_askers_language(cast(str, plan["question"]), claims, message)
-    except _UnparseableModelOutput as truncated:
+    except (ApplicationRuntimeError, BedrockResponseError, DraftingError) as rejected:
         # Nothing has been written at this point, so a second draw costs latency and nothing else.
-        # A response cut off mid-claim is the one failure a retry fixes, and it was the only
-        # remaining cause of "I couldn't produce a reliable answer" in the regression battery.
-        _LOG.warning("retrying after: %s", truncated)
+        # Originally only a response cut off mid-claim was redrawn. The sweeps then showed the
+        # other single-draw failures are draws too: a JSON object with "evidence_ids" twice, a
+        # limitation that tripped a screen on one draw in eight, a claim set that lost every
+        # claim to the link screen. Each surfaced as "I couldn't produce a reliable answer" when
+        # the next draw would have answered. One redraw for any rejection; the second is final.
+        _LOG.warning("retrying after: %s: %s", type(rejected).__name__, rejected)
         try:
             response = services.converse(
                 model_id=cast(str, plan["model_id"]),
@@ -1011,17 +1025,6 @@ def _execute_plan(
                 completion_clock=completion_clock,
                 completed_at=completed_at,
             )
-    except (ApplicationRuntimeError, BedrockResponseError, DraftingError) as rejection:
-        return _failed_answer(
-            services,
-            rejection,
-            request_id=request_id,
-            generation_id=generation_id,
-            revision=revision,
-            fence=fence,
-            completion_clock=completion_clock,
-            completed_at=completed_at,
-        )
     if plan.get("evidence_mode") == "static" and plan.get("route") != "exact_lookup":
         # Iterate before giving up, each round a NEW plan revision. The first answer is the
         # judge of its own evidence: an abstention names what was missing, an answer with a

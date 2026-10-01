@@ -587,12 +587,25 @@ def _names(url: str) -> str:
         ("pull", lambda rest: f"#{rest[0]}" if rest else ""),
         ("issues", lambda rest: f"#{rest[0]}" if rest else ""),
         # A file URL carries the commit between blob and the path, which the link already pins.
-        ("blob", lambda rest: "/".join(rest[1:])),
+        # A release tag or branch there is worth saying: valkey.conf at 9.0.0 and at 8.0.0 were
+        # two identical labels.
+        ("blob", lambda rest: "/".join(rest[1:]) + _at_ref(rest[0] if rest else "")),
         ("tree", lambda rest: "/".join(rest[1:])),
     ):
         if marker in parts:
             return render(parts[parts.index(marker) + 1 :])
     return ""
+
+
+def _at_ref(ref: str) -> str:
+    """ " at 9.0.0" for a tag or branch; nothing for a commit hash or HEAD, which the link pins."""
+    if (
+        not ref
+        or ref in {"HEAD", "unstable", "main", "master"}
+        or re.fullmatch(r"[0-9a-f]{40}", ref)
+    ):
+        return ""
+    return f" at {ref}"
 
 
 def _source_link(citation: str) -> str:

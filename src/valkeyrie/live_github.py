@@ -289,6 +289,20 @@ GENERIC_TEMPLATES: Final[Mapping[str, _Template]] = {
     # read token), and check annotations carry only "Process completed with exit code 1" for
     # these jobs. Add a log template once the token can read logs; the shrinker will need a
     # line filter for "[err]" and "[exception]" rather than a field list.
+    "recent_commits": _Template(
+        path="/repos/valkey-io/{repository}/commits",
+        kinds={"repository": "repository", "ref": "ref"},
+        keep=(
+            "items[].sha",
+            "items[].html_url",
+            "items[].commit.message",
+            "items[].commit.author.name",
+            "items[].commit.author.date",
+        ),
+        query={"sha": "{ref}", "per_page": "20"},
+        purpose="the 20 most recent commits on a branch or tag, newest first (the last five "
+        "commits on unstable; what landed this week)",
+    ),
     "commit": _Template(
         path="/repos/valkey-io/{repository}/commits/{sha}",
         kinds={"repository": "repository", "sha": "sha"},
@@ -1012,8 +1026,13 @@ def read_live_github(
 # A file's evidence payload. The network read may be the whole file (valkey.conf is 143 KB), but
 # what reaches the model is either a small file whole or the windows around the asked-for words.
 MAX_FILE_TEXT_BYTES: Final = 12 * 1024
-# The largest contents response a file read may accept: 384 KiB of JSON carries a 280 KB file.
-MAX_FILE_RESPONSE_BYTES: Final = 384 * 1024
+# The largest contents response a file read may accept. The contents endpoint base64-encodes the
+# file inside JSON, so a file costs about 1.37 times its size on the wire. 384 KiB carried a
+# 280 KB file and refused src/networking.c (298 KB): "how is the output buffer limit enforced in
+# networking.c" planned the read and could not make it. The largest Valkey source is src/module.c
+# at 686 KB, 930 KB encoded; 1 MiB covers every file the contents endpoint will return (it stops
+# inlining content above 1 MB). The evidence payload is still MAX_FILE_TEXT_BYTES.
+MAX_FILE_RESPONSE_BYTES: Final = 1024 * 1024
 FILE_WINDOW_LINES: Final = 24
 MAX_FILE_WINDOWS: Final = 6
 # A repository path: segments of ordinary file characters, no traversal, no leading slash.
@@ -1289,6 +1308,33 @@ def _file(
     return {**payload, "text": None, "windows": windows, "complete": False}
 
 
+def _head_window(lines: list[str]) -> list[dict[str, object]]:
+    kept: list[str] = []
+    budget = MAX_FILE_TEXT_BYTES
+    for line in lines:
+        cost = len(line.encode("utf-8")) + 1
+        if cost > budget:
+            break
+        budget -= cost
+        kept.append(line)
+    return [
+        {
+            "first_line": 1,
+            "last_line": len(kept),
+            "truncated": len(kept) < len(lines),
+            "text": "\n".join(kept),
+        }
+    ]
+
+
+def _defines(line: str, word: str) -> bool:
+    """Whether `line` reads as a C definition of `word`: the word followed by an open paren,
+    preceded by a return type rather than being the first token (a call at column 0)."""
+    lowered = line.casefold()
+    position = lowered.find(word + "(")
+    return position > 0 and lowered[:position].strip() != "" and "=" not in lowered[:position]
+
+
 def _file_windows(lines: list[str], around: tuple[str, ...]) -> list[dict[str, object]]:
     """Numbered windows around the first matches of the query's words, or the file's head.
 
@@ -1299,14 +1345,40 @@ def _file_windows(lines: list[str], around: tuple[str, ...]) -> list[dict[str, o
     hits = [
         index for index, line in enumerate(lines) if any(word in line.casefold() for word in wanted)
     ]
+    # A function name's first mention is usually its prototype, a comment or a call, and a window
+    # there shows nothing of what the function does: "trace SET k v EX 10" read t_string.c around
+    # setGenericCommand and got its forward declaration. A line that DEFINES the word (begins at
+    # column 0, as Valkey's C definitions do, names the word followed by "(", and is not a
+    # prototype ending in ";") is moved to the front so its window is the first one kept.
+    definitions = [
+        index
+        for index in hits
+        if lines[index][:1] not in ("", " ", "\t", "#", "/", "*")
+        and not lines[index].rstrip().endswith(";")
+        and any(_defines(lines[index], word) for word in wanted)
+    ]
+    hits = definitions + [index for index in hits if index not in definitions]
     if not hits:
-        hits = [0]
+        # No anchor word: the asker wants the file itself ("what does 00-RELEASENOTES say on
+        # 9.0"). A 12-line head window answered that with the heading and the urgency legend;
+        # the whole byte budget is spent on the head instead.
+        return _head_window(lines)
     spans: list[tuple[int, int]] = []
     for hit in hits:
-        start = max(0, hit - FILE_WINDOW_LINES // 2)
-        end = min(len(lines), hit + FILE_WINDOW_LINES // 2)
-        if spans and start <= spans[-1][1]:
-            spans[-1] = (spans[-1][0], max(spans[-1][1], end))
+        if hit in definitions:
+            # A function is read from its signature down: a few lines of the comment above it
+            # and twice the usual window below, which is most of a Valkey function.
+            start = max(0, hit - 3)
+            end = min(len(lines), hit + 2 * FILE_WINDOW_LINES)
+        else:
+            start = max(0, hit - FILE_WINDOW_LINES // 2)
+            end = min(len(lines), hit + FILE_WINDOW_LINES // 2)
+        # Hits are no longer in line order (a definition is moved first), so an overlap is checked
+        # against every span kept so far, not only the last one.
+        overlapping = next((i for i, (s, e) in enumerate(spans) if start <= e and s <= end), None)
+        if overlapping is not None:
+            s, e = spans[overlapping]
+            spans[overlapping] = (min(s, start), max(e, end))
             continue
         if len(spans) == MAX_FILE_WINDOWS:
             break
@@ -1944,8 +2016,8 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
             )
         if review is not None and query.kind != "pull-request":
             raise LiveGitHubError("search review state applies to pull requests only")
-        if query.order is not None and query.order != "oldest":
-            raise LiveGitHubError("search order must be oldest or absent")
+        if query.order is not None and query.order not in {"oldest", "newest"}:
+            raise LiveGitHubError("search order must be oldest, newest or absent")
         updated_before = _search_since(query.updated_before)
         reviewed_by = _search_author(query.reviewed_by)
         if (reviewed_by is not None or query.base is not None or query.merged) and (
@@ -2040,6 +2112,9 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
         if query.order == "oldest":
             # Ascending by creation date: the longest-open items come first.
             parameters = {"sort": "created", "order": "asc"}
+        if query.order == "newest":
+            # "The five most recent issues": best match listed five by relevance and said so.
+            parameters = {"sort": "created", "order": "desc"}
         # Without a window, no sort parameter: GitHub has no value that names best match, it is
         # what you get by not asking for a sort. The payload records the ordering by name.
         search_query = " ".join((*qualifiers, f"is:{query.kind}", *window, *terms))
@@ -2193,7 +2268,9 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
         path = template.path.format(**{k: quote(v, safe="") for k, v in filled.items()})
         url = f"{_API_ROOT}{path}"
         if template.query:
-            url += "?" + urlencode(dict(template.query))
+            # A query value may name a validated placeholder ("{ref}"): it is the same filled,
+            # type-checked value the path uses, encoded by urlencode.
+            url += "?" + urlencode({k: v.format(**filled) for k, v in template.query.items()})
         return (
             url,
             "generic",
@@ -2468,6 +2545,8 @@ def _issue_search(
         "sort": (
             "oldest_first"
             if order == "oldest"
+            else "newest_first"
+            if order == "newest"
             else "least_recently_updated"
             if updated_before
             else "updated"
@@ -3018,6 +3097,7 @@ def _generic(
         "contributors": f"{_WEB_ROOT}/{OWNER}/{repo}/graphs/contributors",
         "user": f"{_WEB_ROOT}/{filled.get('login')}",
         "branch": f"{_WEB_ROOT}/{OWNER}/{repo}/tree/{filled.get('ref')}",
+        "recent_commits": f"{_WEB_ROOT}/{OWNER}/{repo}/commits/{filled.get('ref')}",
     }.get(name)
     return {
         "api_version": _API_VERSION,

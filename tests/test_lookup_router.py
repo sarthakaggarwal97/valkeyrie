@@ -376,9 +376,15 @@ def test_the_router_may_read_one_release_by_tag_and_search_a_date_window() -> No
 def test_the_router_prompt_carries_today_as_data() -> None:
     from valkeyrie.lookup_router import ConversationTurn, _router_prompt
 
-    assert _router_prompt("what merged this week", (), today="2026-09-22") == (
-        "Today is 2026-09-22.\nwhat merged this week"
-    )
+    prompt = _router_prompt("what merged this week", (), today="2026-09-22")
+    assert prompt.startswith("Today is 2026-09-22 (Tuesday). Yesterday was 2026-09-21.")
+    assert prompt.endswith("\nwhat merged this week")
+    # The anchors a relative phrase needs are stated, so the router copies rather than computes:
+    # "merged yesterday" was routed to 2025-09-30 on 2026-10-01.
+    october = _router_prompt("merged yesterday", (), today="2026-10-01")
+    assert "Yesterday was 2026-09-30." in october
+    assert "last month was 2026-09-01 to 2026-09-30" in october
+    assert "This month began 2026-10-01" in october and "This year began 2026-01-01" in october
     dated = _router_prompt("and last week?", (ConversationTurn("user", "hi"),), today="2026-09-22")
     assert '"today": "2026-09-22"' in dated and '"current_question": "and last week?"' in dated
     assert _router_prompt("plain", ()) == "plain"
@@ -555,7 +561,9 @@ def test_a_shortfall_rides_as_bounded_data_beside_the_question() -> None:
     assert bounded == "é" * (MAX_SHORTFALL_BYTES // 2)
 
     # Without a shortfall or history the prompt is the bare dated question, as before.
-    assert _router_prompt("q", (), today="2026-09-25") == "Today is 2026-09-25.\nq"
+    assert _router_prompt("q", (), today="2026-09-25").endswith(
+        "do not compute others from memory.\nq"
+    )
     # The bound is reviewed policy, not whatever the constant happens to say.
     assert MAX_SHORTFALL_BYTES == 600
 
@@ -602,8 +610,8 @@ def test_the_router_may_ask_for_the_review_queue_ci_runs_oldest_items_and_a_comp
         ('{"kind":"search","scope":"issue","review":"required"}', "pull requests only"),
         ('{"kind":"search","scope":"pull-request","review":"pending"}', "review must be"),
         (
-            '{"kind":"search","scope":"issue","state":"open","order":"newest"}',
-            "order must be oldest",
+            '{"kind":"search","scope":"issue","state":"open","order":"recent"}',
+            "order must be oldest or newest",
         ),
         ('{"kind":"ci_runs","repository":"valkey","branch":"../x"}', "branch is malformed"),
         (
