@@ -686,9 +686,12 @@ def _itemized(text: str) -> str:
     starts = [
         m.start()
         for m in _ITEM_REFERENCE.finditer(text)
-        if _LIST_SEPARATOR_BEFORE.search(text[: m.start()])
-        or _BEGINS_A_LIST.match(text[m.end() :])
-        or not _COMPLETES_PHRASE_BEFORE.search(text[: m.start()])
+        if not text[: m.start()].rstrip().endswith("(")
+        and (
+            _LIST_SEPARATOR_BEFORE.search(text[: m.start()])
+            or _BEGINS_A_LIST.match(text[m.end() :])
+            or not _COMPLETES_PHRASE_BEFORE.search(text[: m.start()])
+        )
     ]
     if len(starts) < MIN_ITEMS_TO_LIST:
         return f"• {text}"

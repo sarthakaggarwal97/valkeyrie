@@ -453,6 +453,17 @@ def test_a_two_word_list_lead_keeps_its_first_item_in_the_list() -> None:
     assert lines[0] == "• They are" and lines[1].startswith("    ◦ #3645 fix module writes"), lines
 
 
+def test_a_reference_in_parentheses_does_not_start_an_item() -> None:
+    """ "f4cbd1c fix: Reject module writes (#3645), 2a82301 Resolve slot (#4424), ..." listed the
+    PR numbers as items and cut each commit title in half before its own number."""
+    commits = (
+        "The last 5 commits are: f4cbd1c fix: Reject module writes (#3645), 2a82301 Resolve "
+        "slot from key (#4424), 28ecc51 Fix HEXPIRE summaries (#4783), 2783842 Fix IO thread "
+        "leak (#4710), 9b270b6 Bound tracking eviction (#4775)."
+    )
+    assert slack_bot._itemized(f"• {commits}") == f"• {commits}"
+
+
 def test_identical_source_lines_render_once() -> None:
     url = "https://github.com/valkey-io/valkey/blob/" + "a" * 40 + "/src/blocked.c"
     result = slack_bot._format(

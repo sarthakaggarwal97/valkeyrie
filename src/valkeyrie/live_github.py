@@ -502,6 +502,15 @@ MAX_SEARCH_TERM_BYTES: Final = 64
 # and be dropped whole by the budget. 6 KiB keeps the design section of a long issue and lets a
 # five-item search fit beside a board or a release list.
 MAX_SEARCH_BODY_BYTES: Final = 6 * 1024
+# The whole search page, after normalization, under the runtime's live share (40 KiB) with room
+# for the envelope.
+MAX_SEARCH_PAYLOAD_BYTES: Final = 32 * 1024
+
+
+def _json_bytes(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+
+
 # Per-release notes bound inside a release LIST; a single release keeps its full notes.
 MAX_RELEASE_LIST_BODY_BYTES: Final = 3 * 1024
 RELEASE_LIST_BODIES: Final = 3
@@ -2518,7 +2527,15 @@ def _issue_search(
             _object(item, "search item"),
             repositories,
             compact=bool(
-                since or author or review or updated_before or reviewed_by or no_label or base
+                since
+                or author
+                or review
+                or updated_before
+                or reviewed_by
+                or no_label
+                or base
+                # A dated listing is a list, not a reading of each item's text.
+                or order
             ),
         )
         for item in items
@@ -2526,6 +2543,19 @@ def _issue_search(
     identities = [(item["repository"], item["number"]) for item in normalized]
     if len(identities) != len(set(identities)):
         raise LiveGitHubError("GitHub issue search contains duplicate items")
+    # The whole page has a bound as well as each body. Twenty newest open issues, each a filled
+    # bug template, were 81 KB of payload: over the evidence bound, so the read was discarded in
+    # silence and "the five most recent issues" got "I couldn't identify a supported query".
+    # Bodies are halved until the page fits; titles, numbers and labels are never cut.
+    while _json_bytes(normalized) > MAX_SEARCH_PAYLOAD_BYTES and any(
+        isinstance(item.get("body"), str) and len(cast(str, item["body"])) > 200
+        for item in normalized
+    ):
+        for item in normalized:
+            body = item.get("body")
+            if isinstance(body, str) and len(body) > 200:
+                item["body"] = body[: max(200, len(body) // 2)].rstrip()
+                item["body_truncated"] = True
     # The same search, on GitHub's own page, so the citation is somewhere a person can click.
     # Only for a single repository: the allowlist admits github.com/valkey-io/<repo>/ paths and
     # nothing wider, and a cross-repository search has no such page.

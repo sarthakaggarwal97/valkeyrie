@@ -2826,3 +2826,40 @@ def test_recent_commits_template_reads_a_branch_newest_first_with_a_web_url() ->
     assert payload["url"] == "https://github.com/valkey-io/valkey/commits/unstable"
     items = cast(list[dict[str, object]], payload["items"])
     assert items[0]["commit.author.name"] == "A" and "email" not in json.dumps(items)
+
+
+def test_a_search_page_of_long_bodies_is_trimmed_to_the_payload_bound() -> None:
+    """Twenty newest open issues, each a filled bug template, made an 81 KB payload that the
+    runtime discarded in silence. Bodies shrink until the page fits; titles and numbers stay."""
+    from valkeyrie.live_github import MAX_SEARCH_PAYLOAD_BYTES
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        items = [
+            {
+                "number": 4000 + i,
+                "title": f"[BUG] issue {i}",
+                "state": "open",
+                "html_url": f"https://github.com/valkey-io/valkey/issues/{4000 + i}",
+                "url": f"https://api.github.com/repos/valkey-io/valkey/issues/{4000 + i}",
+                "repository_url": "https://api.github.com/repos/valkey-io/valkey",
+                "user": {"login": f"u{i}"},
+                "labels": [{"name": "bug"}],
+                "body": "template text " * 400,
+                "updated_at": "2026-10-01T00:00:00Z",
+                "closed_at": None,
+                "milestone": None,
+            }
+            for i in range(20)
+        ]
+        return _response({"total_count": 559, "incomplete_results": False, "items": items})
+
+    observation = read_live_github(
+        IssueSearchQuery(terms=(), repository="valkey", state="open", order="newest"),
+        fetch=fetch,
+        observed_clock=lambda: OBSERVED,
+    )
+    assert len(observation.canonical_payload) <= MAX_SEARCH_PAYLOAD_BYTES + 2048
+    payload = _decoded(observation)
+    items = cast(list[dict[str, object]], payload["items"])
+    assert len(items) == 20 and items[0]["title"] == "[BUG] issue 0"
+    assert all(item["body_truncated"] for item in items)

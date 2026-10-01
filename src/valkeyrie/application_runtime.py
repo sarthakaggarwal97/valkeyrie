@@ -1827,7 +1827,16 @@ def _live_records(
     def read(query: LiveGitHubQuery) -> RuntimeEvidence | None:
         try:
             return _live_evidence(services.read_live(query))
-        except Exception:
+        except Exception as error:  # noqa: BLE001 - one unavailable object must not discard the rest
+            # Type and message only, never the payload. An 81 KB search page over the evidence
+            # bound was discarded here without a trace, and the question that needed it was
+            # refused with a reason that pointed elsewhere.
+            _LOG.warning(
+                "live read dropped: %s: %s: %s",
+                type(query).__name__,
+                type(error).__name__,
+                str(error)[:200],
+            )
             return None
 
     if len(queries) == 1:
