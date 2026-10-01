@@ -630,6 +630,15 @@ _ITEM_REFERENCE = re.compile(r"(?<![\w/])(?:<[^|>]+\|)?#\d{1,6}\b")
 # The same reference including a link's closing marker, for deciding whether an item is ONLY
 # references.
 _WHOLE_REFERENCE = re.compile(r"(?<![\w/])(?:<[^|>]+\|#\d{1,6}>|#\d{1,6}\b)")
+# Text ending just before a reference that starts a list item ("include #", "fixes #", ", #").
+_LIST_SEPARATOR_BEFORE = re.compile(
+    r"(?:^|[,;:]|\band\b|\bor\b|\binclud(?:e|es|ing)|\bissues|\bfixes)\s*$"
+)
+# Text ending in a preposition the reference completes ("disabled in #", "the fix from PR #").
+_COMPLETES_PHRASE_BEFORE = re.compile(
+    r"\b(?:in|from|by|of|to|at|for|with|see|than|under|via)\s*(?:PR|pull request|issue)?\s*$",
+    re.IGNORECASE,
+)
 MIN_ITEMS_TO_LIST = 4
 
 
@@ -645,7 +654,15 @@ def _itemized(text: str) -> str:
     if not text.startswith("• ") or "\n" in text:
         return text
     text = text[2:]
-    starts = [m.start() for m in _ITEM_REFERENCE.finditer(text)]
+    # A reference that completes the words before it ("disabled in #858", "the fix from #4795")
+    # is part of the current item, not the start of the next one. An item starts at a reference
+    # that follows a list separator (comma, semicolon, "and", "or") or begins the enumeration.
+    starts = [
+        m.start()
+        for m in _ITEM_REFERENCE.finditer(text)
+        if _LIST_SEPARATOR_BEFORE.search(text[: m.start()])
+        or not _COMPLETES_PHRASE_BEFORE.search(text[: m.start()])
+    ]
     if len(starts) < MIN_ITEMS_TO_LIST:
         return f"• {text}"
     lead = text[: starts[0]].strip()

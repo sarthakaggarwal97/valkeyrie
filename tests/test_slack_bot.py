@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -455,6 +456,15 @@ def test_a_claim_enumerating_numbered_items_is_rendered_as_sub_bullets() -> None
     numbers = "It is stated to fix issues #4138, #4137, #4136, #4135, and #858."
     lines = slack_bot._itemized(f"• {numbers}").split("\n")
     assert lines == ["• It is stated to fix issues", "    ◦ #4138, #4137, #4136, #4135, #858"]
+    # A reference that completes the preceding words stays in its item. "re-enables the tests
+    # disabled in #858" was split so that "#858" became a line of its own under "disabled in".
+    production = (
+        "The PR states it fixes issues #4138, #4137, #4136 and #858, and re-enables the "
+        "empty-shard migration tests disabled in #858."
+    )
+    lines = slack_bot._itemized(f"• {production}").split("\n")
+    assert not any(re.fullmatch(r"\s*◦ #\d+", line) for line in lines), lines
+    assert any("tests disabled in #858" in line for line in lines), lines
     # The renderer sees the LINKED form, which is what reached Slack as nine one-number lines.
     linked = slack_bot._itemized("• " + slack_bot._linked(numbers, "valkey")).split("\n")
     assert len(linked) == 2 and linked[1].count("|#") == 5
