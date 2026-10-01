@@ -352,6 +352,7 @@ _LIVE_KINDS: Final[Mapping[str, frozenset[str]]] = {
     "release": frozenset({"release", "release_list"}),
     "workflow_run": frozenset({"workflow_run", "workflow_runs", "run_jobs"}),
     "compare": frozenset({"compare", "path_history"}),
+    "generic": frozenset({"generic_read"}),
     "check": frozenset({"check_run", "commit_checks", "commit_status"}),
     "controller_status": frozenset({"project"}),
     "file": frozenset({"file"}),
@@ -2476,6 +2477,8 @@ def _live_github_url(value: object) -> None:
     if parsed.netloc == "api.github.com":
         allowed = (
             parsed.path.startswith("/repos/valkey-io/")
+            # A user profile from the generic catalog; the login was validated before the URL.
+            or re.fullmatch(r"/users/[A-Za-z0-9-]{1,39}", parsed.path) is not None
             or parsed.path == "/search/issues"
             or parsed.path == "/graphql"
         )

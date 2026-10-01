@@ -10,7 +10,7 @@ import time
 from binascii import Error as BinasciiError
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Final, Protocol, TypeAlias, cast
 from urllib.parse import quote, urlencode
@@ -256,6 +256,126 @@ class PathHistoryQuery:
     per_page: int = 10
 
 
+@dataclass(frozen=True)
+class GenericReadQuery:
+    """One read from the closed template catalog below, by template name and placeholder values.
+
+    Every other query type here is a hand-built dataclass, URL builder, normalizer and finding,
+    about 150 lines each; that is why each new question class cost a day. A template is a path
+    with typed placeholders and a list of fields to keep from the response; the router fills the
+    placeholders by name. The security boundary is unchanged: the catalog is closed, every
+    placeholder is validated by type before it touches the URL, the response is bounded and
+    shrunk to named fields, and nothing from the model reaches the request except through a
+    typed placeholder.
+    """
+
+    template: str
+    values: Mapping[str, str | int]
+
+
+@dataclass(frozen=True)
+class _Template:
+    path: str  # with {name} placeholders
+    kinds: Mapping[str, str]  # placeholder name -> repository | number | ref | path | login | sha
+    keep: tuple[str, ...]  # top-level fields to keep; "items[].field" keeps a field of each item
+    query: Mapping[str, str] = field(default_factory=dict)  # fixed query parameters
+    max_bytes: int = 256 * 1024
+    purpose: str = ""
+
+
+GENERIC_TEMPLATES: Final[Mapping[str, _Template]] = {
+    # NOT here: a job's log, which is where Valkey's test runner names the failing test. The API
+    # requires the actions:read scope (checked: 403 "Must have admin rights" with the current
+    # read token), and check annotations carry only "Process completed with exit code 1" for
+    # these jobs. Add a log template once the token can read logs; the shrinker will need a
+    # line filter for "[err]" and "[exception]" rather than a field list.
+    "commit": _Template(
+        path="/repos/valkey-io/{repository}/commits/{sha}",
+        kinds={"repository": "repository", "sha": "sha"},
+        keep=(
+            "sha",
+            "html_url",
+            "commit.message",
+            "commit.author.name",
+            "commit.author.date",
+            "stats.additions",
+            "stats.deletions",
+            "files[].filename",
+            "files[].additions",
+            "files[].deletions",
+        ),
+        max_bytes=2 * 1024 * 1024,
+        purpose="one commit: its message, author, date, and the files it touched",
+    ),
+    "pull_request_patch": _Template(
+        path="/repos/valkey-io/{repository}/pulls/{number}/files",
+        kinds={"repository": "repository", "number": "number"},
+        keep=(
+            "items[].filename",
+            "items[].status",
+            "items[].additions",
+            "items[].deletions",
+            "items[].patch",
+        ),
+        query={"per_page": "30"},
+        max_bytes=2 * 1024 * 1024,
+        purpose="what a pull request changes, file by file, with the diff of each (bounded)",
+    ),
+    "release_assets": _Template(
+        path="/repos/valkey-io/{repository}/releases/tags/{ref}",
+        kinds={"repository": "repository", "ref": "ref"},
+        keep=(
+            "tag_name",
+            "published_at",
+            "html_url",
+            "assets[].name",
+            "assets[].size",
+            "assets[].download_count",
+            "assets[].browser_download_url",
+        ),
+        purpose="a release's downloadable assets with sizes and download counts",
+    ),
+    "contributors": _Template(
+        path="/repos/valkey-io/{repository}/contributors",
+        kinds={"repository": "repository"},
+        keep=("items[].login", "items[].contributions"),
+        query={"per_page": "50"},
+        purpose="the repository's contributors ranked by commit count",
+    ),
+    "user": _Template(
+        path="/users/{login}",
+        kinds={"login": "login"},
+        keep=(
+            "login",
+            "name",
+            "company",
+            "blog",
+            "location",
+            "bio",
+            "public_repos",
+            "followers",
+            "html_url",
+        ),
+        purpose="a GitHub user's public profile",
+    ),
+    "branch": _Template(
+        path="/repos/valkey-io/{repository}/branches/{ref}",
+        kinds={"repository": "repository", "ref": "ref"},
+        keep=(
+            "name",
+            "commit.sha",
+            "commit.commit.message",
+            "commit.commit.committer.date",
+            "protected",
+        ),
+        purpose="a branch's head commit and whether it is protected",
+    ),
+}
+MAX_GENERIC_ITEMS: Final = 50
+MAX_GENERIC_TEXT: Final = 4000
+MAX_GENERIC_PATCH: Final = 3000
+
+
 MAX_WORKFLOW_RUNS: Final = 20
 MAX_COMPARE_COMMITS: Final = 50
 MAX_RUN_JOBS: Final = 100
@@ -276,6 +396,7 @@ LiveGitHubQuery: TypeAlias = (
     | AdvisoryQuery
     | WorkflowRunQuery
     | WorkflowRunsQuery
+    | GenericReadQuery
     | RunJobsQuery
     | PathHistoryQuery
     | CompareQuery
@@ -2051,6 +2172,25 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
             "workflow_run",
             lambda value: _workflow_runs(value, repository, branch, per_page),
         )
+    if isinstance(query, GenericReadQuery):
+        template = GENERIC_TEMPLATES.get(query.template)
+        if template is None:
+            raise LiveGitHubError("generic read template is not in the catalog")
+        if set(query.values) != set(template.kinds):
+            raise LiveGitHubError("generic read placeholders do not match the template")
+        filled: dict[str, str] = {}
+        for name, kind in template.kinds.items():
+            filled[name] = _placeholder(kind, query.values[name])
+        path = template.path.format(**{k: quote(v, safe="") for k, v in filled.items()})
+        url = f"{_API_ROOT}{path}"
+        if template.query:
+            url += "?" + urlencode(dict(template.query))
+        return (
+            url,
+            "generic",
+            lambda value: _generic(value, query.template, template, filled, url),
+            template.max_bytes,
+        )
     if isinstance(query, RunJobsQuery):
         repository = _repository(query.repository)
         run_id = query.run_id
@@ -2775,6 +2915,100 @@ def _with_failure_details(
         )
         return enriched
     return payload
+
+
+def _placeholder(kind: str, value: object) -> str:
+    """One placeholder value, validated by its declared kind. Nothing else reaches the URL."""
+    if kind == "repository":
+        return _repository(value)
+    if kind == "number":
+        if type(value) is not int or not 0 < value < 10**15:
+            raise LiveGitHubError("generic read number is malformed")
+        return str(value)
+    if kind == "ref":
+        ref = _tag(value)
+        if "/" in ref or ".." in ref:
+            raise LiveGitHubError("generic read ref is malformed")
+        return ref
+    if kind == "path":
+        return _repository_path(value)
+    if kind == "login":
+        if type(value) is not str or _GITHUB_LOGIN.fullmatch(value) is None:
+            raise LiveGitHubError("generic read login is malformed")
+        return value
+    if kind == "sha":
+        if type(value) is not str or re.fullmatch(r"[0-9a-f]{7,40}", value) is None:
+            raise LiveGitHubError("generic read sha is malformed")
+        return value
+    raise LiveGitHubError("generic read placeholder kind is unknown")
+
+
+def _shrink(value: object, depth: int = 0) -> object:
+    """Bound a kept value: strings cut, lists capped, nested objects shrunk, nothing else kept."""
+    if isinstance(value, str):
+        limit = MAX_GENERIC_PATCH if depth else MAX_GENERIC_TEXT
+        encoded = value.encode("utf-8")
+        return value if len(encoded) <= limit else encoded[:limit].decode("utf-8", "ignore")
+    if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, list):
+        return [_shrink(item, depth + 1) for item in value[:MAX_GENERIC_ITEMS]]
+    if isinstance(value, Mapping):
+        return {str(k): _shrink(v, depth + 1) for k, v in list(value.items())[:MAX_GENERIC_ITEMS]}
+    raise LiveGitHubError("generic read response carries an unexpected value type")
+
+
+def _pick(value: Mapping[str, object], dotted: str) -> object:
+    current: object = value
+    for part in dotted.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _generic(
+    value: Mapping[str, object], name: str, template: _Template, filled: Mapping[str, str], url: str
+) -> dict[str, object]:
+    """Keep only the template's named fields from the response, bounded, plus provenance."""
+    kept: dict[str, object] = {}
+    items_fields = [k[len("items[].") :] for k in template.keep if k.startswith("items[].")]
+    for key in template.keep:
+        if key.startswith("items[]."):
+            continue
+        if "[]." in key:
+            prefix, _, inner = key.partition("[].")
+            raw = _pick(value, prefix)
+            if isinstance(raw, list):
+                bucket = kept.setdefault(prefix, [{} for _ in raw[:MAX_GENERIC_ITEMS]])
+                for item, slot in zip(
+                    raw[:MAX_GENERIC_ITEMS], cast(list[dict[str, object]], bucket), strict=True
+                ):
+                    if isinstance(item, Mapping):
+                        slot[inner] = _shrink(_pick(item, inner), 1)
+            continue
+        picked = _pick(value, key)
+        if picked is not None:
+            kept[key] = _shrink(picked)
+    if items_fields:
+        raw_items = value.get("items")
+        if not isinstance(raw_items, list):
+            raise LiveGitHubError("generic read expected a list response")
+        kept["items"] = [
+            {f: _shrink(_pick(item, f), 1) for f in items_fields if isinstance(item, Mapping)}
+            for item in raw_items[:MAX_GENERIC_ITEMS]
+        ]
+        kept["items_shown"] = len(cast(list[object], kept["items"]))
+        kept["items_total_in_page"] = len(raw_items)
+    return {
+        "api_version": _API_VERSION,
+        "kind": "generic_read",
+        "template": name,
+        "purpose": template.purpose,
+        "placeholders": dict(filled),
+        "source": url,
+        **kept,
+    }
 
 
 def _run_jobs(value: Mapping[str, object], repository: str, run_id: int) -> dict[str, object]:

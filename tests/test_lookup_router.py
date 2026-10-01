@@ -650,3 +650,39 @@ def test_the_router_may_ask_for_stale_reviewed_unlabelled_backport_jobs_and_path
     ):
         with pytest.raises(LookupRouterError, match=reason):
             parse_lookup_plan('{"lookups":[' + bad + "]}")
+
+
+def test_the_router_may_use_a_catalog_template_and_nothing_outside_it() -> None:
+    from valkeyrie.live_github import GenericReadQuery
+    from valkeyrie.lookup_router import LookupRouterError, parse_lookup_plan
+
+    plan = parse_lookup_plan(
+        '{"lookups":[{"kind":"github_read","template":"commit","values":{"repository":"valkey","sha":"abc1234"}},'
+        '{"kind":"github_read","template":"user","values":{"login":"madolson"}}]}'
+    )
+    assert plan.live == (
+        GenericReadQuery("commit", {"repository": "valkey", "sha": "abc1234"}),
+        GenericReadQuery("user", {"login": "madolson"}),
+    )
+    for bad, reason in (
+        ('{"kind":"github_read","template":"delete_repo","values":{}}', "not in the catalog"),
+        (
+            '{"kind":"github_read","template":"commit","values":{"repository":"valkey"}}',
+            "do not match",
+        ),
+        (
+            '{"kind":"github_read","template":"commit","values":{"repository":"valkey","sha":"x","extra":1}}',
+            "do not match",
+        ),
+        (
+            '{"kind":"github_read","template":"commit","values":{"repository":"evil","sha":"abc1234"}}',
+            "reviewed inventory",
+        ),
+        (
+            '{"kind":"github_read","template":"pull_request_patch","values":{"repository":"valkey","number":"4795"}}',
+            "number is malformed",
+        ),
+        ('{"kind":"github_read","template":"user","values":{"login":""}}', "value is malformed"),
+    ):
+        with pytest.raises(LookupRouterError, match=reason):
+            parse_lookup_plan('{"lookups":[' + bad + "]}")

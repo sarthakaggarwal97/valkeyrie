@@ -90,7 +90,7 @@ import actions  # noqa: E402
 lambda_client = boto3.client(
     "lambda",
     region_name="us-east-1",
-    config=Config(read_timeout=180, connect_timeout=20, retries={"max_attempts": 0}),
+    config=Config(read_timeout=330, connect_timeout=20, retries={"max_attempts": 0}),
 )
 
 
@@ -749,6 +749,17 @@ def main() -> None:
     # events arrive over a pre-authenticated WebSocket, so Bolt would otherwise demand a
     # signing secret that serves no purpose here. Token verification stays on, so a bad
     # bot token fails at startup rather than on the first mention.
+    # Refuse to start without AWS credentials. A restart that exported the Slack tokens but not
+    # AWS_PROFILE connected to Slack, said "running", and failed every question with
+    # NoCredentialsError. Checking here turns that into a startup error with the cause in it.
+    try:
+        identity = boto3.client("sts", region_name="us-east-1").get_caller_identity()
+    except Exception as error:  # noqa: BLE001 - name the cause and stop
+        raise SystemExit(
+            f"AWS credentials are not usable ({type(error).__name__}: {error}). Export AWS_PROFILE "
+            "before starting the bot; see tools/run_bot.sh."
+        ) from error
+    log.info("answering as %s", identity.get("Arn"))
     app = App(token=os.environ["SLACK_BOT_TOKEN"], request_verification_enabled=False)
     app.event("app_mention")(answer_mention)
     # The assistant surface: Slack's AI panel and DMs, with no mention needed, a visible status

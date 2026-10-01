@@ -30,6 +30,7 @@ from typing import Final, Literal
 
 from valkeyrie.live_github import (
     ALLOWED_REPOSITORIES,
+    GENERIC_TEMPLATES,
     MAX_SEARCH_LABELS,
     MAX_SEARCH_REPOSITORIES,
     MAX_SEARCH_TERMS,
@@ -41,6 +42,7 @@ from valkeyrie.live_github import (
     CompareQuery,
     DirectoryQuery,
     FileQuery,
+    GenericReadQuery,
     IssueQuery,
     IssueSearchQuery,
     LiveGitHubQuery,
@@ -68,6 +70,7 @@ _KINDS: Final[frozenset[str]] = frozenset(
         "ci_runs",
         "ci_jobs",
         "path_history",
+        "github_read",
         "compare",
         "project_board",
         "search",
@@ -149,6 +152,17 @@ ROUTER_SYSTEM: Final = (
     "a part of the "
     "code, together with a file lookup of MAINTAINERS.md for the declared owners and, for a pull "
     "request, its pull_request read, which lists the files it changes.\n"
+    '- {"kind":"github_read","template":"NAME","values":{...}}: one read from a closed catalog of '
+    "templates, each a bounded GitHub endpoint reduced to named fields. Templates and their "
+    "placeholders: "
+    + "; ".join(
+        f"{name} ({', '.join(f'{k}:{v}' for k, v in tpl.kinds.items())}) for {tpl.purpose}"
+        for name, tpl in GENERIC_TEMPLATES.items()
+    )
+    + ". Use pull_request_patch when asked what a pull request changes or "
+    "whether a change is safe; commit for a hash the asker names; contributors for who "
+    "contributes most overall; user for who a person is; release_assets for download sizes and "
+    "counts.\n"
     '- {"kind":"compare","repository":"valkey","base":"9.1.0","head":"unstable"}: the commits in '
     "head that are not in base, with the exact count. Use for what changed since a version or "
     "tag, what is on a branch that a release does not have, and how far two refs have diverged. "
@@ -623,6 +637,28 @@ def _live_lookup(kind: str, item: Mapping[str, object]) -> LiveGitHubQuery | Non
     if kind == "path_history":
         _only_keys(item, {"kind", "repository", "path"})
         return PathHistoryQuery(_repository(item), _file_path(item))
+    if kind == "github_read":
+        _only_keys(item, {"kind", "template", "values"})
+        template = item.get("template")
+        if not isinstance(template, str) or template not in GENERIC_TEMPLATES:
+            raise LookupRouterError("github_read template is not in the catalog")
+        values = item.get("values")
+        if not isinstance(values, Mapping) or set(values) != set(GENERIC_TEMPLATES[template].kinds):
+            raise LookupRouterError("github_read values do not match the template")
+        filled: dict[str, str | int] = {}
+        for name, kind_name in GENERIC_TEMPLATES[template].kinds.items():
+            raw = values[name]
+            if kind_name == "number":
+                if type(raw) is not int or not 0 < raw < 10**15:
+                    raise LookupRouterError("github_read number is malformed")
+                filled[name] = raw
+            elif kind_name == "repository":
+                filled[name] = _repository({"repository": raw})
+            elif not isinstance(raw, str) or not 1 <= len(raw) <= 255:
+                raise LookupRouterError("github_read value is malformed")
+            else:
+                filled[name] = raw  # ref/path/login/sha are validated again by the live layer
+        return GenericReadQuery(template, filled)
     if kind == "ci_runs":
         _only_keys(item, {"kind", "repository", "branch"})
         branch = item.get("branch", "unstable")

@@ -300,7 +300,10 @@ class ApplicationStack(Stack):
             runtime="python3.11",
             # Fable exceeded 30s on the densest questions (multi-part replication and
             # governance-process answers), which surfaced as a truncated request.
-            timeout=120,
+            # A code trace chains up to six lookup rounds at about twenty-five seconds each; 120 s
+            # stopped the key-expiry trace one hop short. The runtime bounds its rounds by the
+            # remaining time, so a longer ceiling is spent only when a chain needs it.
+            timeout=300,
             tracing_config=lambda_.CfnFunction.TracingConfigProperty(mode="PassThrough"),
             tags=owner,
         )

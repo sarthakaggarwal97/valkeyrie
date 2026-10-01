@@ -11,7 +11,7 @@ from typing import Any, cast
 import pytest
 
 from valkeyrie.github import GitHubReadError, HttpResponse
-from valkeyrie.live_github import (  # noqa: PLC2701
+from valkeyrie.live_github import (
     ALLOWED_REPOSITORIES,
     MAX_COLLECTION_ITEMS,
     MAX_DIRECTORY_ENTRIES,
@@ -23,8 +23,10 @@ from valkeyrie.live_github import (  # noqa: PLC2701
     OWNER,
     PROJECTS_GRAPHQL_QUERY,
     REQUEST_TIMEOUT_SECONDS,
+    # noqa: PLC2701,
     CheckRunQuery,
     CompareQuery,
+    GenericReadQuery,
     IssueQuery,
     IssueSearchQuery,
     LatestReleaseQuery,
@@ -2633,3 +2635,101 @@ def test_a_run_listing_explains_its_failed_runs_with_their_failing_jobs() -> Non
         == "test-valgrind-test (unit)"
     )
     assert "1 failed: test-valgrind-test (unit) (failed at step: test)" in str(payload["finding"])
+
+
+def test_the_generic_reader_is_a_closed_catalog_with_typed_placeholders_and_a_field_shrinker() -> (
+    None
+):
+    """A template names a path with typed placeholders and the fields to keep. Anything outside the
+    catalog, a missing or extra placeholder, or a value that fails its kind is refused before a URL
+    exists. The response is reduced to the named fields, strings cut and lists capped."""
+    from valkeyrie.live_github import (
+        GENERIC_TEMPLATES,
+        MAX_GENERIC_ITEMS,
+        MAX_GENERIC_TEXT,
+    )
+
+    calls: list[tuple[str, int]] = []
+    big = {
+        "sha": "c" * 40,
+        "html_url": "https://github.com/valkey-io/valkey/commit/" + "c" * 40,
+        "commit": {
+            "message": "m" * 10_000,
+            "author": {"name": "Binbin", "date": "2026-05-23T02:33:49Z", "email": "secret@example"},
+        },
+        "stats": {"additions": 3, "deletions": 1, "total": 4},
+        "files": [
+            {
+                "filename": f"f{i}.c",
+                "additions": i,
+                "deletions": 0,
+                "patch": "x" * 9000,
+                "raw_url": "drop",
+            }
+            for i in range(80)
+        ],
+        "author": {"login": "enjoy-binbin", "node_id": "drop"},
+    }
+
+    def fetch(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        calls.append((url, max_bytes))
+        return _response(big)
+
+    observation = read_live_github(
+        GenericReadQuery("commit", {"repository": "valkey", "sha": "c" * 40}),
+        fetch=fetch,
+        observed_clock=lambda: OBSERVED,
+    )
+    assert calls == [
+        (
+            "https://api.github.com/repos/valkey-io/valkey/commits/" + "c" * 40,
+            GENERIC_TEMPLATES["commit"].max_bytes,
+        )
+    ]
+    assert observation.object_type == "generic"
+    payload = _decoded(observation)
+    assert payload["kind"] == "generic_read" and payload["template"] == "commit"
+    assert payload["placeholders"] == {"repository": "valkey", "sha": "c" * 40}
+    assert len(cast(str, payload["commit.message"]).encode()) == MAX_GENERIC_TEXT
+    assert "author" not in payload and "email" not in json.dumps(payload), (
+        "only named fields survive"
+    )
+    files = cast(list[dict[str, object]], payload["files"])
+    assert len(files) == MAX_GENERIC_ITEMS and set(files[0]) == {
+        "filename",
+        "additions",
+        "deletions",
+    }
+
+    for bad in (
+        GenericReadQuery("not_a_template", {}),
+        GenericReadQuery("commit", {"repository": "valkey"}),
+        GenericReadQuery("commit", {"repository": "valkey", "sha": "c" * 40, "extra": "x"}),
+        GenericReadQuery("commit", {"repository": "valkey", "sha": "../../x"}),
+        GenericReadQuery("commit", {"repository": "evil", "sha": "c" * 40}),
+        GenericReadQuery("user", {"login": "a/b"}),
+        GenericReadQuery("branch", {"repository": "valkey", "ref": "a/../b"}),
+        GenericReadQuery("pull_request_patch", {"repository": "valkey", "number": "4795"}),
+    ):
+        with pytest.raises(LiveGitHubError):
+            read_live_github(bad, fetch=fetch, observed_clock=lambda: OBSERVED)
+    assert not any("evil" in url or ".." in url for url, _ in calls), (
+        "no refused value reached a URL"
+    )
+
+    # A list response keeps the named item fields and reports how many were shown.
+    def listing(url: str, timeout_seconds: float, max_bytes: int) -> HttpResponse:
+        return _response(
+            [{"login": f"u{i}", "contributions": 100 - i, "avatar_url": "drop"} for i in range(60)]
+        )
+
+    contributors = _decoded(
+        read_live_github(
+            GenericReadQuery("contributors", {"repository": "valkey"}),
+            fetch=listing,
+            observed_clock=lambda: OBSERVED,
+        )
+    )
+    items = cast(list[dict[str, object]], contributors["items"])
+    assert len(items) == MAX_GENERIC_ITEMS and items[0] == {"login": "u0", "contributions": 100}
+    assert contributors["items_shown"] == 50 and contributors["items_total_in_page"] == 60

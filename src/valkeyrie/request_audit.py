@@ -71,6 +71,8 @@ _OBSERVATION_TYPES: Final = frozenset(
         # The commits between two refs, from GitHub's compare endpoint. A bounded read with the
         # exact count and its provenance in the payload, like the rest.
         "compare",
+        # A read from the closed template catalog; the payload names its template and purpose.
+        "generic",
         "tree",
         "code_search",
     }
@@ -269,6 +271,8 @@ def _validated_https_url(value: object) -> str:
             # valkey-io repositories by the repo: qualifiers in the query itself.
             or parts.path == "/search/code"
             or parts.path == "/graphql"
+            # A user profile, from the generic catalog; the login is validated before the URL.
+            or re.fullmatch(r"/users/[A-Za-z0-9-]{1,39}", parts.path) is not None
         )
     elif parts.netloc == "github.com":
         allowed = parts.path.startswith("/valkey-io/") or parts.path.startswith(

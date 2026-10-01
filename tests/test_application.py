@@ -390,7 +390,7 @@ def test_application_stack_is_iam_free_and_retains_exact_version(tmp_path: Path)
     # A public caller must not be serialised behind one execution, and needs headroom
     # beyond the 30s that cut off the densest answers.
     assert function["ReservedConcurrentExecutions"] == 5
-    assert function["Timeout"] == 120
+    assert function["Timeout"] == 300
 
 
 def test_evidence_is_derived_executable_and_cost_truthful(tmp_path: Path) -> None:
