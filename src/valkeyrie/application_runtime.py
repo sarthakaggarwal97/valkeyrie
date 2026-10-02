@@ -272,15 +272,19 @@ _CAPABILITY_REPLY: Final = (
     " repositories: the server, valkey-doc, the website, community, the client libraries"
     " and the modules.\n"
     "\u2022 Present state read from GitHub when you ask for it: issues and pull requests"
-    " with their comments and reviews, releases and what a tag contains, project boards,"
-    " published security advisories.\n"
-    "\u2022 The repositories themselves: what is in a directory, a file at a tag, and where"
-    " a symbol appears in the source.\n"
+    " with their comments, reviews, checks and the files they change; releases and what a tag"
+    " contains; project boards; published security advisories; CI workflow runs and their"
+    " failing jobs; who reviewed, authored or opened what in a date window.\n"
+    "\u2022 The repositories themselves: what is in a directory, a file at a tag, where a"
+    " symbol appears in the source, the history of a path, what changed between two refs,"
+    " the latest commits on a branch, contributors by commit count, and a contributor's"
+    " public profile.\n"
     '\u2022 Follow-ups in a thread, so you can ask "and in a cluster?" without repeating'
     " yourself, in whichever language you ask in.\n"
     "Answers never act on your behalf: no merging, commenting, deploying or triggering, no"
-    " reading anything private, no judging whether a release is ready, and nothing from outside"
-    " the project public sources. Separately, configured operators can dispatch a small reviewed"
+    " reading anything private, no judging whether a release is ready, and nothing beyond the"
+    " project's public sources on GitHub and valkey.io. Separately, configured operators can"
+    " dispatch a small reviewed"
     " catalog of GitHub workflows on personal repositories by starting a message with run; bare"
     " run lists them.\n"
     "The indexed material is refreshed weekly from the repositories; GitHub reads are live, and"
@@ -638,6 +642,7 @@ def _answer(
     # when its plan was accepted first. The exact route is also never widened by the abstention
     # retry (see plan["route"]), since a searched-for record is not the record that was asked for.
     resolved_questions: list[str] = []
+    executed_queries: list[str] = []
     routed = (
         None
         if provisional.routes[0] == "exact_lookup"
@@ -649,6 +654,7 @@ def _answer(
             conversation=conversation,
             today=now[:10],
             resolved_out=resolved_questions,
+            executed_out=executed_queries,
         )
     )
     # Resolved BEFORE the branch so that a live route with no usable query falls through to the
@@ -817,7 +823,7 @@ def _answer(
         "routed_on": now[:10],
         # Canonical keys of every lookup a retry round has run, so a later round (or a worker
         # recovering this request) never reads the same thing again.
-        "retry_queries": [],
+        "retry_queries": sorted(set(executed_queries)),
         "generation_id": generation_id,
         "knowledge_base_id": plan_knowledge_base_id,
         "application_revision": manifest["application_revision"],
@@ -1476,6 +1482,9 @@ def _conversation(value: object) -> tuple[ConversationTurn, ...]:
         if role not in ("user", "assistant"):
             raise ApplicationRuntimeError("conversation turn role is unsupported")
         text = _bounded_text(item["text"], "conversation turn", MAX_TURN_BYTES)
+        # A token pasted in an earlier message travelled to the router model inside the
+        # conversation; the same redactor the current question passes through runs here.
+        text, _ = _redacted(text)
         turns.append(ConversationTurn(cast(Literal["user", "assistant"], role), text))
     if sum(len(turn.text.encode("utf-8")) for turn in turns) > MAX_CONVERSATION_BYTES:
         raise ApplicationRuntimeError("conversation exceeds its byte bound")
@@ -1491,6 +1500,7 @@ def _routed_evidence(
     conversation: tuple[ConversationTurn, ...] = (),
     today: str | None = None,
     resolved_out: list[str] | None = None,
+    executed_out: list[str] | None = None,
 ) -> (
     tuple[tuple[RuntimeEvidence, ...], str | None, str | None, Literal["static", "live"], str]
     | None
@@ -1562,6 +1572,10 @@ def _routed_evidence(
     # already cover are added, so a complete plan costs nothing extra.
     live = _with_named_repository_coverage(plan.live, question)
     records.extend(_live_records(services, live))
+    if executed_out is not None:
+        # The first round's lookups count as executed too: a shortfall round that chose the
+        # same lookup read it again before the content check found nothing new.
+        executed_out.extend(_query_key(query) for query in live)
     if not records:
         return None
     evidence = _bounded_evidence(tuple(records))
@@ -1697,6 +1711,9 @@ def _retry_with_supplement(
         )
         normalized = normalize_bedrock_response(response.response_text, response.stop_reason)
         output = _accept_output(normalized.response_text, widened)
+        # The same language gate the first draw passes: a retry round answered an English
+        # question in Spanish and the answer was stored, because only the first draw was checked.
+        _require_askers_language(question, output[1], output[3])
     except Exception:
         return _Retry(next_revision, revised, widened)
     # Whatever the model said this round comes back: an answer to adopt, or an abstention whose
@@ -2961,8 +2978,11 @@ class AwsRuntimeServices:
                     if isinstance(candidate, str) and candidate.strip():
                         token = candidate.strip()
                 except Exception:
-                    # A failed read is not cached: the next question tries again rather than
-                    # running anonymously for the rest of the container's life.
+                    # Remembered on THIS instance only: the handler builds one per request, so
+                    # the other live reads of this request go anonymous without each calling
+                    # Secrets Manager again, and the next request constructs a fresh instance
+                    # that retries. (Caching None on the class would have lasted the container.)
+                    self._github_token_cached = None
                     return None
             self._github_token_cached = token
             return token

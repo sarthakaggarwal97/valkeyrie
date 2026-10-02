@@ -565,7 +565,7 @@ def test_a_shortfall_rides_as_bounded_data_beside_the_question() -> None:
         "do not compute others from memory.\nq"
     )
     # The bound is reviewed policy, not whatever the constant happens to say.
-    assert MAX_SHORTFALL_BYTES == 1024
+    assert MAX_SHORTFALL_BYTES == 2048
 
 
 def test_the_parser_refuses_a_repository_outside_the_reviewed_inventory() -> None:
@@ -720,10 +720,43 @@ def test_the_parser_accepts_only_what_the_reader_will_fetch() -> None:
     assert plan.live == (WorkflowRunQuery("valkey", 36502585735),)
 
 
-def test_faithfulness_needs_a_whole_word_or_a_six_character_stem() -> None:
+_FAITHFUL = [
+    ("which repositories changed?", "Which repository changed?"),
+    ("are the libraries updated?", "Is the library updated?"),
+    ("who is reviewing it?", "Who reviewed pull request 3853?"),
+    ("is CI running?", "Did the CI run for pull request 3853?"),
+    ("was it configured?", "What configuration was used?"),
+    ("what config controls it?", "Which configuration controls replication compression?"),
+    ("which repo contains it?", "Which repository contains the implementation?"),
+    ("does it require auth?", "Does it require authentication?"),
+    ("which pull request added it?", "Which PR added replication compression?"),
+    ("were the PRs merged?", "Were the pull requests merged?"),
+    ("which categories apply?", "Which category applies?"),
+    ("and in cluster mode?", "How does key expiry work in cluster mode?"),
+    ("what about 9.0?", "What is the default io-threads in Valkey 9.0?"),
+    ("is it released yet?", "Is pull request 3853 released yet?"),
+    ("who authored it?", "Who authored pull request 3853?"),
+]
+_UNFAITHFUL = [
+    # A shared five-character prefix is not the same word.
+    ("who authored it?", "What authority does the TSC have?"),
+    # Short domain tokens are content: PR is not issue, CI is not a release.
+    ("which PR is open?", "Which issue is open?"),
+    ("was PR 3853 merged?", "Was issue 3853 merged?"),
+    ("is CI green?", "Is the 9.2 release green?"),
+    ("is it not released?", "Is it released?"),
+]
+
+
+@pytest.mark.parametrize(("fragment", "resolved"), _FAITHFUL)
+def test_a_faithful_resolution_is_accepted(fragment: str, resolved: str) -> None:
     from valkeyrie.lookup_router import _is_faithful
 
-    assert _is_faithful("is it released yet?", "is pull request 3853 released yet?")
-    assert _is_faithful("who authored it?", "who authored pull request 3853?")
-    # "authored" and "authority" share five characters and nothing else.
-    assert not _is_faithful("who authored it?", "What authority does the TSC have?")
+    assert _is_faithful(fragment, resolved)
+
+
+@pytest.mark.parametrize(("fragment", "resolved"), _UNFAITHFUL)
+def test_a_resolution_that_changes_the_subject_is_refused(fragment: str, resolved: str) -> None:
+    from valkeyrie.lookup_router import _is_faithful
+
+    assert not _is_faithful(fragment, resolved)

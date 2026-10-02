@@ -4157,7 +4157,7 @@ def test_a_recovered_plan_must_belong_to_this_request_and_have_a_sound_sequence(
         )
 
 
-def test_the_github_token_is_read_once_under_a_lock_and_a_failed_read_is_not_cached() -> None:
+def test_the_github_token_is_read_once_under_a_lock_and_a_failure_lasts_one_request() -> None:
     import os
     import threading
 
@@ -4208,7 +4208,13 @@ def test_the_github_token_is_read_once_under_a_lock_and_a_failed_read_is_not_cac
         services._github_token_lock = threading.Lock()
         services._boto3 = lambda: SDK(flaky)  # type: ignore[method-assign]
         assert services._github_token() is None  # the failure is returned
-        assert services._github_token() == "github_pat_good"  # and not cached
+        # Remembered on this instance (one per request): the other live reads of the request do
+        # not each call Secrets Manager again.
+        assert services._github_token() is None and flaky.calls == 1
+        fresh = object.__new__(AwsRuntimeServices)
+        fresh._github_token_cached = _UNSET
+        fresh._boto3 = lambda: SDK(flaky)  # type: ignore[method-assign]
+        assert fresh._github_token() == "github_pat_good"  # the next request retries
     finally:
         os.environ.pop("GITHUB_TOKEN_SECRET_ID", None)
 

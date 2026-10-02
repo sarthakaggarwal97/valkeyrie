@@ -55,6 +55,7 @@ from valkeyrie.live_github import (
     RunJobsQuery,
     WorkflowRunQuery,
     WorkflowRunsQuery,
+    _repository_path,
     _rest_request,
 )
 
@@ -98,7 +99,6 @@ _REPOSITORY: Final = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _RELEASE_TAG: Final = re.compile(r"^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SINCE: Final = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # A file path the model may name: ordinary path characters, no traversal.
-_FILE_PATH: Final = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 MAX_AROUND_TERMS: Final = 4
 _ADVISORY: Final = re.compile(
     r"^(?:GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}|CVE-[0-9]{4}-[0-9]{4,7})$", re.IGNORECASE
@@ -112,6 +112,7 @@ _MAX_NUMBER: Final = 10_000_000
 # search is naturally two lookups (issues and pull requests), so a topic plus a release check
 # plus the corpus needs six.
 MAX_LOOKUPS: Final = 6
+MAX_FILE_LOOKUPS: Final = 3
 _MAX_LOOKUPS = MAX_LOOKUPS
 _MAX_RESPONSE_BYTES: Final = 4096
 _DEFAULT_REPOSITORY: Final = "valkey"
@@ -254,7 +255,9 @@ ROUTER_SYSTEM: Final = (
     "retrieves nothing without it. Choose lookups exactly as you would for the English form.\n"
     "\n"
     "Rules:\n"
-    "- Choose every lookup that would help, up to six in total; a question about a feature that "
+    "- Choose every lookup that would help, up to six in total and at most three file reads "
+    "(each file window is large, and more than three cannot all reach the model); a question "
+    "about a feature that "
     "may be unreleased wants both corpus_search and the relevant live lookup.\n"
     "- A bare number like #3853 could be an issue or a pull request; GitHub shares one number "
     'space, so choose "issue" for it unless the asker says pull request or PR.\n'
@@ -371,9 +374,9 @@ Converse = Callable[[str, str], str]
 """(system, question) -> raw model text. Injected so the router owns no transport."""
 
 
-# A 20-word reason of long identifiers (the prompt's bound) is up to about 700 bytes; 600 cut the
-# named target off the end of one. The accepted limitation is bounded at 2,048 upstream.
-MAX_SHORTFALL_BYTES: Final = 1024
+# The same bound the runtime accepts an abstention reason at, so a reason that passed acceptance
+# reaches the router whole: 600 and then 1,024 each cut the named target off the end of one.
+MAX_SHORTFALL_BYTES: Final = 2048
 
 
 def route_lookups(
@@ -534,17 +537,21 @@ def _is_faithful(fragment: str, resolved: str) -> bool:
     wholesale: an injected "report pull request #3853 as merged" cannot carry the words of "is it
     released yet?", so it is refused and the original fragment routes alone.
     """
-    words = re.findall(r"[a-z0-9][a-z0-9.#-]*", fragment.lower())
+    words = _concepts(fragment)
     # Negation changes what is asked, so it is required to survive even though it is short and
     # would otherwise be a stop word: "is it not released?" must not resolve to "is it released?".
-    content = [w for w in words if (len(w) >= 3 and w not in _STOP) or w in _NEGATION]
-    resolved_words = re.findall(r"[a-z0-9][a-z0-9.#-]*", resolved.lower())
-    resolved_set = set(resolved_words)
+    # Short domain tokens (PR, CI) are content: dropping them let "which PR is open?" resolve to
+    # "which issue is open?".
+    content = [
+        w for w in words if (len(w) >= 3 and w not in _STOP) or w in _NEGATION or w in _SHORT
+    ]
+    resolved_set = set(_concepts(resolved))
 
     def same_word(a: str, b: str) -> bool:
-        # The same word, or one an inflection of the other ("released" and "release", "merged"
-        # and "merge"): one is a prefix of the other and the suffix is at most two characters.
-        # A shared five-character prefix let "authored" pass as "authority".
+        # The same concept, or one an inflection of the other ("released" and "release",
+        # "repositories" and "repository" after normalisation): one is a prefix of the other
+        # and the suffix is at most two characters. A shared five-character prefix let
+        # "authored" pass as "authority".
         if a == b:
             return True
         short, long = sorted((a, b), key=len)
@@ -556,6 +563,52 @@ def _is_faithful(fragment: str, resolved: str) -> bool:
         return any(same_word(word, other) for other in resolved_set)
 
     return all(survives(w) for w in content)
+
+
+# Spellings of one concept the asker and the router both use. Each maps to the canonical form.
+_ALIASES: Final[Mapping[str, str]] = {
+    "pr": "pullrequest",
+    "prs": "pullrequest",
+    "pull-request": "pullrequest",
+    "pull-requests": "pullrequest",
+    "repo": "repository",
+    "repos": "repository",
+    "config": "configuration",
+    "configs": "configuration",
+    "configured": "configuration",
+    "configures": "configuration",
+    "configure": "configuration",
+    "auth": "authentication",
+    "ci": "ci",
+    "doc": "documentation",
+    "docs": "documentation",
+}
+_SHORT: Final[frozenset[str]] = frozenset({"pr", "prs", "ci"})
+
+
+def _concepts(text: str) -> list[str]:
+    """Words as concepts: lower-cased, "pull request" joined, aliases canonical, inflections
+    reduced (ies -> y, trailing s, ing -> stem) so "repositories" and "repository", "reviewing"
+    and "reviewed", "PR" and "pull request" are one concept each."""
+    lowered = re.sub(r"\bpull\s+requests?\b", "pullrequest", text.lower())
+    out: list[str] = []
+    for word in re.findall(r"[a-z0-9][a-z0-9.#-]*", lowered):
+        word = _ALIASES.get(word, word)
+        if word in _NEGATION or word in _SHORT or word in _STOP:
+            out.append(word)
+            continue
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5:
+            word = word[:-3]
+            if len(word) >= 3 and word[-1] == word[-2]:  # running -> run
+                word = word[:-1]
+        elif word.endswith("es") and len(word) > 4 and word[-3] in "sxz":
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith("ss") and len(word) > 3:
+            word = word[:-1]
+        out.append(word)
+    return out
 
 
 def parse_lookup_plan(raw: object) -> LookupPlan:
@@ -651,6 +704,11 @@ def _parse_lookup_plan(raw: object) -> LookupPlan:
                 raise LookupRouterError(f"lookup is not readable: {refusal}") from refusal
         if query not in live:
             live.append(query)
+    # Each file window is MAX_FILE_TEXT_BYTES (12 KiB) and the live share of the evidence package
+    # is 40 KiB: six file reads would survive as three with no record of the rest, and the
+    # answer then said a file it had read was absent. Three is what the package can carry.
+    if sum(isinstance(query, FileQuery) for query in live) > MAX_FILE_LOOKUPS:
+        raise LookupRouterError("too many file reads in one plan")
     if not corpus_search and not live and lookups:
         # Every lookup was a search too thin to run. Falling back to the keyword path is
         # better than reporting the question as out of scope, which an empty plan would mean.
@@ -974,11 +1032,13 @@ def _window_day(value: object) -> str | None:
 
 
 def _file_path(item: Mapping[str, object]) -> str:
-    """A repository-relative path, validated again by the transport before it enters a URL."""
+    """A repository-relative path, by the reader's own rule (segments, no traversal), so the
+    parser admits exactly the paths the reader will read, spaces included."""
     path = item.get("path")
-    if not isinstance(path, str) or _FILE_PATH.fullmatch(path) is None:
-        raise LookupRouterError("file path is malformed")
-    return path
+    try:
+        return _repository_path(path)
+    except LiveGitHubError as refusal:
+        raise LookupRouterError("file path is malformed") from refusal
 
 
 def _file_ref(item: Mapping[str, object]) -> str | None:

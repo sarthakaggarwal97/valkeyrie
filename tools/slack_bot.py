@@ -190,6 +190,14 @@ def _release(key: str) -> None:
 
 
 _MENTION = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+# The credential shapes the runtime redacts from the question (application_runtime._CREDENTIAL),
+# applied here to history turns before they leave the process.
+_CREDENTIAL_SHAPES = re.compile(
+    r"gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+    r"|AKIA[A-Z0-9]{16}"
+)
 
 
 def _without_mentions(text: str, client: Any) -> str:
@@ -200,14 +208,17 @@ def _without_mentions(text: str, client: Any) -> str:
     "@someone" for anyone else keeps the sentence the asker wrote.
     """
     global _bot_user_id
-    if _bot_user_id is None:
+    bot_id = _bot_user_id
+    if bot_id is None:
         try:
-            _bot_user_id = client.auth_test()["user_id"]
+            bot_id = _bot_user_id = client.auth_test()["user_id"]
         except Exception:  # noqa: BLE001 - the mention is still answerable without the id
-            _bot_user_id = ""
+            # Not cached: a transient failure must not turn every later bot mention into
+            # "@someone" for the life of the process. With no id, every mention is removed.
+            bot_id = None
 
     def replace(match: re.Match[str]) -> str:
-        return " " if match.group(1) == _bot_user_id else " @someone "
+        return " " if bot_id is None or match.group(1) == bot_id else " @someone "
 
     return re.sub(r"\s{2,}", " ", _MENTION.sub(replace, text)).strip()
 
@@ -216,10 +227,19 @@ def _bounded_reply(text: str) -> str:
     """Every reply under Slack's 40,000-character limit, whatever path produced it."""
     if len(text) <= MAX_REPLY_CHARS:
         return text
-    cut = text[: MAX_REPLY_CHARS - 200]
+    limit = MAX_REPLY_CHARS - 200
+    # Cut on a line boundary when one is near, never inside <url|label> markup or a backtick run.
+    cut_at = text.rfind("\n", limit - 2000, limit)
+    if cut_at < 0:
+        cut_at = limit
+    cut = text[:cut_at]
+    open_link = cut.rfind("<")
+    if open_link > cut.rfind(">"):
+        cut = cut[:open_link]
+    cut = cut.rstrip("`")
     if cut.count("```") % 2:
         cut += "\n```"
-    return cut + "\n\n_The rest of this reply did not fit in one Slack message._"
+    return cut.rstrip() + "\n\n_The rest of this reply did not fit in one Slack message._"
 
 
 def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
@@ -372,13 +392,20 @@ def answer_assistant_message(
         say(f"That is over my {MAX_QUESTION_BYTES // 1024} KB limit for one message.")
         return
     key = _event_key(payload)
-    with _answered_lock:
-        if key in _answered:
-            return
-        _answered[key] = True
-        while len(_answered) > MAX_ANSWERED_EVENTS:
-            _answered.pop(next(iter(_answered)))
-    set_status("reading Valkey sources...")
+    if not _claim(key):
+        return
+
+    def deliver(*args: Any, **kwargs: Any) -> None:
+        try:
+            say(*args, **kwargs)
+        except Exception:
+            _release(key)
+            raise
+
+    try:
+        set_status("reading Valkey sources...")
+    except Exception as error:  # noqa: BLE001 - the status line is decoration
+        log.debug("could not set assistant status (%s)", error)
     try:
         conversation = _thread_history(payload, client)
         started = time.monotonic()
@@ -386,6 +413,7 @@ def answer_assistant_message(
         text = _format(result, seconds=time.monotonic() - started)
     except Exception:
         log.exception("assistant answer failed")
+        _release(key)
         say("Something went wrong answering that. The failure is logged.")
         return
     if not payload.get("thread_ts") or payload.get("thread_ts") == payload.get("ts"):
@@ -394,7 +422,7 @@ def answer_assistant_message(
             set_title(question[:60])
         except Exception as error:  # noqa: BLE001 - a title is decoration
             log.debug("could not set assistant thread title (%s)", error)
-    say(text=text, unfurl_links=False)
+    deliver(text=_bounded_reply(text), unfurl_links=False)
 
 
 def _ask(
@@ -554,7 +582,11 @@ def _turns_before(
             role = "user"
         if role == "assistant":
             # Keep the claims, drop the Sources block: links are not conversation.
-            text = text.split("\n\n*Sources*", 1)[0].strip()
+            text = text.split("\n\n_Sources", 1)[0].split("\n\n*Sources*", 1)[0].strip()
+        else:
+            # A token pasted earlier in the thread must not travel to the Lambda and the router
+            # model inside the history; the same shapes the runtime redacts are redacted here.
+            text = _CREDENTIAL_SHAPES.sub("[redacted credential]", text)
         encoded = text.encode("utf-8")
         if len(encoded) > MAX_HISTORY_TURN_BYTES:
             text = encoded[:MAX_HISTORY_TURN_BYTES].decode("utf-8", "ignore")
@@ -721,7 +753,7 @@ def _day(match: re.Match[str]) -> str:
         when = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
         if match.re is _ISO_INSTANT:
             hour, minute, second = (int(match.group(i)) for i in (4, 5, 6))
-            if not (hour < 24 and minute < 60 and second < 61):
+            if not (hour < 24 and minute < 60 and second < 60):
                 return match.group(0)
     except ValueError:
         return match.group(0)
@@ -732,7 +764,7 @@ def _day(match: re.Match[str]) -> str:
 # double quotes (a quoted error message, a quoted command, quoted evidence). The prompt tells the
 # model to keep quoted evidence exactly as spelled, and "CONFIG SET appendonly yes; CONFIG GET
 # appendonly" inside quotes was split at its semicolon into two broken lines.
-_PROTECTED = re.compile(r"```.*?```|`[^`\n]*`|\"[^\"\n]{1,400}\"", re.DOTALL)
+_PROTECTED = re.compile(r"```.*?```|``[^\n]*?``|`[^`\n]*`|\"[^\"\n]+\"", re.DOTALL)
 
 
 def _protected_spans(text: str) -> list[tuple[int, int]]:

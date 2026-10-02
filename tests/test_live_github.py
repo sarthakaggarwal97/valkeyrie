@@ -3015,3 +3015,32 @@ def test_malformed_but_plausible_responses_are_refused_not_crashed_or_believed()
             observed_clock=lambda: OBSERVED,
         )
     assert MAX_SEARCH_PAYLOAD_BYTES == 32 * 1024
+
+
+def test_directory_and_tree_shapes_are_checked_not_assumed() -> None:
+    """A mapping without type "file" and the requested path was reported as "this path is a
+    file"; a tree without a boolean truncated flag, or a blob without a size, was believed."""
+    import pytest as _pytest
+
+    from valkeyrie.live_github import _directory, _tree
+
+    with _pytest.raises(LiveGitHubError):
+        _directory({}, "valkey", "src/db.c", None)
+    with _pytest.raises(LiveGitHubError):
+        _directory(
+            {"name": "db.c", "path": "src/other.c", "type": "file"}, "valkey", "src/db.c", None
+        )
+    with _pytest.raises(LiveGitHubError):
+        _tree(
+            {"tree": [{"path": "src/a.c", "type": "blob", "size": 1}], "truncated": ["yes"]},
+            "valkey",
+            "src",
+            None,
+        )
+    with _pytest.raises(LiveGitHubError):
+        _tree(
+            {"tree": [{"path": "src/a.c", "type": "blob"}], "truncated": False},
+            "valkey",
+            "src",
+            None,
+        )

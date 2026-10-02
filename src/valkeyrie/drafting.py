@@ -147,8 +147,6 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             # fabricated citation. The last label must be a plausible public suffix, so
             # valkey.conf/foo stays a file path.
             r"\b(?:https?|ftp)://|\bwww\.|\bmailto:|"
-            # Slack auto-links these hosts even without a path.
-            r"\b(?:github\.com|valkey\.io)\b|"
             r"\b[a-z0-9-]+(?:\.[a-z0-9-]+)*"
             r"\.(?:com|org|net|io|dev|sh|app|co|ai|me|info|edu|gov|cloud|xyz)/(?:[a-z0-9]|%[0-9a-f]{2})",
             re.IGNORECASE,
@@ -187,7 +185,7 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             # "is not authoritative", "are not official", "isn't the source of truth", "should
             # not be treated as canonical", "cannot be considered authoritative", "may not be
             # canonical", "is only a secondary source, not an authoritative X": disclaimers.
-            r"|\s+(?:is|are|was|were)(?:n't|\s+not)\b"
+            r"|\s+(?:is|are|was|were)(?:n't|\s+not)\b(?!\s+(?:only|just|merely)\b)"
             r"|\s+(?:should|cannot|can't|could|may|must)(?:\s+not|n't)?\s+(?:be\s+)?"
             r"(?:treated|considered|taken|read|be)\b"
             r"|[^.;:!?]*\bnot\s+(?:an?\s+|the\s+)?(?:canonical|authoritative|official|source\s+of\s+truth)\b)"
@@ -199,6 +197,12 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             r"\bprove[sd]?\b[^.;:!?]*\bbeyond\s+(?:question|doubt|dispute)\b"
             r"|\b(?:canonical|authoritative|official)\b[^.;:!?]*"
             r"\b(?:supplied|retrieved|provided|cited)\s+(?:evidence|context|sources?)\b"
+            # "the official documentation states that this answer is definitive": a named
+            # artifact used to declare THIS answer or evidence conclusive.
+            r"|\b(?:official|canonical|authoritative)\s+(?:documentation|reference|source)\s+"
+            r"(?:states?|says?|shows?|confirms?)\s+(?:that\s+)?"
+            r"(?:this|(?:this|the)\s+(?:answer|evidence|source|result))\s+is\s+"
+            r"(?:definitive|authoritative|canonical|the\s+source\s+of\s+truth)\b"
             # "According to X" stays prohibited in every form. It is attribution prose rather than
             # a fact, and the same sentence reads better without it: "valkey.conf sets the default
             # to no" says more than "according to valkey.conf, the default is no".
@@ -225,7 +229,10 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             # "the lazy-free worker is ready to release memory", "valkey-go is a Go client" and
             # "Debian does not ship it by default" are not release decisions, and every one of
             # them was refused.
-            r"\b(?:release|version|candidate)\s+is\s+(?:ready|approved)\b"
+            # "the candidate is approved" is a verdict whatever the candidate; "the candidate is
+            # ready" is not (a replica candidate is ready to take over).
+            r"\b(?:release|release\s+candidate)\s+is\s+(?:ready|approved)\b"
+            r"|\bcandidate\s+is\s+approved\b"
             r"|\b(?:is|are)\s+ready\s+(?:for\s+release\b|to\s+(?:release|ship|tag)\b(?!\s+\w))"
             r"|\bapprove(?:s|d)?\s+the\s+release\b"
             r"|\bgo\s*/?\s*no[- ]?go\b"
@@ -245,13 +252,20 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             # Verdicts in the release owner's words, each bound to a release subject: "9.2 is
             # approved", "the release looks ready", "the candidate is good to go", "has my
             # approval", "declare the release ready", "give the release the green light".
+            # A release subject is "release", "release candidate", or "Valkey <version>" ("the
+            # replica candidate is ready to take over" and "version 9.2 is good to go with the new
+            # config" are not verdicts). Spans use (?:\.(?=\d)|[^.;:!?])* so "9.2" does not end
+            # them.
             r"|\bvalkey\s+\d+\.\d+(?:\.\d+)?(?:-rc\d+)?\s+is\s+(?:approved|ready|good\s+to\s+go)\b"
-            r"|\b(?:release|version|candidate)(?:\s+\S{1,16}){0,2}\s+(?:looks|seems|appears|is)\s+"
+            r"|\b(?:release|release\s+candidate)(?:\s+\S{1,16}){0,2}\s+(?:looks|seems|appears|is)\s+"
             r"(?:ready|good\s+to\s+go)\b"
-            r"|\b(?:release|version|candidate)\b[^.;:!?]*\bhas\s+(?:my|our)\s+approval\b"
-            r"|\bdeclare\s+the\s+(?:release|candidate|version)\s+ready\b"
-            r"|\bgreen\s+light\b(?=[^.;:!?]*\b(?:release|candidate)\b)"
-            r"|\b(?:release|candidate)\b[^.;:!?]*\bgreen\s+light\b",
+            r"|\b(?:release|release\s+candidate|valkey\s+\d+\.\d+)(?:\.(?=\d)|[^.;:!?])*"
+            r"\bhas\s+(?:my|our)\s+approval\b"
+            r"|\bdeclare\s+(?:the\s+)?(?:release|release\s+candidate|candidate|"
+            r"valkey\s+\d+\.\d+(?:\.\d+)?)\s+ready\b"
+            r"|\bgreen\s+light\b(?=(?:\.(?=\d)|[^.;:!?])*\b(?:release|release\s+candidate|valkey\s+\d)\b)"
+            r"|\b(?:release|release\s+candidate|valkey\s+\d+\.\d+)(?:\.(?=\d)|[^.;:!?])*"
+            r"\bgreen\s+light\b",
             re.IGNORECASE,
         ),
     ),
@@ -277,7 +291,10 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             r"might|must|will|won't|do|don't|not|never|think|believe|recommend|suggest|hope|"
             r"cannot)\b)[a-z]{2,12}){0,4}\s+"
             r"(?:merged|pushed|committed|deployed|released|tagged|published|closed|created|"
-            r"rebased|cherry-picked|opened|reverted|approved|dispatched|triggered|rerun|reran)\b"
+            r"rebased|cherry-picked|reverted|approved(?!\s+of\b)|dispatched|triggered|rerun|reran|"
+            r"opened\s+(?:a\s+|the\s+)?(?:pull\s+request|pr|issue|ticket))\b"
+            # "we rebased onto unstable in this example" narrates an example, not an act.
+            r"(?![^.;:!?]*\b(?:in\s+this\s+example|as\s+an\s+example|for\s+example)\b)"
             r"|\b(?:i|we)\s+(?:personally\s+)?performed\s+the\s+"
             r"(?:deployment|merge|release|rollout|commit|push|publication|tag|rebase|revert)\b"
             r"|\b(?:i|we)\s+(?:was|were|am|are)\s+the\s+(?:one|person|ones)\s+who\s+"
@@ -286,7 +303,9 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             # verb is a claim of having acted; "did not" is excluded by the negation above being
             # required to sit between them.
             r"|\b(?:i|we)\s+did\s+(?:just\s+|already\s+|successfully\s+)?"
-            r"(?:merge|push|commit|deploy|release|tag|publish|close|create)\b"
+            r"(?:merge|push|commit|deploy|release|tag|publish|close|create|rebase|cherry-pick|"
+            r"revert|approve|dispatch|trigger|rerun)\b"
+            r"|\b(?:i|we)\s+did\s+open\s+(?:a\s+|the\s+)?(?:pull\s+request|pr|issue|ticket)\b"
             r"|\b(?:i|we)(?:'ve)?(?:\s+(?!(?:can|cannot|could|would|should|not|never)\b)"
             r"[a-z]{2,12}){0,3}\s+(?:completed|finished)\s+the\s+"
             r"(?:deployment|merge|release|rollout|commit|push|publication|tag)\b",

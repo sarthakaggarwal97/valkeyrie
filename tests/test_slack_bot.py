@@ -931,7 +931,8 @@ def test_delivery_failures_release_the_fence_and_replies_are_bounded_and_sanitis
 
     # Partial and error outcomes never carry the runtime's internal text to Slack.
     partial = slack_bot._format({"outcome": "partial", "message": "request lease is still active"})
-    assert "lease" not in partial and "try" in partial.lower() or "again" in partial
+    assert "lease is still active" not in partial and "request lease" not in partial
+    assert "again" in partial.lower()
     error = slack_bot._format({"outcome": "error", "message": "DynamoDB fence invariant failed"})
     assert "DynamoDB" not in error
 
@@ -939,8 +940,14 @@ def test_delivery_failures_release_the_fence_and_replies_are_bounded_and_sanitis
     huge = slack_bot._format(
         {**answers, "claims": [{"claim_id": "c1", "text": "x" * 41_000, "evidence_ids": ["e"]}]}
     )
-    assert len(huge) <= slack_bot.MAX_REPLY_CHARS + 300
+    assert len(huge) <= slack_bot.MAX_REPLY_CHARS
     assert len(slack_bot._bounded_reply("y" * 50_000)) <= slack_bot.MAX_REPLY_CHARS
+    # A cut never lands inside link markup or a fence.
+    linked = ("a" * 29_700) + "<https://example.com/path|label>" + ("b" * 1_000)
+    cut = slack_bot._bounded_reply(linked)
+    assert cut.count("<") == cut.count(">")
+    fenced = ("a" * 29_799) + "```code" + ("b" * 400)
+    assert slack_bot._bounded_reply(fenced).count("```") % 2 == 0
 
     # A Lambda body that is not a result object is a contract error, not an abstention.
     class Lambda:
@@ -952,3 +959,31 @@ def test_delivery_failures_release_the_fence_and_replies_are_bounded_and_sanitis
     monkeypatch.setattr(slack_bot, "lambda_client", Lambda())
     with pytest.raises(RuntimeError, match="not a result object"):
         real_ask("q", event)
+
+    # A FunctionError carries only its type out of _ask; the body never reaches the log line.
+    class Failing:
+        def invoke(self, **kwargs: object) -> dict[str, object]:
+            import io
+
+            return {
+                "FunctionError": "Unhandled",
+                "Payload": io.BytesIO(b'{"errorType":"KeyError","errorMessage":"secret detail"}'),
+            }
+
+    monkeypatch.setattr(slack_bot, "lambda_client", Failing())
+    with pytest.raises(RuntimeError) as failure:
+        real_ask("q", event)
+    assert "KeyError" in str(failure.value) and "secret detail" not in str(failure.value)
+
+    # A token in an earlier turn is redacted before the history leaves the process.
+    turns = slack_bot._turns_before(
+        [
+            {"ts": "1", "user": "U1", "text": "Earlier token ghp_AAAAAAAAAAAAAAAAAAAA here"},
+            {"ts": "2", "user": "UBOT", "text": "ack"},
+            {"ts": "3", "user": "U1", "text": "<@UBOT> and now?"},
+        ],
+        "3",
+        "UBOT",
+        asker="U1",
+    )
+    assert turns[0]["text"] == "Earlier token [redacted credential] here"

@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Final, Protocol, TypeAlias, cast
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 from valkeyrie.github import GitHubFetcher, GitHubReadError, HttpResponse, fetch_public_github
 from valkeyrie.request_audit import LiveObservation, create_live_observation
@@ -281,6 +281,13 @@ class _Template:
     query: Mapping[str, str] = field(default_factory=dict)  # fixed query parameters
     max_bytes: int = 256 * 1024
     purpose: str = ""
+    # Fields the response MUST carry, with their type ("str", "int", "object", "list"); a
+    # response missing one, or with the wrong container on the way, is malformed rather than
+    # a complete observation of nothing. "items[].field" applies to every item.
+    require: Mapping[str, str] = field(default_factory=dict)
+    # Response fields that must equal a placeholder: the object GitHub answered with is the one
+    # that was asked for ({"login": "login"} binds response login to the login placeholder).
+    identity: Mapping[str, str] = field(default_factory=dict)
 
 
 GENERIC_TEMPLATES: Final[Mapping[str, _Template]] = {
@@ -292,6 +299,7 @@ GENERIC_TEMPLATES: Final[Mapping[str, _Template]] = {
     "recent_commits": _Template(
         path="/repos/valkey-io/{repository}/commits",
         kinds={"repository": "repository", "ref": "ref"},
+        require={"items[].sha": "str", "items[].commit": "object", "items[].html_url": "str"},
         keep=(
             "items[].sha",
             "items[].html_url",
@@ -306,6 +314,8 @@ GENERIC_TEMPLATES: Final[Mapping[str, _Template]] = {
     "commit": _Template(
         path="/repos/valkey-io/{repository}/commits/{sha}",
         kinds={"repository": "repository", "sha": "sha"},
+        require={"sha": "str", "commit": "object", "html_url": "str", "files": "list"},
+        identity={"sha": "sha"},
         keep=(
             "sha",
             "html_url",
@@ -324,6 +334,7 @@ GENERIC_TEMPLATES: Final[Mapping[str, _Template]] = {
     "pull_request_patch": _Template(
         path="/repos/valkey-io/{repository}/pulls/{number}/files",
         kinds={"repository": "repository", "number": "number"},
+        require={"items[].filename": "str", "items[].status": "str"},
         keep=(
             "items[].filename",
             "items[].status",
@@ -338,6 +349,8 @@ GENERIC_TEMPLATES: Final[Mapping[str, _Template]] = {
     "release_assets": _Template(
         path="/repos/valkey-io/{repository}/releases/tags/{ref}",
         kinds={"repository": "repository", "ref": "ref"},
+        require={"tag_name": "str", "html_url": "str", "assets": "list"},
+        identity={"tag_name": "ref"},
         keep=(
             "tag_name",
             "published_at",
@@ -352,6 +365,7 @@ GENERIC_TEMPLATES: Final[Mapping[str, _Template]] = {
     "contributors": _Template(
         path="/repos/valkey-io/{repository}/contributors",
         kinds={"repository": "repository"},
+        require={"items[].login": "str", "items[].contributions": "int"},
         keep=("items[].login", "items[].contributions"),
         query={"per_page": "50"},
         purpose="the repository's contributors ranked by commit count",
@@ -359,6 +373,8 @@ GENERIC_TEMPLATES: Final[Mapping[str, _Template]] = {
     "user": _Template(
         path="/users/{login}",
         kinds={"login": "login"},
+        require={"login": "str", "html_url": "str"},
+        identity={"login": "login"},
         keep=(
             "login",
             "name",
@@ -375,6 +391,8 @@ GENERIC_TEMPLATES: Final[Mapping[str, _Template]] = {
     "branch": _Template(
         path="/repos/valkey-io/{repository}/branches/{ref}",
         kinds={"repository": "repository", "ref": "ref"},
+        require={"name": "str", "commit": "object"},
+        identity={"name": "ref"},
         keep=(
             "name",
             "commit.sha",
@@ -388,6 +406,8 @@ GENERIC_TEMPLATES: Final[Mapping[str, _Template]] = {
 MAX_GENERIC_ITEMS: Final = 50
 MAX_GENERIC_TEXT: Final = 4000
 MAX_GENERIC_PATCH: Final = 3000
+# The whole normalized generic payload, under the runtime's live share (40 KiB) with headroom.
+MAX_GENERIC_PAYLOAD_BYTES: Final = 30 * 1024
 
 
 MAX_WORKFLOW_RUNS: Final = 20
@@ -1305,10 +1325,27 @@ def _file(
     commit = _sha(value, "sha")
     encoded_path = "/".join(quote(part, safe="") for part in path.split("/"))
     web = _text(value, "html_url", 1024)
-    if not web.startswith(f"{_WEB_ROOT}/{OWNER}/{repository}/blob/") or not web.endswith(
-        "/" + encoded_path
+    # Identity by DECODED path: GitHub spells "a+b.c" as a+b.c and "my file.md" as my%20file.md
+    # in html_url, so an encoding comparison refused valid files, and a prefix-plus-suffix
+    # comparison accepted blob/<ref>/other/<path>. The page must be exactly
+    # /<owner>/<repo>/blob/<one ref segment>/<the requested path>.
+    web_parts = urlsplit(web)
+    web_path = unquote(web_parts.path)
+    blob_prefix = f"/{OWNER}/{repository}/blob/"
+    if (
+        web_parts.scheme != "https"
+        or web_parts.netloc != "github.com"
+        or not web_path.startswith(blob_prefix)
+        or web_path[len(blob_prefix) :].split("/", 1)[1:] != [path]
     ):
         raise LiveGitHubError("GitHub file page URL does not name the requested path")
+    api_parts = urlsplit(_text(value, "url", 1024))
+    if (
+        api_parts.scheme != "https"
+        or api_parts.netloc != "api.github.com"
+        or unquote(api_parts.path) != f"/repos/{OWNER}/{repository}/contents/{path}"
+    ):
+        raise LiveGitHubError("GitHub file API URL does not name the requested path")
     payload: dict[str, object] = {
         "api_version": _API_VERSION,
         "kind": "file",
@@ -1321,9 +1358,8 @@ def _file(
         "around": list(around),
         # The contents endpoint answers with its own url carrying the resolved ref, so the exact
         # match the other readers use does not apply; the prefix is what must hold.
-        "api_url": _github_api_url(
-            value, "url", f"{_API_ROOT}/repos/{OWNER}/{repository}/contents/{encoded_path}"
-        ),
+        "api_url": f"{_API_ROOT}/repos/{OWNER}/{repository}/contents/{encoded_path}"
+        + (f"?{api_parts.query}" if api_parts.query else ""),
         "url": web,
     }
     if len(content) <= MAX_FILE_TEXT_BYTES:
@@ -2296,7 +2332,13 @@ def _rest_request(query: object) -> tuple[str, str, Normalizer] | tuple[str, str
         term = _code_term(query.term)
         qualifiers = [f"repo:{OWNER}/{name}" for name in repositories]
         if query.path is not None:
-            qualifiers.append(f"path:{_repository_path(query.path)}")
+            # The search expression is GitHub's own language, decoded before parsing: a path
+            # with a space injected a second qualifier ("docs repo:valkey-io/valkey-doc"). A
+            # search path is the strict form (no spaces, quotes or backslashes) and is quoted.
+            search_path = _repository_path(query.path)
+            if re.search(r"[\s\"\\]", search_path):
+                raise LiveGitHubError("code search path must not contain spaces or quotes")
+            qualifiers.append(f'path:"{search_path}"')
         if query.extension is not None:
             qualifiers.append(f"extension:{_extension(query.extension)}")
         # Quoted so a symbol with underscores or a multi-word string is one term rather than a
@@ -3160,12 +3202,52 @@ def _shrink(value: object, depth: int = 0) -> object:
 
 
 def _generic_web_url(value: object, filled: Mapping[str, str]) -> None:
-    """A kept GitHub page URL must point into the repository the placeholders named (or, for a
-    user profile, at github.com itself)."""
+    """A kept GitHub page URL must point into the repository the placeholders named, or be
+    exactly the profile page of the login asked for."""
     repository = filled.get("repository")
-    prefix = f"{_WEB_ROOT}/{OWNER}/{repository}/" if repository else f"{_WEB_ROOT}/"
-    if type(value) is not str or not value.startswith(prefix) or ".." in value:
+    if type(value) is not str or ".." in value:
+        raise LiveGitHubError("generic read page URL is malformed")
+    if repository is None:
+        if value != f"{_WEB_ROOT}/{filled.get('login')}":
+            raise LiveGitHubError("generic read page URL is not the requested profile")
+        return
+    if not value.startswith(f"{_WEB_ROOT}/{OWNER}/{repository}/"):
         raise LiveGitHubError("generic read page URL is outside the named repository")
+
+
+_TYPE_CHECK: Final[Mapping[str, Callable[[object], bool]]] = {
+    "str": lambda v: type(v) is str,
+    "int": lambda v: type(v) is int,
+    "object": lambda v: isinstance(v, Mapping),
+    "list": lambda v: isinstance(v, list),
+}
+
+
+def _require_shape(
+    value: Mapping[str, object], template: _Template, filled: Mapping[str, str]
+) -> None:
+    """The response carries every required field with its type, and names the object asked for.
+
+    Without this, {} for a commit became a complete observation with no fields, a commit
+    response for another sha was kept under the requested one, and a profile for another
+    login was kept under the requested login.
+    """
+    for dotted, kind in template.require.items():
+        check = _TYPE_CHECK[kind]
+        if dotted.startswith("items[]."):
+            inner = dotted[len("items[].") :]
+            items = value.get("items")
+            if not isinstance(items, list):
+                raise LiveGitHubError("generic read expected a list response")
+            for item in items[:MAX_GENERIC_ITEMS]:
+                if not isinstance(item, Mapping) or not check(_pick(item, inner)):
+                    raise LiveGitHubError(f"generic read item lacks {inner}")
+            continue
+        if not check(_pick(value, dotted)):
+            raise LiveGitHubError(f"generic read response lacks {dotted}")
+    for field_name, placeholder in template.identity.items():
+        if _pick(value, field_name) != filled.get(placeholder):
+            raise LiveGitHubError(f"generic read response is not the requested {placeholder}")
 
 
 def _pick(value: Mapping[str, object], dotted: str) -> object:
@@ -3181,6 +3263,7 @@ def _generic(
     value: Mapping[str, object], name: str, template: _Template, filled: Mapping[str, str], url: str
 ) -> dict[str, object]:
     """Keep only the template's named fields from the response, bounded, plus provenance."""
+    _require_shape(value, template, filled)
     kept: dict[str, object] = {}
     items_fields = [k[len("items[].") :] for k in template.keep if k.startswith("items[].")]
     for key in template.keep:
@@ -3222,6 +3305,20 @@ def _generic(
                 _generic_web_url(shown["html_url"], filled)
         kept["items_shown"] = len(cast(list[object], kept["items"]))
         kept["items_total_in_page"] = len(raw_items)
+    # The whole payload has a bound as well as each field: 30 patches of 3,000 bytes were 93 KB,
+    # which the runtime refused after the read succeeded. Lists shrink from the end, and their
+    # shown count says so.
+    while _json_bytes(kept) > MAX_GENERIC_PAYLOAD_BYTES:
+        longest = max(
+            (k for k, v in kept.items() if isinstance(v, list) and len(v) > 1),
+            key=lambda k: len(cast(list[object], kept[k])),
+            default=None,
+        )
+        if longest is None:
+            raise LiveGitHubError("generic read response exceeds the payload bound")
+        cast(list[object], kept[longest]).pop()
+        if longest == "items":
+            kept["items_shown"] = len(cast(list[object], kept["items"]))
     # A page a person can open, derived from the placeholders, so the citation is clickable.
     repo = filled.get("repository")
     web = {
@@ -3335,7 +3432,8 @@ def _path_history(
         "kind": "path_history",
         "repository": repository,
         "path": path,
-        "url": f"{_WEB_ROOT}/{OWNER}/{repository}/commits/HEAD/{path}",
+        "url": f"{_WEB_ROOT}/{OWNER}/{repository}/commits/HEAD/"
+        + "/".join(quote(part, safe="") for part in path.split("/")),
         "per_page": per_page,
         "commits": commits,
         "authors": dict(ranked),
@@ -3545,7 +3643,9 @@ def _response_object(
                 parse_constant=_reject_constant,
             ),
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, _StrictJsonError) as error:
+    except (UnicodeDecodeError, ValueError, RecursionError, _StrictJsonError) as error:
+        # ValueError covers JSONDecodeError and the 4,300-digit integer refusal; a 1,200-deep
+        # array raises RecursionError. Both escaped as Python exceptions.
         raise LiveGitHubError(f"{source} response is not strict JSON") from error
     if type(value) is list:
         # A list endpoint (releases) returns a bare array. Wrapping it keeps one response
