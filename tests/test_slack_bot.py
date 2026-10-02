@@ -990,3 +990,43 @@ def test_delivery_failures_release_the_fence_and_replies_are_bounded_and_sanitis
         asker="U1",
     )
     assert turns[0]["text"] == "Earlier token [redacted credential] here"
+
+
+def test_verification_wave_renderer_rules() -> None:
+    """Each line is a reproduced defect from the review of the readability pass."""
+    s = slack_bot
+    # A lead that begins "When I checked," is the answer, not a prerequisite.
+    assert s._is_a_lead("When I checked, 42 open pull requests were awaiting review.", 3)
+    assert not s._is_a_lead("Before coding a feature, open an issue first.", 3)
+    # The observation stem follows the original punctuation.
+    assert s._spoken("three approvals as of the latest observation.") == (
+        "three approvals when I last checked."
+    )
+    assert s._spoken("(as of the latest observation) and more") == "(when I last checked) and more"
+    # A clause already ended by "?" does not get "?."; a semicolon in parentheses is not a split.
+    question = (
+        "A clause long enough to clear the lead threshold of two hundred and twenty characters "
+        "so that the splitter runs on it and we can see what happens to a question; is that "
+        "enough? The rest follows and goes on for a while longer here."
+    )
+    assert "?." not in s._led(question)
+    paren = (
+        "The replica sends its replication offset (the offset it processed; not the primary's) "
+        "and the primary replies with the missing part of the stream when the backlog still holds "
+        "it, which is the common case after a short blip of the network."
+    )
+    assert s._led(paren) == f"• {paren}"
+    # Commas around conjunctions are not list items; a "so" clause is not a trailer.
+    prose = (
+        "Writes are acknowledged before fsync, so, with appendfsync everysec, a crash, a power "
+        "loss, or a kernel panic, can lose about one second."
+    )
+    assert s._led(prose) == f"• {prose}"
+    versions = (
+        "Supported versions are 9.2, 9.1, 9.0, 8.1, 8.0, 7.2, so upgrade any 7.0 or 6.2 "
+        "deployment before support ends."
+    )
+    assert "    So upgrade" not in s._led(versions)
+    # Common sentence starters are capitalized after a split; names are not.
+    assert s._sentence_case("however, the backlog may") == "However, the backlog may"
+    assert s._sentence_case("valkey-cli follows redirects") == "valkey-cli follows redirects"

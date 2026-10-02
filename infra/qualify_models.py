@@ -86,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        import boto3  # type: ignore[import-not-found]  # Operator supplies the exact batch SDK.
+        import boto3  # Operator supplies the exact batch SDK.
 
         if version("boto3") != _BOTO3_VERSION:
             raise LiveQualificationError(f"qualification requires boto3=={_BOTO3_VERSION}")

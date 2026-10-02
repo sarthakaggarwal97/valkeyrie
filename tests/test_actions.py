@@ -128,3 +128,28 @@ def test_a_dispatch_is_audited_before_it_is_sent(
         actions.execute(parsed, token="test-token")
     rows = [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()]
     assert rows and rows[0]["action"] == "ci" and rows[0]["by"] == OPERATOR
+
+
+def test_the_cooldown_is_taken_only_by_a_real_dispatch_and_returned_on_a_4xx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    import urllib.error
+
+    spec = actions.ActionSpec("ci", "d", "sarthakaggarwal97/valkey", "ci.yml", "main", {}, ())
+    command = actions.Command(spec, {}, False, "U1")
+    # No token: nothing dispatched, so no cooldown is consumed.
+    actions.execute(command, token="")
+    assert "ci" not in actions._last_dispatch
+    # A 4xx from GitHub ran nothing: the cooldown is given back.
+    failing = urllib.error.HTTPError("u", 422, "Unprocessable", {}, io.BytesIO(b"{}"))  # type: ignore[arg-type]
+
+    def raise_failing(*args: object, **kwargs: object) -> object:
+        raise failing
+
+    monkeypatch.setattr(actions.urllib.request, "urlopen", raise_failing)
+    try:
+        actions.execute(command, token="t")
+    except actions.CommandError:
+        pass
+    assert "ci" not in actions._last_dispatch

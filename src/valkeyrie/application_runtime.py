@@ -48,7 +48,12 @@ from valkeyrie.lookup_router import (
     route_lookups,
 )
 from valkeyrie.prompts import load_prompt_package
-from valkeyrie.request_audit import LiveObservation, RequestAuditError, live_observation_value
+from valkeyrie.request_audit import (
+    LiveObservation,
+    RequestAuditError,
+    _observation_id,
+    live_observation_value,
+)
 from valkeyrie.retrieval import (
     RetrievalError,
     RetrievalIntent,
@@ -427,10 +432,15 @@ def run_runtime_event(
     except Exception as error:  # noqa: BLE001 - an AWS client failure is a partial, not a crash
         # A throttled DynamoDB read raised botocore's ClientError straight through the Lambda; the
         # caller then saw a FunctionError instead of a replayable partial.
-        if type(error).__name__ not in {
-            "ClientError",
-            "EndpointConnectionError",
-            "ReadTimeoutError",
+        # botocore raises service errors as generated SUBCLASSES of ClientError named after the
+        # error code (ProvisionedThroughputExceededException), so the class hierarchy is the test;
+        # an exact-name test caught only a bare ClientError, which never arrives. Credential and
+        # parameter errors are setup bugs and still crash.
+        bases = {klass.__name__ for klass in type(error).__mro__}
+        if not bases & {"ClientError", "BotoCoreError"} or bases & {
+            "NoCredentialsError",
+            "CredentialRetrievalError",
+            "ParamValidationError",
         }:
             raise
         _LOG.warning("aws call failed: %s: %s", type(error).__name__, str(error)[:200])
@@ -1615,6 +1625,10 @@ ROUND_SECONDS: Final = 25.0
 # One model call is bounded to this; a round is admitted only if the model call it will make can
 # also finish before the deadline, since the 25 s is a measured typical round, not a bound.
 MODEL_CALL_SECONDS: Final = 60.0
+# The router draw is small (median 3 s measured); 15 s is generous and bounded. Stores answer in
+# well under a second; 5 s with one retry.
+ROUTER_CALL_SECONDS: Final = 15.0
+STORE_CALL_SECONDS: Final = 5.0
 
 
 @dataclass(frozen=True)
@@ -1745,7 +1759,10 @@ def _retry_with_supplement(
 
 def _room_for_a_round(deadline: float | None) -> bool:
     """Whether a lookup round fits before the deadline (monotonic seconds), or always when none."""
-    return deadline is None or time.monotonic() + ROUND_SECONDS + MODEL_CALL_SECONDS < deadline
+    return (
+        deadline is None
+        or time.monotonic() + ROUND_SECONDS + MODEL_CALL_SECONDS + ROUTER_CALL_SECONDS < deadline
+    )
 
 
 def _evidence_content_key(item: RuntimeEvidence) -> str:
@@ -2112,6 +2129,15 @@ def _parse_live_evidence(text: str, metadata: Mapping[str, object]) -> LiveRunti
     # digest was altered after it was written, and used to be accepted on syntax alone.
     if payload_digest != "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest():
         raise ApplicationRuntimeError("live observation text does not match its digest")
+    # The observation id binds timestamp, source, type and digest together; a persisted record
+    # with observed_at or source_url changed was accepted while its id still named the original.
+    if observation_id != _observation_id(
+        observed_at=cast(str, observed_at),
+        source_url=cast(str, source_url),
+        object_type=cast(str, object_type),
+        payload_digest=payload_digest,
+    ):
+        raise ApplicationRuntimeError("live observation identity does not match its fields")
     _live_github_url(source_url)
     _live_github_url(citation_url)
     return LiveRuntimeEvidence(
@@ -2926,7 +2952,7 @@ class AwsRuntimeServices:
     @staticmethod
     def _boto3() -> Any:
         try:
-            import boto3  # type: ignore[import-not-found]
+            import boto3
         except ImportError as error:  # pragma: no cover - Lambda provides boto3
             raise RuntimeError("Lambda boto3 runtime is unavailable") from error
         return boto3
@@ -2941,7 +2967,7 @@ class AwsRuntimeServices:
         """A bounded client: botocore's defaults (60 s reads, up to 5 attempts) let one call run
         for minutes, past the round that admitted it and past the Lambda itself."""
         try:
-            from botocore.config import Config  # type: ignore[import-not-found]
+            from botocore.config import Config
         except ImportError:  # pragma: no cover - the test environment has no botocore
             return None
         return Config(
@@ -2949,12 +2975,16 @@ class AwsRuntimeServices:
         )
 
     def _table(self) -> Any:
-        return self._boto3().resource("dynamodb").Table(self._table_name)
+        return (
+            self._boto3()
+            .resource("dynamodb", **self._client_options(STORE_CALL_SECONDS, 2))
+            .Table(self._table_name)
+        )
 
     def read_controls(self) -> Mapping[str, str]:
         response = (
             self._boto3()
-            .client("ssm")
+            .client("ssm", **self._client_options(STORE_CALL_SECONDS, 2))
             .get_parameters(Names=list(_CONTROL_NAMES), WithDecryption=False)
         )
         return {item["Name"]: item["Value"] for item in response.get("Parameters", [])}
@@ -3411,7 +3441,7 @@ class AwsRuntimeServices:
         # reply that runs longer than that is not a lookup plan.
         response = (
             self._boto3()
-            .client("bedrock-runtime")
+            .client("bedrock-runtime", **self._client_options(ROUTER_CALL_SECONDS, 1))
             .converse(
                 modelId=self._model_id,
                 system=[{"text": system}],

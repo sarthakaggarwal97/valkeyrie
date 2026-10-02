@@ -548,8 +548,8 @@ def create_lambda_client(region_name: str) -> LambdaClient:
     ):
         raise ValueError("AWS region is malformed")
     try:
-        import boto3  # type: ignore[import-not-found]
-        from botocore.config import Config  # type: ignore[import-not-found]
+        import boto3
+        from botocore.config import Config
     except ImportError as error:  # pragma: no cover - operator environment supplies boto3
         raise RuntimeError("boto3 is required for AWS adapters") from error
     config = Config(

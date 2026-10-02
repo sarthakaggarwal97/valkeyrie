@@ -211,8 +211,15 @@ def execute(command: Command, token: str | None = None) -> str:
     )
     if command.dry_run:
         return f"Dry run only. This would dispatch {described}"
+    token = token if token is not None else os.environ.get(TOKEN_ENV, "")
+    if not token:
+        return (
+            f"Commands are configured but the dispatch credential ({TOKEN_ENV}) is not set in "
+            "this bot process, so nothing was triggered."
+        )
     # One dispatch of an action per cooldown window, process-wide: twenty distinct events from
-    # one operator dispatched twenty runs. A refusal names when the next is allowed.
+    # one operator dispatched twenty runs. Taken only once a dispatch can happen (after the token
+    # check), and given back when GitHub answers 4xx, since nothing ran.
     now = time.monotonic()
     with _cooldown_lock:
         last = _last_dispatch.get(spec.name)
@@ -220,12 +227,6 @@ def execute(command: Command, token: str | None = None) -> str:
             wait = int(DISPATCH_COOLDOWN_SECONDS - (now - last)) + 1
             raise CommandError(f"{spec.name} was dispatched recently; try again in {wait}s.")
         _last_dispatch[spec.name] = now
-    token = token if token is not None else os.environ.get(TOKEN_ENV, "")
-    if not token:
-        return (
-            f"Commands are configured but the dispatch credential ({TOKEN_ENV}) is not set in "
-            "this bot process, so nothing was triggered."
-        )
     _audit(command, described)
     request = urllib.request.Request(
         f"https://api.github.com/repos/{spec.repo}/actions/workflows/{spec.workflow}/dispatches",
@@ -243,6 +244,9 @@ def execute(command: Command, token: str | None = None) -> str:
         with urllib.request.urlopen(request, timeout=20) as response:
             status = response.status
     except urllib.error.HTTPError as error:
+        if 400 <= error.code < 500:
+            with _cooldown_lock:
+                _last_dispatch.pop(spec.name, None)  # GitHub ran nothing
         detail = {
             401: "the dispatch credential was rejected",
             403: "the dispatch credential lacks Actions write on that repository",

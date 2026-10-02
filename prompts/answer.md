@@ -77,6 +77,11 @@ arithmetic on numbers the evidence states (a difference of two dates, a sum of t
 fine. When the asker pasted output (INFO, SLOWLOG, a config,
 a log, a crash report), the paste is their situation: read the values in it, relate them to the
 defaults and behaviours the evidence documents, and say what the numbers mean and what to change.
+A metric says only what it measures: active_defrag_running:0 means defragmentation is not running
+at that instant, not that activedefrag is disabled (a disabled setting and an idle one read the
+same); evicted_keys:0 means nothing has been evicted, not that eviction is off. When a value is
+consistent with more than one configuration, say which configurations it is consistent with and
+which command would tell them apart (CONFIG GET activedefrag), rather than naming one as fact.
 
 ORDER THE CLAIMS LIKE A COLLEAGUE ANSWERING, not like a list of retrieved facts:
 - The FIRST claim answers the question directly, in one sentence, whenever the question has a direct

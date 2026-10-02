@@ -47,6 +47,12 @@ python_version = "3.11"
 strict = true
 files = ["src", "infra", "tests"]
 
+# The AWS SDK is provided by the Lambda runtime and, since the bot group was locked, also present
+# in the dev environment; it ships no type information either way.
+[[tool.mypy.overrides]]
+module = ["boto3", "boto3.*", "botocore", "botocore.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

@@ -75,6 +75,13 @@ def _load(only: str | None) -> list[dict[str, Any]]:
             raise SystemExit(f"battery entry {case.get('id')!r} is missing {sorted(missing)}")
         if case["expect"] not in _EXPECTED:
             raise SystemExit(f"battery entry {case['id']!r} expects {case['expect']!r}")
+        for key in ("contains", "excludes"):
+            value = case.get(key)
+            if value is not None and (
+                not isinstance(value, list) or not all(isinstance(v, str) for v in value)
+            ):
+                # A bare string would be iterated letter by letter and match almost anything.
+                raise SystemExit(f"battery entry {case['id']!r}: {key} must be a list of strings")
     if only is not None:
         cases = [case for case in cases if case["id"] == only]
         if not cases:
@@ -146,7 +153,11 @@ def main() -> int:
         # Content canaries. The battery judged outcome shape and citation path only, so a fluent
         # wrong answer passed; `contains` names phrases a right answer must say (case-insensitive,
         # over every claim) and `excludes` phrases a wrong one would.
-        spoken = " ".join(str(c.get("text", "")) for c in claims).casefold()
+        spoken = (
+            " ".join(str(c.get("text", "")) for c in claims)
+            + " "
+            + str(result.get("message") or "")
+        ).casefold()
         contains_ok = all(str(w).casefold() in spoken for w in case.get("contains") or [])
         excludes_ok = not any(str(w).casefold() in spoken for w in case.get("excludes") or [])
         return {
@@ -190,6 +201,8 @@ def main() -> int:
         if cited:
             hits = sum(1 for c in cited if c)
             axis = f"  cited {hits}/{len(cited)}"
+        if any(row.get("content_ok") is False for row in draws):
+            axis += "  CONTENT"
             if hits < len(cited):
                 axis += " RETRIEVAL"
         print(f"{mark:5} {passed}/{len(draws)}  {case['id']:32} expect {case['expect']}{axis}")

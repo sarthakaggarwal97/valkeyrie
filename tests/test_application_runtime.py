@@ -3942,11 +3942,18 @@ def test_rounds_are_bounded_by_time_when_a_deadline_is_given_and_by_count_otherw
     from valkeyrie.live_github import FileQuery
 
     assert _room_for_a_round(None) is True
-    from valkeyrie.application_runtime import MODEL_CALL_SECONDS
+    from valkeyrie.application_runtime import MODEL_CALL_SECONDS, ROUTER_CALL_SECONDS
 
     # A round is admitted only when its typical duration AND one bounded model call both fit:
     # a round admitted with 25 s left ran a 60 s model call into the Lambda's end.
-    assert _room_for_a_round(time.monotonic() + ROUND_SECONDS + MODEL_CALL_SECONDS + 1) is True
+    # ... and the bounded router draw the round also makes.
+    assert (
+        _room_for_a_round(
+            time.monotonic() + ROUND_SECONDS + MODEL_CALL_SECONDS + ROUTER_CALL_SECONDS + 1
+        )
+        is True
+    )
+    assert _room_for_a_round(time.monotonic() + ROUND_SECONDS + MODEL_CALL_SECONDS + 1) is False
     assert _room_for_a_round(time.monotonic() + ROUND_SECONDS * 2) is False
     assert _room_for_a_round(time.monotonic() + ROUND_SECONDS / 2) is False
 

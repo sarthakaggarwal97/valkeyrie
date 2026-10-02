@@ -320,6 +320,10 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
         _react(client, event, _WORKING)
         try:
             reply = actions.execute(parsed)
+        except actions.CommandError as refusal:
+            # A refusal (the cooldown) is an answer, not a failure.
+            deliver(text=_plain(str(refusal)), thread_ts=thread)
+            return
         except Exception:
             log.exception("command execution failed")
             deliver(text="That command failed to run. The failure is logged.", thread_ts=thread)
@@ -721,8 +725,8 @@ _SPOKEN: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...
     (re.compile(r"\bAt (?:the )?observation(?: time)?\b,?\s*"), "When I checked, "),
     (re.compile(r"\bat (?:the )?observation(?: time)?\b"), "when I checked"),
     (
-        re.compile(r"\b[Aa]s of the (?:latest |last |most recent )?observation\b,?\s*"),
-        "when I last checked, ",
+        re.compile(r"\b[Aa]s of the (?:latest |last |most recent )?observation\b(,?)(\s*)"),
+        lambda m: "when I last checked" + (", " if m.group(1) or m.start() == 0 else m.group(2)),
     ),
     (re.compile(r"\b[Aa]s observed on (\d{4}-\d{2}-\d{2})\b"), r"when I checked on \1"),
     (
@@ -823,6 +827,11 @@ def _split_outside(text: str, delimiter: re.Pattern[str]) -> list[str]:
     for m in delimiter.finditer(text):
         if _is_protected(m.start(), spans):
             continue
+        # A delimiter inside parentheses belongs to the parenthetical: "(the offset it
+        # processed; not the primary's)" was cut into a broken sentence.
+        before = text[: m.start()]
+        if before.count("(") > before.count(")"):
+            continue
         pieces.append(text[cursor : m.start()])
         cursor = m.end()
     pieces.append(text[cursor:])
@@ -853,8 +862,10 @@ def _is_a_lead(body: str, count: int) -> bool:
     if len(_ITEM_REFERENCE.findall(body)) >= MIN_ITEMS_TO_LIST:
         return False
     # "Before coding a major feature, open an issue..." is a prerequisite, not the answer.
-    if re.match(r"(?:Before|After|If|When|Unless|While)\b", visible):
+    if re.match(r"(?:Before|After|If|When(?! I (?:last )?checked\b)|Unless|While)\b", visible):
         return False
+    if visible.count(",") >= 6 and _enumerated(visible) is not None:
+        return False  # a 21-item list reads down a list, not across a lead line
     return len(_SENTENCE_BREAK.split(body)) == 1
 
 
@@ -1131,10 +1142,8 @@ def _led(text: str) -> str:
         # The semicolon the split consumed becomes a period, and the continuation starts a
         # sentence: "...from its backlog\n    if that is not possible..." read as a fragment.
         # Lower-case names keep their spelling (_sentence_case leaves jemalloc alone).
-        first, rest = clauses[0].rstrip(".") + ".", clauses[1:]
-        return "\n".join(
-            [f"• {first}"] + [f"    {_sentence_case(clause).rstrip('.')}." for clause in rest]
-        )
+        first, rest = _ended(clauses[0]), clauses[1:]
+        return "\n".join([f"• {first}"] + [f"    {_ended(_sentence_case(c))}" for c in rest])
     # A long single sentence with a strong contrast is two thoughts: "X, but Y", "X, although Y".
     # "so" is left joined: a causal sentence reads as one and split as a non sequitur.
     for match in _STRONG_JOIN.finditer(text):
@@ -1201,6 +1210,11 @@ def _enumerated(text: str) -> str | None:
             trailer = items.pop()
         if len(items) < 5 or any(len(item) > 70 or len(item) < 2 for item in items):
             continue
+        if any(
+            item.lower() in _NOT_AN_ITEM or item.lower().split(" ", 1)[0] in _NOT_AN_ITEM
+            for item in items
+        ):
+            continue  # "so", "but", "in practice" between commas are clauses, not items
         if _LISTING_VERB.search(items[0]):
             # The list starts at a later verb; this one was a noun ("security support end
             # dates are: ...").
@@ -1212,10 +1226,19 @@ def _enumerated(text: str) -> str | None:
     return None
 
 
+def _ended(clause: str) -> str:
+    """A clause with a sentence ending: a period is added only when nothing ends it already
+    ("?", "!", an ellipsis or a code span were given "?." and "```.")."""
+    stripped = clause.rstrip()
+    if stripped.endswith(("?", "!", "...", "`", ":")):
+        return stripped
+    return stripped.rstrip(".") + "."
+
+
 def _sentence_case(text: str) -> str:
     """Capitalize a continuation's first word unless it is a name that is spelled lower-case:
     "mem_not_counted_for_evict in INFO memory" must not become "Mem_not_counted_for_evict"."""
-    first = text.split(" ", 1)[0].rstrip(",")
+    first = text.split(" ", 1)[0].rstrip(",;:")
     # Only a word that is plainly English prose is capitalized; a lower-case word that could be a
     # name (jemalloc, valkey-cli, appendonly) keeps its spelling, since a wrong capital changes
     # what it refers to and a missing one does not.
@@ -1226,6 +1249,8 @@ def _sentence_case(text: str) -> str:
 
 _PROSE_STARTERS = frozenset(
     "a an the this that these those it its they there here if when while so but and or otherwise "
+    "however therefore instead because since once after before until unless although though "
+    "meanwhile it's that's there's don't doesn't isn't we're you're "
     "then thus hence also only even each every all both some any no not use set run check try "
     "small large other another with without for from to in on at by as of is are was were be "
     "being been has have had do does did can could will would should may might must you your we "
@@ -1233,9 +1258,12 @@ _PROSE_STARTERS = frozenset(
 )
 
 
+_NOT_AN_ITEM = frozenset(
+    "so but and or then however therefore because although though whereas while yet".split()
+)
 _TRAILER = re.compile(
     r"^(?:each|all|both|plus|with|which|respectively|among others|and more|as well as|where|"
-    r"so|though|although|but|while|whereas|none of|most of|some of|many of)\b",
+    r"though|although|but|while|whereas|none of|most of|some of|many of)\b",
     re.IGNORECASE,
 )
 
