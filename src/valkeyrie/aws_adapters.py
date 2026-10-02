@@ -329,7 +329,7 @@ class DynamoPromotionStore(PromotionStore):
             _response(
                 self._client.put_item(
                     TableName=self._table_name,
-                    Item=_item({"pk": _generation_pk(record.generation_id), **values}),
+                    Item=_bounded_item({"pk": _generation_pk(record.generation_id), **values}),
                     ConditionExpression="attribute_not_exists(pk)",
                 ),
                 PromotionError,
@@ -654,6 +654,19 @@ def _attribute(value: object) -> dict[str, object]:
             "M": {key: _attribute(item) for key, item in cast(Mapping[str, object], value).items()}
         }
     raise ValueError("unsupported DynamoDB attribute type")
+
+
+# DynamoDB refuses items over 400 KB; a 10,000-record structured index serialized to 1.4 MB and
+# would have failed at PutItem with the generation half-published.
+MAX_ITEM_BYTES = 380 * 1024
+
+
+def _bounded_item(values: Mapping[str, object]) -> dict[str, dict[str, object]]:
+    item = _item(values)
+    size = len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    if size > MAX_ITEM_BYTES:
+        raise PublicationError(f"item of {size} bytes exceeds the DynamoDB item bound")
+    return item
 
 
 def _item(values: Mapping[str, object]) -> dict[str, dict[str, object]]:

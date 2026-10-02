@@ -424,6 +424,17 @@ def run_runtime_event(
         )
     except (ApplicationRuntimeError, DraftingError) as error:
         result = RuntimeResult("error", request_id, str(error))
+    except Exception as error:  # noqa: BLE001 - an AWS client failure is a partial, not a crash
+        # A throttled DynamoDB read raised botocore's ClientError straight through the Lambda; the
+        # caller then saw a FunctionError instead of a replayable partial.
+        if type(error).__name__ not in {
+            "ClientError",
+            "EndpointConnectionError",
+            "ReadTimeoutError",
+        }:
+            raise
+        _LOG.warning("aws call failed: %s: %s", type(error).__name__, str(error)[:200])
+        result = RuntimeResult("partial", request_id, "A backing service did not respond in time.")
     return _result_value(result)
 
 
@@ -1289,8 +1300,12 @@ def _accept_output(
             # this failure was unfixable after the fact: it is rare, and it never reproduced on
             # demand. A bounded prefix of the model's own text names the shape. Model output about
             # Valkey, capped, and only on the path that is already discarding it.
+            # Shape only: a prefix of model text can carry a token that was in the evidence.
             _LOG.warning(
-                "unparseable model response: %r (len %d)", response_text[:160], len(response_text)
+                "unparseable model response: len %d, starts %r, sha256 %s",
+                len(response_text),
+                response_text[:1],
+                hashlib.sha256(response_text.encode("utf-8")).hexdigest()[:12],
             )
             raise _UnparseableModelOutput("normalized model response is invalid JSON") from error
         try:
@@ -1373,7 +1388,11 @@ def _accept_output(
         cited.update(unique_ids)
         claims.append({"claim_id": claim_id, "text": text, "evidence_ids": unique_ids})
     if dropped:
-        _LOG.warning("claims dropped: %s", dropped)
+        # Counts by reason: 70,000 malformed claims once made a 2.4 MB log record.
+        tally: dict[str, int] = {}
+        for reason in dropped:
+            tally[reason[:80]] = tally.get(reason[:80], 0) + 1
+        _LOG.warning("claims dropped: %s", dict(sorted(tally.items())[:20]))
     if not claims:
         raise ApplicationRuntimeError("model answer has no claim")
     static_targets: set[tuple[str, str, str, str]] = set()
@@ -1593,6 +1612,9 @@ def _routed_evidence(
 MAX_RETRY_ROUNDS: Final = 2
 MAX_RETRY_ROUNDS_WITH_DEADLINE: Final = 6
 ROUND_SECONDS: Final = 25.0
+# One model call is bounded to this; a round is admitted only if the model call it will make can
+# also finish before the deadline, since the 25 s is a measured typical round, not a bound.
+MODEL_CALL_SECONDS: Final = 60.0
 
 
 @dataclass(frozen=True)
@@ -1723,7 +1745,7 @@ def _retry_with_supplement(
 
 def _room_for_a_round(deadline: float | None) -> bool:
     """Whether a lookup round fits before the deadline (monotonic seconds), or always when none."""
-    return deadline is None or time.monotonic() + ROUND_SECONDS < deadline
+    return deadline is None or time.monotonic() + ROUND_SECONDS + MODEL_CALL_SECONDS < deadline
 
 
 def _evidence_content_key(item: RuntimeEvidence) -> str:
@@ -2086,6 +2108,10 @@ def _parse_live_evidence(text: str, metadata: Mapping[str, object]) -> LiveRunti
         raise ApplicationRuntimeError("live observation type is unsupported")
     if not isinstance(payload_digest, str) or _DIGEST.fullmatch(payload_digest) is None:
         raise ApplicationRuntimeError("live observation digest is malformed")
+    # The text IS the canonical payload; a persisted record whose text no longer hashes to its
+    # digest was altered after it was written, and used to be accepted on syntax alone.
+    if payload_digest != "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest():
+        raise ApplicationRuntimeError("live observation text does not match its digest")
     _live_github_url(source_url)
     _live_github_url(citation_url)
     return LiveRuntimeEvidence(
@@ -2905,6 +2931,23 @@ class AwsRuntimeServices:
             raise RuntimeError("Lambda boto3 runtime is unavailable") from error
         return boto3
 
+    @classmethod
+    def _client_options(cls, read_timeout: float, attempts: int) -> dict[str, Any]:
+        config = cls._config(read_timeout, attempts)
+        return {"config": config} if config is not None else {}
+
+    @staticmethod
+    def _config(read_timeout: float, attempts: int) -> Any:
+        """A bounded client: botocore's defaults (60 s reads, up to 5 attempts) let one call run
+        for minutes, past the round that admitted it and past the Lambda itself."""
+        try:
+            from botocore.config import Config  # type: ignore[import-not-found]
+        except ImportError:  # pragma: no cover - the test environment has no botocore
+            return None
+        return Config(
+            connect_timeout=5, read_timeout=read_timeout, retries={"max_attempts": attempts}
+        )
+
     def _table(self) -> Any:
         return self._boto3().resource("dynamodb").Table(self._table_name)
 
@@ -2977,7 +3020,8 @@ class AwsRuntimeServices:
                     candidate = value.get("SecretString")
                     if isinstance(candidate, str) and candidate.strip():
                         token = candidate.strip()
-                except Exception:
+                except Exception as error:  # noqa: BLE001 - anonymous reads are the fallback
+                    _LOG.warning("github token unavailable: %s", type(error).__name__)
                     # Remembered on THIS instance only: the handler builds one per request, so
                     # the other live reads of this request go anonymous without each calling
                     # Secrets Manager again, and the next request constructs a fresh instance
@@ -3329,7 +3373,7 @@ class AwsRuntimeServices:
             model_input["your_previous_reply_not_evidence"] = previous_answer
         response = (
             self._boto3()
-            .client("bedrock-runtime")
+            .client("bedrock-runtime", **self._client_options(MODEL_CALL_SECONDS, 1))
             .converse(
                 modelId=model_id,
                 system=[{"text": text} for text in system],
@@ -3374,7 +3418,9 @@ class AwsRuntimeServices:
                 messages=[{"role": "user", "content": [{"text": question}]}],
                 # A six-lookup plan with the model's reasoning block runs to about 300 tokens;
                 # a cap it can hit truncates the JSON and loses the whole plan.
-                inferenceConfig={"maxTokens": 800},
+                # A six-lookup plan with a resolved question and retrieval_query is about 1,000
+                # tokens; 800 cut legal plans short.
+                inferenceConfig={"maxTokens": 1600},
                 # Same reasoning setting as the answer call. Measured over ten questions, three
                 # draws each: low effort routed every question at least as well as the default
                 # (it kept the named repository's search in every draw where the default dropped

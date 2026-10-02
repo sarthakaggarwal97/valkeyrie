@@ -320,10 +320,13 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
             # The eyes come off on EVERY exit, including a failed dispatch or a failed post;
             # a reaction left behind reads as the bot still working on it.
             _unreact(client, event, _WORKING)
-        deliver(text=reply, thread_ts=thread, unfurl_links=False)
+        # The dispatch may have happened: a failed confirmation must NOT release the fence, or a
+        # redelivery dispatches the workflow a second time.
+        say(text=reply, thread_ts=thread, unfurl_links=False)
         return
 
     _react(client, event, _WORKING)
+    failed = False
     try:
         conversation = _thread_history(event, client)
         started = time.monotonic()
@@ -334,11 +337,15 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
         # redelivery (or the asker's retry) is answered: the runtime replays a stored result and
         # re-runs an unfinished one, so neither costs a second inference.
         log.exception("answer failed")
+        failed = True
+    finally:
+        # The eyes come off BEFORE the fence is released below: a retry that started in between
+        # added its own eyes, which this handler then removed.
+        _unreact(client, event, _WORKING)
+    if failed:
         _release(key)
         say(text="Something went wrong answering that. The failure is logged.", thread_ts=thread)
         return
-    finally:
-        _unreact(client, event, _WORKING)
     deliver(text=_bounded_reply(text), thread_ts=thread, unfurl_links=False)
 
 

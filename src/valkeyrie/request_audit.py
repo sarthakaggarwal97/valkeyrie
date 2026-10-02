@@ -200,7 +200,7 @@ def _decoded_payload(value: object) -> object:
     try:
         text = value.decode("utf-8")
         decoded = cast(object, json.loads(text))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
         raise RequestAuditError("live observation canonical payload is not valid JSON") from error
     _validated_json_value(decoded)
     return decoded

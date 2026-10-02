@@ -396,7 +396,7 @@ def test_deployed_retrieval_rejects_forged_reviewed_source_metadata(
         def __init__(self, client: Client) -> None:
             self.client_value = client
 
-        def client(self, name: str) -> Client:
+        def client(self, name: str, **kwargs: object) -> Client:
             assert name == "bedrock-agent-runtime"
             return self.client_value
 
@@ -1236,7 +1236,7 @@ def test_aws_converse_places_reviewed_answer_contract_after_untrusted_payload(
         def __init__(self, bedrock: BedrockClient) -> None:
             self.bedrock = bedrock
 
-        def client(self, name: str) -> BedrockClient:
+        def client(self, name: str, **kwargs: object) -> BedrockClient:
             assert name == "bedrock-runtime"
             return self.bedrock
 
@@ -1526,7 +1526,7 @@ def test_aws_static_retrieval_reuses_intent_aliases_and_scoped_fallback(
         def __init__(self, bedrock: Bedrock) -> None:
             self.bedrock = bedrock
 
-        def client(self, name: str) -> Bedrock:
+        def client(self, name: str, **kwargs: object) -> Bedrock:
             assert name == "bedrock-agent-runtime"
             return self.bedrock
 
@@ -3002,7 +3002,7 @@ def test_the_clarification_note_reaches_the_model_payload() -> None:
             }
 
     class _Boto3:
-        def client(self, name: str) -> _Client:
+        def client(self, name: str, **kwargs: object) -> _Client:
             return _Client()
 
     services = AwsRuntimeServices.__new__(AwsRuntimeServices)
@@ -3942,7 +3942,12 @@ def test_rounds_are_bounded_by_time_when_a_deadline_is_given_and_by_count_otherw
     from valkeyrie.live_github import FileQuery
 
     assert _room_for_a_round(None) is True
-    assert _room_for_a_round(time.monotonic() + ROUND_SECONDS * 2) is True
+    from valkeyrie.application_runtime import MODEL_CALL_SECONDS
+
+    # A round is admitted only when its typical duration AND one bounded model call both fit:
+    # a round admitted with 25 s left ran a 60 s model call into the Lambda's end.
+    assert _room_for_a_round(time.monotonic() + ROUND_SECONDS + MODEL_CALL_SECONDS + 1) is True
+    assert _room_for_a_round(time.monotonic() + ROUND_SECONDS * 2) is False
     assert _room_for_a_round(time.monotonic() + ROUND_SECONDS / 2) is False
 
     class Endless(FakeServices):
@@ -4181,7 +4186,7 @@ def test_the_github_token_is_read_once_under_a_lock_and_a_failure_lasts_one_requ
         def __init__(self, secrets: Secrets) -> None:
             self.secrets = secrets
 
-        def client(self, name: str) -> Secrets:
+        def client(self, name: str, **kwargs: object) -> Secrets:
             return self.secrets
 
     os.environ["GITHUB_TOKEN_SECRET_ID"] = "secret-id"

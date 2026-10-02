@@ -17,6 +17,21 @@ actions = pytest.importorskip("actions")
 OPERATOR = "U08UZUQ790R"
 
 
+@pytest.fixture(autouse=True)
+def _fresh_cooldown() -> None:
+    actions._last_dispatch.clear()
+
+
+def test_a_second_dispatch_of_one_action_inside_the_cooldown_is_refused() -> None:
+    """Twenty distinct events from one operator dispatched twenty runs."""
+    actions._last_dispatch.clear()
+    actions._last_dispatch["ci"] = __import__("time").monotonic()
+    spec = actions.ActionSpec("ci", "d", "sarthakaggarwal97/valkey", "ci.yml", "main", {}, ())
+    command = actions.Command(spec, {}, False, "U1")
+    with pytest.raises(actions.CommandError, match="dispatched recently"):
+        actions.execute(command, token="t")
+
+
 def test_only_messages_naming_the_run_word_are_commands() -> None:
     assert actions.match_command("run backport-sweep branch=8.1") == "backport-sweep branch=8.1"
     assert actions.match_command("  RUN ci") == "ci"
@@ -66,7 +81,7 @@ def test_the_catalog_itself_cannot_target_the_org(tmp_path: Path) -> None:
         "    repo: valkey-io/valkey\n"
         "    workflow: ci.yml\n"
     )
-    with pytest.raises(actions.CommandError, match="valkey-io"):
+    with pytest.raises(actions.CommandError, match="outside sarthakaggarwal97"):
         actions.load_catalog(bad)
 
 

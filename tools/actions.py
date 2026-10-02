@@ -23,9 +23,12 @@ question answering, so "run down the list of eviction policies" still gets an an
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shlex
+import threading
+import time
 import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,6 +38,10 @@ from typing import Any
 import yaml
 
 CATALOG_PATH = Path(__file__).with_name("actions.yaml")
+log = logging.getLogger("valkeyrie.actions")
+DISPATCH_COOLDOWN_SECONDS = 120.0
+_last_dispatch: dict[str, float] = {}
+_cooldown_lock = threading.Lock()
 AUDIT_PATH = Path(os.environ.get("VALKEYRIE_ACTIONS_AUDIT", "/tmp/valkeyrie-actions.jsonl"))
 # The write credential. Deliberately a DIFFERENT variable from the read token, so granting one can
 # never accidentally grant the other, and unset means every command answers "commands are off".
@@ -68,6 +75,18 @@ class Command:
     requested_by: str
 
 
+PERSONAL_OWNER = "sarthakaggarwal97"
+_REF = re.compile(r"^(?!.*\.\.)(?!/)(?!.*//)[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+
+
+def _catalog_ref(name: str, value: object) -> str:
+    """A git ref from the catalog: a branch or tag name, no whitespace, control characters or
+    traversal; str() on an arbitrary YAML value let "main\\nunexpected" through."""
+    if not isinstance(value, str) or _REF.fullmatch(value) is None:
+        raise CommandError(f"catalog action {name} has a malformed ref")
+    return value
+
+
 def load_catalog(path: Path = CATALOG_PATH) -> tuple[tuple[str, ...], dict[str, ActionSpec]]:
     """The operator list and the action catalog, fail-closed on any malformed entry."""
     document = yaml.safe_load(path.read_text())
@@ -82,10 +101,14 @@ def load_catalog(path: Path = CATALOG_PATH) -> tuple[tuple[str, ...], dict[str, 
             raise CommandError(f"catalog action name {name!r} is malformed")
         # The org boundary, enforced in code as well as stated in the catalog comment: a command
         # must not be able to touch valkey-io even if the catalog is edited carelessly.
-        if repo.startswith("valkey-io/"):
-            raise CommandError(f"catalog action {name} targets valkey-io, which commands may not")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
             raise CommandError(f"catalog action {name} has a malformed repository")
+        # Positive allowlist of the one personal owner, case-insensitively: a deny on the spelling
+        # "valkey-io/" accepted "Valkey-IO/valkey", which GitHub resolves to the organization.
+        if repo.split("/", 1)[0].casefold() != PERSONAL_OWNER:
+            raise CommandError(
+                f"catalog action {name} targets a repository outside {PERSONAL_OWNER}"
+            )
         workflow = str(raw.get("workflow", ""))
         if not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", workflow):
             raise CommandError(f"catalog action {name} has a malformed workflow file")
@@ -97,7 +120,7 @@ def load_catalog(path: Path = CATALOG_PATH) -> tuple[tuple[str, ...], dict[str, 
             description=str(raw.get("description", "")),
             repo=repo,
             workflow=workflow,
-            ref=str(raw.get("ref", "main")),
+            ref=_catalog_ref(name, raw.get("ref", "main")),
             inputs={str(k): dict(v or {}) for k, v in inputs.items()},
             allowed_slack_users=tuple(str(u) for u in raw.get("allowed_slack_users") or ()),
         )
@@ -188,6 +211,15 @@ def execute(command: Command, token: str | None = None) -> str:
     )
     if command.dry_run:
         return f"Dry run only. This would dispatch {described}"
+    # One dispatch of an action per cooldown window, process-wide: twenty distinct events from
+    # one operator dispatched twenty runs. A refusal names when the next is allowed.
+    now = time.monotonic()
+    with _cooldown_lock:
+        last = _last_dispatch.get(spec.name)
+        if last is not None and now - last < DISPATCH_COOLDOWN_SECONDS:
+            wait = int(DISPATCH_COOLDOWN_SECONDS - (now - last)) + 1
+            raise CommandError(f"{spec.name} was dispatched recently; try again in {wait}s.")
+        _last_dispatch[spec.name] = now
     token = token if token is not None else os.environ.get(TOKEN_ENV, "")
     if not token:
         return (
@@ -236,6 +268,6 @@ def _audit(command: Command, described: str) -> None:
     try:
         with AUDIT_PATH.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row) + "\n")
-    except OSError:
-        # The command still runs: the audit file is evidence, not authorization.
-        pass
+    except OSError as error:
+        # The command still runs: the audit file is evidence, not authorization. Said in the log.
+        log.warning("command audit could not be written (%s)", type(error).__name__)

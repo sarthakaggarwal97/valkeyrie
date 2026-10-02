@@ -3263,6 +3263,10 @@ def _generic(
     value: Mapping[str, object], name: str, template: _Template, filled: Mapping[str, str], url: str
 ) -> dict[str, object]:
     """Keep only the template's named fields from the response, bounded, plus provenance."""
+    if any(k.startswith("items[].") for k in template.keep) and set(value) != {"items"}:
+        # A list endpoint answers with a bare array, which the response layer wraps as exactly
+        # {"items": [...]}; an object with other keys is not that endpoint's answer.
+        raise LiveGitHubError("generic read expected a bare array response")
     _require_shape(value, template, filled)
     kept: dict[str, object] = {}
     items_fields = [k[len("items[].") :] for k in template.keep if k.startswith("items[].")]

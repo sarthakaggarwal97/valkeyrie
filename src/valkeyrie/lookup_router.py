@@ -131,9 +131,9 @@ ROUTER_SYSTEM: Final = (
     '- {"kind":"corpus_search"}: the indexed corpus of Valkey repositories: source code, '
     "documentation, governance, contribution guides, client libraries, modules. Use for how "
     "something works, how to use a command, who maintains what, how to contribute.\n"
-    '- {"kind":"pull_request","repository":"valkey","number":N}: one pull request by number. '
+    '- {"kind":"pull_request","repository":"valkey","number":3853}: one pull request by number. '
     "Use when a number is given and the asker wants its status, design, or whether it merged.\n"
-    '- {"kind":"issue","repository":"valkey","number":N}: one issue by number.\n'
+    '- {"kind":"issue","repository":"valkey","number":4153}: one issue by number.\n'
     '- {"kind":"releases","repository":"valkey"}: the most recent releases INCLUDING release '
     "candidates and other prereleases. Use for anything about what has shipped, what the latest "
     "or newest version is, whether an rc or a version exists.\n"
@@ -158,7 +158,8 @@ ROUTER_SYSTEM: Final = (
     "a part of the "
     "code, together with a file lookup of MAINTAINERS.md for the declared owners and, for a pull "
     "request, its pull_request read, which lists the files it changes.\n"
-    '- {"kind":"github_read","template":"NAME","values":{...}}: one read from a closed catalog of '
+    '- {"kind":"github_read","template":"commit","values":{"repository":"valkey",'
+    '"sha":"f4cbd1c5ef06f0dd574799a0a6ab5f5bf57c82a5"}}: one read from a closed catalog of '
     "templates, each a bounded GitHub endpoint reduced to named fields. Templates and their "
     "placeholders: "
     + "; ".join(
@@ -196,7 +197,7 @@ ROUTER_SYSTEM: Final = (
     "security advisory by CVE or GHSA id, carrying its severity, description and the versions "
     "that fixed it. Omit the identifier to list the recent advisories. Use for any question about "
     "a CVE, a GHSA id, or which release fixed a vulnerability.\n"
-    '- {"kind":"project_board","number":N}: a valkey-io project board, the planning view for a '
+    '- {"kind":"project_board","number":51}: a valkey-io project board, the planning view for a '
     "release or a workstream. Use for what is planned, in progress, or remaining for a release, "
     "or what is on a board. Known boards: "
     + ", ".join(f"{title} is #{number}" for title, number in KNOWN_BOARDS.items())
@@ -217,7 +218,8 @@ ROUTER_SYSTEM: Final = (
     "answering that with merged ones answers a different question. With a window the terms may be "
     'empty, so "what merged '
     'this week" is a search with since and no terms, and "what happened in August" is since the '
-    "1st until the 31st. Compute the days from today's date, given with the question. "
+    "1st until the 31st. Take the days from the dated anchors given with the question (today, "
+    "yesterday, this week, last week, this and last month); never work a date out from memory. "
     'For pull requests an optional "review" of "required" (no review yet, the review queue), '
     '"approved", or "changes_requested" selects by review state, and it waives the terms: "which '
     'pull requests need review" is scope pull-request with review required and state open. An '
@@ -306,7 +308,9 @@ ROUTER_SYSTEM: Final = (
     "when the asker names a run id or the shortfall names one, ci_jobs for that run. To ROOT-CAUSE "
     "it, go on: the failing job names a test suite (unit, integration, cluster), so a code_search "
     "for the test name the shortfall reports, a file lookup of that test, and a path_history of "
-    "the source file it exercises, which shows the recent commits that could have broken it.\n"
+    "the source file it exercises, which shows the recent commits that could have broken it. "
+    "Know the limit: ci_jobs names the failing JOB and STEP, not the failing test; the test name "
+    "is in the job log, which no lookup reads. Say so rather than promising it.\n"
     "- HOW DOES something WORK INTERNALLY, WHAT HAPPENS WHEN, or TRACE a behaviour (key expiry, "
     "a client connecting, a command executing, replication catching up): corpus_search for the "
     "design material, then FOLLOW THE CODE. A code_search finds where the function or symbol is "
@@ -335,8 +339,9 @@ ROUTER_SYSTEM: Final = (
     "question already stands alone, return it unchanged. Choose lookups for the standalone "
     "question, not the fragment.\n"
     "\n"
-    'Reply format exactly: {"lookups":[...]} or, with conversation, '
-    '{"question":"...","lookups":[...]}'
+    'Reply format exactly: {"lookups":[...]}; with conversation add "question":"..." (the '
+    'standalone question); for a non-English question add "retrieval_query":"..." (its English '
+    "restatement). No other keys."
 )
 
 
@@ -458,11 +463,15 @@ def _dated_anchors(today: str) -> str:
     day = date.fromisoformat(today)
     month_start = day.replace(day=1)
     last_month_end = month_start - timedelta(days=1)
+    week_start = day - timedelta(days=day.weekday())
+    last_week_start = week_start - timedelta(days=7)
     return (
         f"Today is {day.isoformat()} ({day.strftime('%A')}). Yesterday was "
         f"{(day - timedelta(days=1)).isoformat()}. Seven days ago was "
         f"{(day - timedelta(days=7)).isoformat()}, thirty days ago "
         f"{(day - timedelta(days=30)).isoformat()}. "
+        f"This week began {week_start.isoformat()} (Monday); last week was "
+        f"{last_week_start.isoformat()} to {(week_start - timedelta(days=1)).isoformat()}. "
         f"This month began {month_start.isoformat()}; last month was "
         f"{last_month_end.replace(day=1).isoformat()} to {last_month_end.isoformat()}. "
         f"This year began {day.replace(month=1, day=1).isoformat()}. Copy these dates; do not "
@@ -1093,7 +1102,7 @@ def _repository(item: Mapping[str, object]) -> str:
     repository = item.get("repository", _DEFAULT_REPOSITORY)
     if not isinstance(repository, str) or _REPOSITORY.fullmatch(repository) is None:
         raise LookupRouterError("lookup repository is malformed")
-    if repository.startswith(".") or ".." in repository:
+    if ".." in repository:
         raise LookupRouterError("lookup repository is malformed")
     # The parser is the boundary, so it refuses what the transport would refuse anyway. A
     # syntactically valid name outside the reviewed inventory used to parse into a typed query and
