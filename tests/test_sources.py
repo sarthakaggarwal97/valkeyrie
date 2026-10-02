@@ -268,3 +268,14 @@ def test_valkey_doc_utf8_bom_topics_remain_reviewed_canonical_sources() -> None:
     for path in paths:
         assert classify_path(document, "valkey-doc", path) == "include"
         assert classify_path(document, "valkey-glide-docs", path) == "include"
+
+
+def test_hard_exclusions_match_case_insensitively() -> None:
+    """tests/Credential.txt and tests/.ENV were included while their lower-case forms were not."""
+    from pathlib import Path as _Path
+
+    from valkeyrie.sources import classify_path, load_source_inventory
+
+    document = load_source_inventory(_Path(__file__).resolve().parents[1] / "sources.yaml")
+    for path in ("tests/credential.txt", "tests/Credential.txt", "tests/.env", "tests/.ENV"):
+        assert classify_path(document, "valkey-glide", path) == "exclude", path

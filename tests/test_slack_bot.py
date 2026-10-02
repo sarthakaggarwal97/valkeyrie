@@ -633,8 +633,8 @@ def test_issue_and_pr_words_before_a_number_are_linked_and_long_claims_get_a_lea
         "returned 217 results."
     )
     lines = slack_bot._led(one_sentence).split("\n")
-    assert lines[0].startswith("• There are open fix PRs") and lines[0].endswith("crash-log tests")
-    assert lines[1] == "    a search for open PRs matching fix test failure returned 217 results."
+    assert lines[0].startswith("• There are open fix PRs") and lines[0].endswith("crash-log tests.")
+    assert lines[1] == "    A search for open PRs matching fix test failure returned 217 results."
 
 
 def test_the_assistant_surface_answers_through_the_same_path_with_a_status_and_a_title(
@@ -694,7 +694,7 @@ def test_prose_is_spoken_and_the_first_claim_leads() -> None:
         "When I checked, valkey had 559 open issues."
     )
     assert spoken("It was merged on 2026-09-15T21:15:53Z and released 2026-10-01.") == (
-        "It was merged on 15 Sep 2026 and released 1 Oct 2026."
+        "It was merged on 15 Sep 2026, 21:15 UTC and released 1 Oct 2026."
     )
     assert spoken("The evidence does not include the job logs.") == "I couldn't find the job logs."
     assert spoken("The evidence contains no benchmark.") == "I found no benchmark."
@@ -702,7 +702,10 @@ def test_prose_is_spoken_and_the_first_claim_leads() -> None:
         "What I read covers only Valkey; it says nothing about X."
     )
     assert spoken("a decision the evidence cannot settle") == "a decision my reading cannot settle"
-    assert spoken("Given these facts, GT suits counters.") == "So GT suits counters."
+    # "Given these facts" is natural prose and stays; an earlier rewrite to "So" read abruptly.
+    assert (
+        spoken("Given these facts, GT suits counters.") == "Given these facts, GT suits counters."
+    )
     # Not touched: a version, a login at sentence start, code, a date glued to other text.
     assert spoken("madolson is the chair.") == "madolson is the chair."
     assert spoken("Use 9.0.6 or 2026-09-01.x builds.") == "Use 9.0.6 or 2026-09-01.x builds."
@@ -758,8 +761,8 @@ def test_a_long_enumeration_is_listed_and_a_long_two_thought_sentence_is_broken(
         "demoting node freeze the event loop, so an unintended immediate failover left slot 609 "
         "owned by the wrong node and cascading test failures followed."
     )
-    broken = slack_bot._led(cause).split("\n")
-    assert len(broken) == 2 and broken[1].startswith("    So an unintended")
+    # A causal "X, so Y" is one thought and stays on one line (split, it read as a non sequitur).
+    assert slack_bot._led(cause) == f"• {cause}"
     # A qualifier about the whole list follows it on its own line instead of posing as an item.
     supported = (
         "Currently supported versions and their initial releases are 9.1 (2026-05-19), "

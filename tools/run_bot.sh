@@ -13,4 +13,4 @@ cd "$(dirname "$0")/.."
 export AWS_PROFILE="${AWS_PROFILE:-valkeyrie-personal}"
 export SLACK_TEAM_ID="${SLACK_TEAM_ID:-THDV9665P}"
 git pull -q origin main
-exec uv run --with boto3==1.40.21 --with slack-bolt==1.21.2 python tools/slack_bot.py
+exec uv run --locked --group bot python tools/slack_bot.py

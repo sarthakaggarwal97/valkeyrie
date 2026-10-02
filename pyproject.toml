@@ -14,6 +14,9 @@ dependencies = [
 ]
 
 [dependency-groups]
+# The Slack bot's own closure, locked with everything else so pip-audit sees it and so a restart
+# resolves the same transitive versions as the last one (uv run --with resolved them anew).
+bot = ["boto3==1.40.21", "slack-bolt==1.21.2"]
 dev = [
     "bandit==1.9.4",
     "hatchling==1.32.0",

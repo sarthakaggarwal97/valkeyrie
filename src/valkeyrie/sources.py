@@ -190,7 +190,9 @@ def classify_path(
     if entry is None:
         raise SourceInventoryError(f"unknown repository: {repository_name}")
 
-    if _matches(_hard_exclusion_patterns(document), path):
+    # Case-insensitive: tests/Credential.txt and tests/.ENV were included while their lower-case
+    # spellings were excluded.
+    if _matches([p.casefold() for p in _hard_exclusion_patterns(document)], path.casefold()):
         return "exclude"
     policies = cast(dict[str, dict[str, object]], document["path_policies"])
     policy_name = cast(str, entry["path_policy"])

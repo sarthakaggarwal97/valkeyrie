@@ -15,11 +15,13 @@
   question: What does HSET do?
   expect: answer
   cites: commands/hset.md
+  contains: [hash, field]
   because: The simplest possible question. If this fails, everything is broken.
 
 - id: command-hello
   question: HELLO
   expect: answer
+  contains: [RESP3]
   cites: commands/hello.md
   because: HELLO is a command, and a case-insensitive greeting pattern greeted it back instead.
 
@@ -38,6 +40,7 @@
 - id: internals-event-loop
   question: How does the Valkey event loop process callbacks?
   expect: answer
+  contains: [event]
   cites: src/ae.c
   because: "The event category matched 'event' and scoped the event loop to the website and community."
 
@@ -202,6 +205,7 @@
 - id: repo-symbol
   question: Which file implements the SCAN cursor logic?
   expect: answer
+  contains: [scanGenericCommand]
   cites: src/db.c
   because: Embedding similarity over prose does not find a function; code search does.
 
@@ -218,7 +222,10 @@
 - id: meta-capability
   question: What level of support can you provide?
   expect: clarification
-  because: A maintainer asked this and got a deflection; the application now answers it exactly.
+  because: |
+    A maintainer asked this and got a deflection. The application answers it from a fixed
+    capability text, which the runtime reports under the clarification outcome (no evidence, no
+    model call), so clarification is the right shape here.
 
 - id: meta-about-last-answer
   question: why did you just mention these?
@@ -231,10 +238,15 @@
   because: It asked which items were meant while the items sat in the turn immediately above.
 
 - id: copilot-troubleshooting
-  question: I get MISCONF Errors writing against a read only replica, what now?
+  question: I get READONLY You can't write against a read only replica, what now?
   expect: answer
   cites: topics/
-  because: A pasted error is the subject of the message, whatever library it also mentions.
+  contains: [replica]
+  excludes: [MISCONF]
+  because: |
+    A pasted error is the subject of the message, whatever library it also mentions. The error a
+    read-only replica returns is READONLY (src/server.c); MISCONF is the persistence error, and an
+    earlier version of this entry conflated them.
 
 - id: copilot-troubleshooting-known
   question: my valkey server keeps crashing with SIGSEGV on startup, is this known?
@@ -299,7 +311,11 @@
     evicted_keys:0
   expect: answer
   cites: valkey.conf
+  contains: [noeviction]
+  excludes: [defrag is disabled, defrag is off, defragmentation is disabled]
   because: |
     Diagnosis from pasted output. The paste is the asker's situation, not a search string: the
     router reads valkey.conf around the options the metrics name and the answer relates the numbers
-    (fragmentation 1.83 with defrag off, 90% of maxmemory under noeviction) to the defaults.
+    (fragmentation 1.83, 90% of maxmemory under noeviction) to the defaults. active_defrag_running:0
+    says only that defrag is not running at this instant (commands/info.md), not that activedefrag
+    is disabled, and the answer must not claim the latter.

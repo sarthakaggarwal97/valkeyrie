@@ -115,7 +115,7 @@ def _unreact(client: Any, event: dict[str, Any], name: str) -> None:
     try:
         client.reactions_remove(channel=channel, timestamp=timestamp, name=name)
     except Exception as error:  # noqa: BLE001 - removal failing is not a failure
-        log.debug("could not remove :%s: (%s)", name, error)
+        log.debug("could not remove :%s: (%s)", name, _brief(error))
 
 
 def _react(client: Any, event: dict[str, Any], name: str) -> None:
@@ -133,11 +133,12 @@ def _react(client: Any, event: dict[str, Any], name: str) -> None:
         if "missing_scope" in text or "not_allowed_token_type" in text:
             _reaction_scope_missing = True
             log.warning(
-                "reactions are disabled: the Slack app needs the reactions:write scope (%s)", error
+                "reactions are disabled: the Slack app needs the reactions:write scope (%s)",
+                _brief(error),
             )
             return
         # already_reacted is the common one and means the mark is already there.
-        log.debug("could not add :%s: (%s)", name, error)
+        log.debug("could not add :%s: (%s)", name, _brief(error))
 
 
 def record_feedback(event: dict[str, Any], client: Any) -> None:
@@ -171,6 +172,13 @@ def record_feedback(event: dict[str, Any], client: Any) -> None:
         log.debug("could not record feedback (%s)", error)
         return
     log.info("feedback %s on %s by %s", verdict, item.get("ts"), event.get("user"))
+
+
+def _brief(error: BaseException) -> str:
+    """An exception as type and Slack error code only: str(SlackApiError) carries the whole
+    response, which can include tokens or user text."""
+    code = getattr(getattr(error, "response", None), "get", lambda k, d=None: d)("error")
+    return f"{type(error).__name__}" + (f": {code}" if isinstance(code, str) else "")
 
 
 def _claim(key: str) -> bool:
@@ -412,7 +420,7 @@ def answer_assistant_message(
     try:
         set_status("reading Valkey sources...")
     except Exception as error:  # noqa: BLE001 - the status line is decoration
-        log.debug("could not set assistant status (%s)", error)
+        log.debug("could not set assistant status (%s)", _brief(error))
     try:
         conversation = _thread_history(payload, client)
         started = time.monotonic()
@@ -428,7 +436,7 @@ def answer_assistant_message(
         try:
             set_title(question[:60])
         except Exception as error:  # noqa: BLE001 - a title is decoration
-            log.debug("could not set assistant thread title (%s)", error)
+            log.debug("could not set assistant thread title (%s)", _brief(error))
     deliver(text=_bounded_reply(text), unfurl_links=False)
 
 
@@ -540,7 +548,7 @@ def _thread_history(event: dict[str, Any], client: Any) -> list[dict[str, str]]:
             return []  # The mention was never found: stale history is worse than none.
     except Exception as error:  # noqa: BLE001 - history is optional; the answer is not.
         if not _history_unavailable_logged:
-            log.warning("thread history unavailable, answering without it: %s", error)
+            log.warning("thread history unavailable, answering without it: %s", _brief(error))
             _history_unavailable_logged = True
         return []
     if not any(m.get("ts") == current for m in messages):
@@ -700,12 +708,21 @@ _MORE_HELP = "For more: the Valkey Slack help channels, GitHub Discussions, or v
 # Spoken forms for the phrases the model writes from its instructions. "The evidence does not
 # include X" is true and reads like a form letter; "I couldn't find X" says the same thing the way
 # a colleague would. Only exact stems are rewritten, so nothing about Valkey itself is reworded.
-_SPOKEN: tuple[tuple[re.Pattern[str], str], ...] = (
+_SPOKEN: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
+    (
+        re.compile(r"\b(?:are|is) (?:not )?listed in the (?:supplied |available )?evidence\b"),
+        lambda m: (
+            m.group(0)
+            .replace("the evidence", "the results")
+            .replace("supplied ", "")
+            .replace("available ", "")
+        ),
+    ),
     (re.compile(r"\bAt (?:the )?observation(?: time)?\b,?\s*"), "When I checked, "),
     (re.compile(r"\bat (?:the )?observation(?: time)?\b"), "when I checked"),
     (
-        re.compile(r"\b[Aa]s of the (?:latest |last |most recent )?observation\b"),
-        "when I last checked",
+        re.compile(r"\b[Aa]s of the (?:latest |last |most recent )?observation\b,?\s*"),
+        "when I last checked, ",
     ),
     (re.compile(r"\b[Aa]s observed on (\d{4}-\d{2}-\d{2})\b"), r"when I checked on \1"),
     (
@@ -742,7 +759,6 @@ _SPOKEN: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         "my reading",
     ),
-    (re.compile(r"\bGiven these [a-z]+,?\s*"), "So "),
 )
 _ISO_INSTANT = re.compile(
     r"(?<![\w:/.-])(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z(?![\w:/-]|\.\w)"
@@ -764,7 +780,11 @@ def _day(match: re.Match[str]) -> str:
                 return match.group(0)
     except ValueError:
         return match.group(0)
-    return f"{when.day} {_MONTHS[when.month - 1]} {when.year}"
+    rendered = f"{when.day} {_MONTHS[when.month - 1]} {when.year}"
+    if match.re is _ISO_INSTANT:
+        # "merged on 15 Sep 2026" dropped 21:15:53Z; the time matters for a merge or a release.
+        rendered += f", {int(match.group(4)):02d}:{int(match.group(5)):02d} UTC"
+    return rendered
 
 
 # Text the renderer must never rewrite or split inside: fenced code, inline code, and anything in
@@ -827,9 +847,13 @@ def _is_a_lead(body: str, count: int) -> bool:
     enough to read at a glance. Otherwise it is rendered like the rest."""
     if count == 1:
         return True
-    if "\n" in body or len(body) > LEAD_MAX_CHARS:
+    visible = re.sub(r"<[^|>]+\|([^>]+)>", r"\1", body)
+    if "\n" in body or len(visible) > LEAD_MAX_CHARS:
         return False
     if len(_ITEM_REFERENCE.findall(body)) >= MIN_ITEMS_TO_LIST:
+        return False
+    # "Before coding a major feature, open an issue..." is a prerequisite, not the answer.
+    if re.match(r"(?:Before|After|If|When|Unless|While)\b", visible):
         return False
     return len(_SENTENCE_BREAK.split(body)) == 1
 
@@ -839,6 +863,8 @@ def _live_label(kind: str, name: str, url: str) -> str:
     failure" rather than "issue (PR search: is:open fix test failure)", "valkey.conf (live)" rather
     than "file (valkey.conf)", "#3853" rather than "issue (#3853)"."""
     if kind in ("issue", "issue search"):
+        if "/pull/" in url and name.startswith("#"):
+            return f"PR {name}"
         if name.startswith(("PR search:", "issue search:")):
             return name.replace("PR search:", "PRs matching", 1).replace(
                 "issue search:", "issues matching", 1
@@ -1090,21 +1116,27 @@ def _led(text: str) -> str:
     dropping nothing. Short claims and single sentences are left exactly as written.
     """
     if len(text) <= LEAD_MAX_CHARS:
-        return f"• {text}"
+        # A 214-character sentence listing 21 ACL categories is still a list to read down.
+        enumerated = _enumerated(text) if text.count(",") >= 6 else None
+        return enumerated if enumerated is not None else f"• {text}"
     sentences = _SENTENCE_BREAK.split(text, maxsplit=1)
     if len(sentences) >= 2:
         return f"• {sentences[0]}\n    {sentences[1]}"
     # One long sentence: its semicolon-joined clauses are separate points and read as such.
-    clauses = [c.strip() for c in _split_outside(text, _CLAUSE_BREAK) if c.strip()]
-    if len(clauses) >= 2:
-        first, rest = clauses[0], clauses[1:]
-        # Continuations keep their own spelling: capitalizing changed "jemalloc" to "Jemalloc".
-        return "\n".join([f"• {first}"] + [f"    {clause}" for clause in rest])
     enumerated = _enumerated(text)
     if enumerated is not None:
         return enumerated
-    # A long single sentence with a strong conjunction is two thoughts: "X, so Y", "X, while Y".
-    # The second starts its own indented line. Only when both halves are substantial.
+    clauses = [c.strip() for c in _split_outside(text, _CLAUSE_BREAK) if c.strip()]
+    if len(clauses) >= 2:
+        # The semicolon the split consumed becomes a period, and the continuation starts a
+        # sentence: "...from its backlog\n    if that is not possible..." read as a fragment.
+        # Lower-case names keep their spelling (_sentence_case leaves jemalloc alone).
+        first, rest = clauses[0].rstrip(".") + ".", clauses[1:]
+        return "\n".join(
+            [f"• {first}"] + [f"    {_sentence_case(clause).rstrip('.')}." for clause in rest]
+        )
+    # A long single sentence with a strong contrast is two thoughts: "X, but Y", "X, although Y".
+    # "so" is left joined: a causal sentence reads as one and split as a non sequitur.
     for match in _STRONG_JOIN.finditer(text):
         head, tail = text[: match.start()].rstrip(), text[match.end() :].strip()
         if len(head) >= 60 and len(tail) >= 60:
@@ -1113,9 +1145,10 @@ def _led(text: str) -> str:
 
 
 # "while" and "whereas" are left joined: a contrast reads as one thought, split it reads as two.
-_STRONG_JOIN = re.compile(r",\s+(so|but|which means|although)\s+")
+_STRONG_JOIN = re.compile(r",\s+(but|which means|although)\s+")
 _LISTING_VERB = re.compile(
-    r"\b(?:includes?|including|such as|are|were|adds?|added|supports?|provides?|offers?|gained|"
+    r"\b(?:includes?|including|such as|are|were|adds?|added|lists?|supports?|provides?|"
+    r"offers?|gained|"
     r"brings?|comprises?)(?:\s+the\s+following)?:?(?=\s)"
 )
 
@@ -1182,10 +1215,22 @@ def _enumerated(text: str) -> str | None:
 def _sentence_case(text: str) -> str:
     """Capitalize a continuation's first word unless it is a name that is spelled lower-case:
     "mem_not_counted_for_evict in INFO memory" must not become "Mem_not_counted_for_evict"."""
-    first = text.split(" ", 1)[0]
-    if not first or not first[0].isalpha() or not first.isalpha():
+    first = text.split(" ", 1)[0].rstrip(",")
+    # Only a word that is plainly English prose is capitalized; a lower-case word that could be a
+    # name (jemalloc, valkey-cli, appendonly) keeps its spelling, since a wrong capital changes
+    # what it refers to and a missing one does not.
+    if first.lower() not in _PROSE_STARTERS:
         return text
     return text[0].upper() + text[1:]
+
+
+_PROSE_STARTERS = frozenset(
+    "a an the this that these those it its they there here if when while so but and or otherwise "
+    "then thus hence also only even each every all both some any no not use set run check try "
+    "small large other another with without for from to in on at by as of is are was were be "
+    "being been has have had do does did can could will would should may might must you your we "
+    "our i my he she his her which who what where how why".split()
+)
 
 
 _TRAILER = re.compile(
@@ -1316,7 +1361,9 @@ def main() -> None:
     try:
         _bot_user_id = app.client.auth_test()["user_id"]
     except Exception as error:  # noqa: BLE001 - the answer path does not need this
-        log.warning("could not resolve the bot user id, feedback will be ignored (%s)", error)
+        log.warning(
+            "could not resolve the bot user id, feedback will be ignored (%s)", _brief(error)
+        )
     log.info("connecting to Slack in Socket Mode, serving %s:%s", FUNCTION, QUALIFIER)
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
 

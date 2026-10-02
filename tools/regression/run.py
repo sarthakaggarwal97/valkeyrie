@@ -143,6 +143,12 @@ def main() -> int:
                 citations.append(descriptor.split("@", 1)[0])
         wanted = case.get("cites")
         cited_ok = None if not wanted else any(str(wanted) in c for c in citations)
+        # Content canaries. The battery judged outcome shape and citation path only, so a fluent
+        # wrong answer passed; `contains` names phrases a right answer must say (case-insensitive,
+        # over every claim) and `excludes` phrases a wrong one would.
+        spoken = " ".join(str(c.get("text", "")) for c in claims).casefold()
+        contains_ok = all(str(w).casefold() in spoken for w in case.get("contains") or [])
+        excludes_ok = not any(str(w).casefold() in spoken for w in case.get("excludes") or [])
         return {
             "id": case["id"],
             "draw": draw,
@@ -153,8 +159,11 @@ def main() -> int:
             "seconds": round(time.monotonic() - started, 1),
             "cites": wanted,
             "cited_ok": cited_ok,
+            "content_ok": contains_ok and excludes_ok,
             "passed": _outcome_matches(case["expect"], str(result.get("outcome")), len(claims))
-            and cited_ok is not False,
+            and cited_ok is not False
+            and contains_ok
+            and excludes_ok,
         }
 
     work = [(case, draw) for case in cases for draw in range(1, args.draws + 1)]
