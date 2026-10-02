@@ -181,7 +181,10 @@ ROUTER_SYSTEM: Final = (
     "command's exact definition (src/commands/<command>.json carries summary, complexity, since, "
     "arity, flags and arguments), or a function's code (src/<file>.c). A large file is returned as "
     'the numbered lines around the "around" words, so name the words that identify the part you '
-    "need. Prefer this over corpus_search when the asker wants an exact value, flag or signature.\n"
+    "need. Prefer this over corpus_search when the asker wants an exact value, flag or signature. "
+    "Whether a setting can be changed at runtime or needs a restart is in src/config.c: its "
+    'registration line carries MODIFIABLE_CONFIG or IMMUTABLE_CONFIG, so use "around" with the '
+    "setting's name in quotes.\n"
     '- {"kind":"directory","repository":"valkey","path":"src/commands"}: what is IN a path, as '
     "names, types and sizes. Use for what exists rather than what a file says: which commands have "
     'a definition, which test files cover a feature, what a directory holds. Omit "path" for the '
