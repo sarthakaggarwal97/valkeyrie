@@ -19,7 +19,7 @@ dependencies = [
 bot = ["boto3==1.40.21", "slack-bolt==1.21.2"]
 dev = [
     "bandit==1.9.4",
-    "hatchling==1.32.0",
+    "hatchling==1.32.4",
     "mypy==2.3.1",
     "pip-audit==2.10.1",
     "pytest==9.1.1",
@@ -29,7 +29,7 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling==1.32.0"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
