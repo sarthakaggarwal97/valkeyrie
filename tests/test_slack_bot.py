@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -14,7 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import pytest
 
-slack_bot = pytest.importorskip("slack_bot")
+# Only the optional dependencies may skip this module; a broken import of the bot itself must
+# fail collection, not quietly skip every test here.
+pytest.importorskip("slack_bolt")
+pytest.importorskip("boto3")
+slack_bot = importlib.import_module("slack_bot")  # an ImportError here fails collection
 
 
 def test_turns_before_maps_the_thread_and_stops_at_the_current_mention() -> None:
@@ -381,12 +386,12 @@ def test_numbers_hashes_and_run_ids_become_links_into_the_one_repository_the_sou
     sha = "ae819a9419bb519f1cfbab04f2213899adf78e84"
     base = "https://github.com/valkey-io/valkey"
     text = slack_bot._linked(
-        slack_bot._plain(f"#4797 Forkless Full-Sync, run 13052 on {sha} & #4644"),
+        slack_bot._plain(f"#4797 Forkless Full-Sync, run 36943607261 on {sha} & #4644"),
         slack_bot._sole_repository(one),
     )
     assert text == (
         f"<{base}/issues/4797|#4797> Forkless Full-Sync, "
-        f"run <{base}/actions/runs/13052|13052> on "
+        f"run <{base}/actions/runs/36943607261|36943607261> on "
         f"<{base}/commit/{sha}|{sha[:10]}> "
         f"&amp; <{base}/issues/4644|#4644>"
     )
@@ -410,7 +415,7 @@ def test_numbers_hashes_and_run_ids_become_links_into_the_one_repository_the_sou
         + ": https://github.com/valkey-io/valkey-glide/blob/a/README.md"
     ]
     assert slack_bot._sole_repository(several) is None
-    assert slack_bot._linked("#4797 and run 13052", None) == "#4797 and run 13052"
+    assert slack_bot._linked("#4797 and run 36943607261", None) == "#4797 and run 36943607261"
     # A number inside a path or an anchor is not a reference.
     assert (
         slack_bot._linked("see src/commands/#12 or /pull/#13", "valkey")
@@ -629,7 +634,7 @@ def test_issue_and_pr_words_before_a_number_are_linked_and_long_claims_get_a_lea
     )
     lines = slack_bot._led(one_sentence).split("\n")
     assert lines[0].startswith("• There are open fix PRs") and lines[0].endswith("crash-log tests")
-    assert lines[1] == "    A search for open PRs matching fix test failure returned 217 results."
+    assert lines[1] == "    a search for open PRs matching fix test failure returned 217 results."
 
 
 def test_the_assistant_surface_answers_through_the_same_path_with_a_status_and_a_title(
@@ -799,3 +804,151 @@ def test_a_continuation_does_not_capitalize_a_lower_case_name() -> None:
         slack_bot._sentence_case("valkey-cli follows redirects") == "valkey-cli follows redirects"
     )
     assert slack_bot._sentence_case("so the backlog overflows") == "So the backlog overflows"
+
+
+def test_quoted_text_code_and_identifiers_are_never_rewritten_or_split() -> None:
+    """Review pass over the renderer. Each input changed meaning or broke markup before."""
+    spoken = slack_bot._spoken
+    assert (
+        spoken("At observational scale, nothing changes.")
+        == "At observational scale, nothing changes."
+    )
+    assert spoken("Use artifact valkey-2026-09-15T21:15:53Z.tar.gz.") == (
+        "Use artifact valkey-2026-09-15T21:15:53Z.tar.gz."
+    )
+    assert spoken("See https://x.test/builds/2026-09-15T21:15:53Z/report.") == (
+        "See https://x.test/builds/2026-09-15T21:15:53Z/report."
+    )
+    assert spoken("The token is 2026-02-31T99:99:99Z.") == "The token is 2026-02-31T99:99:99Z."
+    assert (
+        spoken("Use `2026-09-15T21:15:53Z` as the key.") == "Use `2026-09-15T21:15:53Z` as the key."
+    )
+    quoted = 'The server returned "The evidence is unavailable" and stopped.'
+    assert spoken(quoted) == quoted
+    log = 'The log says "At observation time, release 9.2.0-rc1 was published on 2026-09-15."'
+    assert spoken(log) == log
+    command = (
+        "The procedure is described in enough detail to exceed the display threshold before "
+        'showing the quoted shell fragment that must be copied as one unit; "CONFIG SET '
+        'appendonly yes; CONFIG GET appendonly" is the literal command sequence.'
+    )
+    assert '"CONFIG SET appendonly yes; CONFIG GET appendonly"' in slack_bot._led(command)
+    examples = (
+        'Supported examples include "ERR invalid, syntax", `SCAN cursor, MATCH pattern`, GET key '
+        "with a plain string value, SET key value with an optional expiry, HSET key field value, "
+        "DEL key, EXISTS key, and MGET key1 key2 for multiple values in one request."
+    )
+    listed = slack_bot._led(examples)
+    assert (
+        '    ◦ "ERR invalid, syntax"' in listed and "    ◦ `SCAN cursor, MATCH pattern`" in listed
+    )
+    code = "Use `#1, #2, #3, #4` as literal bucket labels."
+    assert slack_bot._itemized("• " + slack_bot._linked(code, "valkey")) == f"• {code}"
+    assert (
+        slack_bot._linked("Run 10000 iterations first.", "valkey") == "Run 10000 iterations first."
+    )
+    assert slack_bot._plain("MAXBYTES &lt;bytes&gt;") == "MAXBYTES &lt;bytes&gt;"
+    assert slack_bot._source_link(
+        "live GitHub issue_search observed 2026-10-02T00:00:00Z: "
+        "https://github.com/valkey-io/valkey/pulls?q=is%3Apull-request+is%3Aopen+review%3Arequired"
+    ).endswith("|PRs matching is:open review:required>")
+    assert slack_bot._source_link(
+        "live GitHub directory observed 2026-10-02T00:00:00Z: "
+        "https://github.com/valkey-io/valkey/tree/9.0.0"
+    ).endswith("|valkey root listing at 9.0.0>")
+    long = (
+        "A long first clause that goes on for a while to pass the lead length threshold of the "
+        "renderer, and then keeps going for a few more words; jemalloc reports allocator "
+        "statistics and appendonly remains the configuration spelling in every released version."
+    )
+    assert "    jemalloc reports" in slack_bot._led(long)
+
+
+def test_delivery_failures_release_the_fence_and_replies_are_bounded_and_sanitised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review pass over the bot process: a failed post kept the event marked answered, so a
+    redelivery was ignored and the answer lost; a partial carried an internal message to Slack; a
+    JSON array from the Lambda rendered as an abstention; a mention mid-word glued two tokens."""
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def auth_test(self) -> dict[str, str]:
+            return {"user_id": "UBOT"}
+
+        def conversations_replies(self, **kwargs: object) -> dict[str, object]:
+            return {"messages": []}
+
+        def reactions_add(self, **kwargs: object) -> None:
+            self.calls.append("+")
+
+        def reactions_remove(self, **kwargs: object) -> None:
+            self.calls.append("-")
+
+    slack_bot._answered.clear()
+    monkeypatch.setattr(slack_bot, "_bot_user_id", None)
+    real_ask = slack_bot._ask
+    answers = {
+        "outcome": "answer",
+        "claims": [{"claim_id": "c1", "text": "Fine.", "evidence_ids": ["e"]}],
+        "citations": [],
+    }
+    monkeypatch.setattr(slack_bot, "_ask", lambda q, e, c=None: answers)
+    event = {
+        "type": "app_mention",
+        "user": "U1",
+        "text": "<@UBOT> hello",
+        "ts": "1.0",
+        "channel": "C",
+        "team": "T",
+    }
+    monkeypatch.setattr(slack_bot, "EXPECTED_TEAM", "T")
+    posted: list[str] = []
+    attempts = {"n": 0}
+
+    def flaky_say(**kwargs: object) -> None:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("slack post failed")
+        posted.append(str(kwargs["text"]))
+
+    client = Client()
+    with pytest.raises(RuntimeError):
+        slack_bot.answer_mention(event, flaky_say, client)
+    assert client.calls == ["+", "-"]  # the eyes came off
+    slack_bot.answer_mention(event, flaky_say, client)  # redelivery is answered
+    assert posted == ["Fine.\n\n_Checked 0 sources in 0 s._"] or posted[0].startswith("Fine.")
+    slack_bot.answer_mention(event, flaky_say, client)  # a third delivery is a duplicate
+    assert len(posted) == 1
+
+    # Mentions: this bot's becomes a space, another person's stays a word.
+    assert slack_bot._without_mentions("compare GET<@UBOT>SET", client) == "compare GET SET"
+    assert slack_bot._without_mentions("<@UBOT> ask <@UOTHER> about it", client) == (
+        "ask @someone about it"
+    )
+
+    # Partial and error outcomes never carry the runtime's internal text to Slack.
+    partial = slack_bot._format({"outcome": "partial", "message": "request lease is still active"})
+    assert "lease" not in partial and "try" in partial.lower() or "again" in partial
+    error = slack_bot._format({"outcome": "error", "message": "DynamoDB fence invariant failed"})
+    assert "DynamoDB" not in error
+
+    # Every rendered reply is under the cap, whichever path produced it.
+    huge = slack_bot._format(
+        {**answers, "claims": [{"claim_id": "c1", "text": "x" * 41_000, "evidence_ids": ["e"]}]}
+    )
+    assert len(huge) <= slack_bot.MAX_REPLY_CHARS + 300
+    assert len(slack_bot._bounded_reply("y" * 50_000)) <= slack_bot.MAX_REPLY_CHARS
+
+    # A Lambda body that is not a result object is a contract error, not an abstention.
+    class Lambda:
+        def invoke(self, **kwargs: object) -> dict[str, object]:
+            import io
+
+            return {"Payload": io.BytesIO(b"[]")}
+
+    monkeypatch.setattr(slack_bot, "lambda_client", Lambda())
+    with pytest.raises(RuntimeError, match="not a result object"):
+        real_ask("q", event)

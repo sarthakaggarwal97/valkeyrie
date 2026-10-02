@@ -419,7 +419,12 @@ def test_evidence_is_derived_executable_and_cost_truthful(tmp_path: Path) -> Non
         for key, value in rollback["operator_supplied_prior_identity"].items()
         if key not in {"PRIOR_ARTIFACT_BUCKET"}
     )
-    assert APPLICATION_SERVICE_ROLE_ARN in "\n".join(rollback["commands"])
+    joined = "\n".join(rollback["commands"])
+    assert APPLICATION_SERVICE_ROLE_ARN in joined
+    # The application role reads exactly one artifact key, so a rollback to another key needs the
+    # bootstrap grant widened first and tightened after; a recipe without those steps fails on
+    # s3:GetObject.
+    assert "Bootstrap overlap" in joined and "Bootstrap tighten" in joined
     assert rollback["corpus_action"] == "none"
     cost = evidence["cost"]
     assert cost["qualification_measurement"] == {

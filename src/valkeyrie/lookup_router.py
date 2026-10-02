@@ -45,6 +45,7 @@ from valkeyrie.live_github import (
     GenericReadQuery,
     IssueQuery,
     IssueSearchQuery,
+    LiveGitHubError,
     LiveGitHubQuery,
     PathHistoryQuery,
     ProjectQuery,
@@ -52,7 +53,9 @@ from valkeyrie.live_github import (
     ReleaseByTagQuery,
     ReleaseListQuery,
     RunJobsQuery,
+    WorkflowRunQuery,
     WorkflowRunsQuery,
+    _rest_request,
 )
 
 # The closed catalog. Adding an entry here is the ONLY way the model gains a capability.
@@ -71,6 +74,7 @@ _KINDS: Final[frozenset[str]] = frozenset(
         "ci_jobs",
         "path_history",
         "github_read",
+        "workflow_run",
         "compare",
         "project_board",
         "search",
@@ -142,7 +146,8 @@ ROUTER_SYSTEM: Final = (
     '- {"kind":"ci_runs","repository":"valkey","branch":"unstable"}: the latest workflow runs on a '
     "branch with their conclusions. Use for what is failing or red on a branch, whether CI is "
     "green, and which workflows ran most recently. It lists runs; a named run's detail is "
-    "workflow_run.\n"
+    "workflow_run: "
+    '{"kind":"workflow_run","repository":"valkey","run_id":36502585735}.\n'
     '- {"kind":"ci_jobs","repository":"valkey","run_id":36502585735}: the jobs of one workflow run '
     "and the step each failing job failed at. Use after ci_runs names a failed run, or when the "
     'asker gives a run id: "why did the Daily run fail" is ci_runs to find it, then '
@@ -366,7 +371,9 @@ Converse = Callable[[str, str], str]
 """(system, question) -> raw model text. Injected so the router owns no transport."""
 
 
-MAX_SHORTFALL_BYTES: Final = 600
+# A 20-word reason of long identifiers (the prompt's bound) is up to about 700 bytes; 600 cut the
+# named target off the end of one. The accepted limitation is bounded at 2,048 upstream.
+MAX_SHORTFALL_BYTES: Final = 1024
 
 
 def route_lookups(
@@ -532,8 +539,23 @@ def _is_faithful(fragment: str, resolved: str) -> bool:
     # would otherwise be a stop word: "is it not released?" must not resolve to "is it released?".
     content = [w for w in words if (len(w) >= 3 and w not in _STOP) or w in _NEGATION]
     resolved_words = re.findall(r"[a-z0-9][a-z0-9.#-]*", resolved.lower())
-    stems = {w[:5] for w in resolved_words}
-    return all((w in _NEGATION and w in resolved_words) or w[:5] in stems for w in content)
+    resolved_set = set(resolved_words)
+
+    def same_word(a: str, b: str) -> bool:
+        # The same word, or one an inflection of the other ("released" and "release", "merged"
+        # and "merge"): one is a prefix of the other and the suffix is at most two characters.
+        # A shared five-character prefix let "authored" pass as "authority".
+        if a == b:
+            return True
+        short, long = sorted((a, b), key=len)
+        return len(short) >= 4 and long.startswith(short) and len(long) - len(short) <= 2
+
+    def survives(word: str) -> bool:
+        if word in _NEGATION:
+            return word in resolved_set
+        return any(same_word(word, other) for other in resolved_set)
+
+    return all(survives(w) for w in content)
 
 
 def parse_lookup_plan(raw: object) -> LookupPlan:
@@ -616,7 +638,18 @@ def _parse_lookup_plan(raw: object) -> LookupPlan:
             corpus_search = True
             continue
         query = _live_lookup(kind, item)
-        if query is not None and query not in live:
+        if query is None:
+            continue
+        # Parity with the reader: a query the parser accepts but the reader refuses (a 513-byte
+        # path, a search term of stop words, an unknown advisory id shape, a malformed generic
+        # placeholder) used to pass here and fail silently at read time. The reader's own URL
+        # builder is the authority on what it will fetch; it is pure and runs here.
+        if not isinstance(query, ProjectQuery):  # GraphQL, validated by its own arm
+            try:
+                _rest_request(query)
+            except LiveGitHubError as refusal:
+                raise LookupRouterError(f"lookup is not readable: {refusal}") from refusal
+        if query not in live:
             live.append(query)
     if not corpus_search and not live and lookups:
         # Every lookup was a search too thin to run. Falling back to the keyword path is
@@ -662,6 +695,13 @@ def _live_lookup(kind: str, item: Mapping[str, object]) -> LiveGitHubQuery | Non
         if type(run_id) is not int or not 0 < run_id < 10**15:
             raise LookupRouterError("ci jobs run_id is malformed")
         return RunJobsQuery(_repository(item), run_id)
+    if kind == "workflow_run":
+        _only_keys(item, {"kind", "repository", "run_id"})
+        run_id = item.get("run_id")
+        if type(run_id) is not int or not 0 < run_id < 10**15:
+            raise LookupRouterError("workflow run_id is malformed")
+        return WorkflowRunQuery(_repository(item), run_id)
+
     if kind == "path_history":
         _only_keys(item, {"kind", "repository", "path"})
         return PathHistoryQuery(_repository(item), _file_path(item))

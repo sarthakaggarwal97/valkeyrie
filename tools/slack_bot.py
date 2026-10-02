@@ -28,7 +28,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -173,6 +173,55 @@ def record_feedback(event: dict[str, Any], client: Any) -> None:
     log.info("feedback %s on %s by %s", verdict, item.get("ts"), event.get("user"))
 
 
+def _claim(key: str) -> bool:
+    """Take the delivery fence for an event; False when this process already holds it."""
+    with _answered_lock:
+        if key in _answered:
+            return False
+        _answered[key] = True
+        while len(_answered) > MAX_ANSWERED_EVENTS:
+            _answered.pop(next(iter(_answered)))
+        return True
+
+
+def _release(key: str) -> None:
+    with _answered_lock:
+        _answered.pop(key, None)
+
+
+_MENTION = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+
+
+def _without_mentions(text: str, client: Any) -> str:
+    """The question with this bot's mention removed and other people's mentions kept as words.
+
+    Removing every mention outright turned "compare GET<@bot>SET" into "compare GETSET" and
+    dropped the person in "ask <@someone> about ownership"; a space where the bot was and
+    "@someone" for anyone else keeps the sentence the asker wrote.
+    """
+    global _bot_user_id
+    if _bot_user_id is None:
+        try:
+            _bot_user_id = client.auth_test()["user_id"]
+        except Exception:  # noqa: BLE001 - the mention is still answerable without the id
+            _bot_user_id = ""
+
+    def replace(match: re.Match[str]) -> str:
+        return " " if match.group(1) == _bot_user_id else " @someone "
+
+    return re.sub(r"\s{2,}", " ", _MENTION.sub(replace, text)).strip()
+
+
+def _bounded_reply(text: str) -> str:
+    """Every reply under Slack's 40,000-character limit, whatever path produced it."""
+    if len(text) <= MAX_REPLY_CHARS:
+        return text
+    cut = text[: MAX_REPLY_CHARS - 200]
+    if cut.count("```") % 2:
+        cut += "\n```"
+    return cut + "\n\n_The rest of this reply did not fit in one Slack message._"
+
+
 def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
     """Answer one mention in a thread, or explain why it could not be answered."""
     # Who may trigger an inference. Every mention delivered to this installation used to run one,
@@ -186,15 +235,31 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
         # A bot's own mention, or an edit/join/share event that is not a person asking.
         return
 
-    question = re.sub(r"<@[A-Z0-9]+>", "", event.get("text", "")).strip()
+    question = _without_mentions(event.get("text", ""), client)
     # Keep the conversation in a thread so a busy channel stays readable.
     thread = event.get("thread_ts") or event["ts"]
 
+    # Slack redelivers an event whose ack it did not see. Every user-facing reply, including the
+    # prompt for an empty mention, sits behind this fence; the fence is RELEASED again if the
+    # reply never reaches Slack, so a transient post failure is retried on redelivery rather
+    # than lost for the life of the process.
+    key = _event_key(event)
+    if not _claim(key):
+        log.info("duplicate delivery of %s ignored", key)
+        return
+
+    def deliver(**kwargs: Any) -> None:
+        try:
+            say(**kwargs)
+        except Exception:
+            _release(key)
+            raise
+
     if not question:
-        say(text="Ask me a Valkey question, for example: what is the TSC?", thread_ts=thread)
+        deliver(text="Ask me a Valkey question, for example: what is the TSC?", thread_ts=thread)
         return
     if len(question.encode("utf-8")) > MAX_QUESTION_BYTES:
-        say(
+        deliver(
             text=(
                 f"That is over my {MAX_QUESTION_BYTES // 1024} KB limit for one message. "
                 "Paste the part that matters, for example the Memory or Clients section of INFO, "
@@ -203,19 +268,6 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
             thread_ts=thread,
         )
         return
-
-    # Slack redelivers an event whose ack it did not see. The runtime already replays the same
-    # answer for the same event, so inference is not repeated; the REPLY was, and a thread got
-    # the same answer twice. Each event is answered once per process; a redelivery that arrives
-    # after a restart still replays the stored result, which is the right answer to send.
-    key = _event_key(event)
-    with _answered_lock:
-        if key in _answered:
-            log.info("duplicate delivery of %s ignored", key)
-            return
-        _answered[key] = True
-        while len(_answered) > MAX_ANSWERED_EVENTS:
-            _answered.pop(next(iter(_answered)))
 
     # A command, not a question. Checked AFTER dedup so a redelivered command cannot dispatch
     # twice, and before any retrieval, because a command needs no evidence. Only a message whose
@@ -226,29 +278,29 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
         try:
             parsed = actions.parse_command(command_text, str(event.get("user", "")))
         except actions.CommandError as refusal:
-            say(text=_plain(str(refusal)), thread_ts=thread)
+            deliver(text=_plain(str(refusal)), thread_ts=thread)
             return
         except Exception:
             log.exception("command handling failed")
-            say(
+            deliver(
                 text="That command could not be processed. The failure is logged.", thread_ts=thread
             )
             return
         if isinstance(parsed, str):
-            say(text=_plain(parsed), thread_ts=thread)
+            deliver(text=_plain(parsed), thread_ts=thread)
             return
         _react(client, event, _WORKING)
         try:
             reply = actions.execute(parsed)
         except Exception:
             log.exception("command execution failed")
-            say(text="That command failed to run. The failure is logged.", thread_ts=thread)
+            deliver(text="That command failed to run. The failure is logged.", thread_ts=thread)
             return
         finally:
             # The eyes come off on EVERY exit, including a failed dispatch or a failed post;
             # a reaction left behind reads as the bot still working on it.
             _unreact(client, event, _WORKING)
-        say(text=reply, thread_ts=thread, unfurl_links=False)
+        deliver(text=reply, thread_ts=thread, unfurl_links=False)
         return
 
     _react(client, event, _WORKING)
@@ -258,13 +310,16 @@ def answer_mention(event: dict[str, Any], say: Any, client: Any) -> None:
         result = _ask(question, event, conversation)
         text = _format(result, seconds=time.monotonic() - started)
     except Exception:
-        # Log the detail, tell the channel only that it failed.
+        # Log the detail, tell the channel only that it failed. The fence is released so a
+        # redelivery (or the asker's retry) is answered: the runtime replays a stored result and
+        # re-runs an unfinished one, so neither costs a second inference.
         log.exception("answer failed")
+        _release(key)
         say(text="Something went wrong answering that. The failure is logged.", thread_ts=thread)
         return
     finally:
         _unreact(client, event, _WORKING)
-    say(text=text, thread_ts=thread, unfurl_links=False)
+    deliver(text=_bounded_reply(text), thread_ts=thread, unfurl_links=False)
 
 
 assistant = Assistant()
@@ -374,10 +429,23 @@ def _ask(
         InvocationType="RequestResponse",
         Payload=json.dumps(payload).encode("utf-8"),
     )
-    body = json.loads(response["Payload"].read())
+    raw = response["Payload"].read()
     if "FunctionError" in response:
-        raise RuntimeError(f"lambda reported an error: {body}")
-    return body if isinstance(body, dict) else {}
+        # The error body can carry anything the function raised. Its type is enough to act on.
+        kind = "unknown"
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and isinstance(parsed.get("errorType"), str):
+                kind = parsed["errorType"]
+        except ValueError:
+            pass
+        raise RuntimeError(f"lambda reported an error of type {kind}")
+    body = json.loads(raw)
+    if not isinstance(body, dict) or not isinstance(body.get("outcome"), str):
+        # A list or a bare value is a broken contract, not an abstention; it used to render as
+        # "I don't have grounded evidence for that (unknown)".
+        raise RuntimeError("lambda response is not a result object")
+    return body
 
 
 # Events answered by this process, oldest first. Bounded so a long-lived bot does not grow.
@@ -387,6 +455,7 @@ _answered_lock = threading.Lock()
 # sources and closers always fit after the claims.
 MAX_REPLY_CHARS = 30_000
 MAX_ANSWERED_EVENTS = 4096
+MAX_HISTORY_PAGES = 5
 # The workspace this bot serves. Set SLACK_TEAM_ID to enforce it; unset serves any team the app
 # is installed in, which is the behaviour a local run expects.
 EXPECTED_TEAM = os.environ.get("SLACK_TEAM_ID", "")
@@ -415,17 +484,35 @@ def _thread_history(event: dict[str, Any], client: Any) -> list[dict[str, str]]:
     try:
         if _bot_user_id is None:
             _bot_user_id = client.auth_test()["user_id"]
-        replies = client.conversations_replies(
-            channel=event["channel"], ts=thread, limit=MAX_HISTORY_TURNS * 2 + 2
-        )
+        messages: list[dict[str, Any]] = []
+        cursor: str | None = None
+        current = event.get("ts", "")
+        # Slack pages a long thread. The first page is the OLDEST messages, so a 20-message
+        # thread answered a follow-up against messages 9 to 14 instead of the ones just before
+        # it. Pages are followed until the current mention is on one, within a small bound.
+        for _ in range(MAX_HISTORY_PAGES):
+            kwargs: dict[str, Any] = {"channel": event["channel"], "ts": thread, "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            replies = client.conversations_replies(**kwargs)
+            messages.extend(replies.get("messages", []))
+            if any(m.get("ts") == current for m in messages):
+                break
+            cursor = (replies.get("response_metadata") or {}).get("next_cursor") or None
+            if not cursor:
+                break
+        else:
+            return []  # The mention was never found: stale history is worse than none.
     except Exception as error:  # noqa: BLE001 - history is optional; the answer is not.
         if not _history_unavailable_logged:
             log.warning("thread history unavailable, answering without it: %s", error)
             _history_unavailable_logged = True
         return []
+    if not any(m.get("ts") == current for m in messages):
+        return []
     return _turns_before(
-        replies.get("messages", []),
-        event.get("ts", ""),
+        messages,
+        current,
         _bot_user_id or "",
         asker=event.get("user") or "",
     )
@@ -457,7 +544,9 @@ def _turns_before(
         # steer how the next follow-up is read.
         if message.get("user") == bot_user_id:
             role = "assistant"
-        elif message.get("bot_id"):
+        elif message.get("bot_id") or not message.get("user"):
+            # Another bot, or a system message with no human author, is not the asker's words
+            # even when it opened the thread.
             continue
         elif asker and message.get("user") != asker and message.get("ts") != root_ts:
             continue
@@ -524,9 +613,18 @@ def _format(result: dict[str, Any], *, seconds: float | None = None) -> str:
                 line = body + ("\n" if len(texts) > 1 else "")
             else:
                 line = _grouped(_itemized(_led(body)))
-            if rendered and used + len(line) > budget:
-                left = len(texts) - position
-                rendered.append(f"\u2022 _{left} more claim(s) did not fit in one Slack message._")
+            if used + len(line) > budget:
+                if not rendered:
+                    # A single claim over the whole budget: cut it rather than send over the cap.
+                    line = line[: max(0, budget - 60)] + (
+                        "\n```" if line[:budget].count("```") % 2 else ""
+                    )
+                    rendered.append(line)
+                left = len(texts) - position - (0 if rendered else 1)
+                if left > 0:
+                    rendered.append(
+                        f"\u2022 _{left} more claim(s) did not fit in one Slack message._"
+                    )
                 break
             rendered.append(line)
             used += len(line) + 1
@@ -540,11 +638,19 @@ def _format(result: dict[str, Any], *, seconds: float | None = None) -> str:
             _plain(message) if message else "What would you like to know about the Valkey project?"
         )
     if outcome == "partial":
-        detail = _plain(message) if message else "Some evidence could not be retrieved."
-        return f"{detail}\nI won't guess at the rest. Try asking without the live-status wording."
+        # The runtime's partial messages name internal conditions ("request lease is still
+        # active", "retrieval evidence exceeds its byte bound"). Logged, not shown.
+        log.warning("partial result: %s", message)
+        return (
+            "I couldn't finish that one: part of what I needed was not reachable just now. "
+            "Please ask again in a moment."
+        )
+    if outcome == "error":
+        log.warning("error result: %s", message)
+        return "I couldn\u2019t produce a reliable answer. Please try again."
     if message:
         # An abstention is the one reply with nothing to click; it gets the pointer to people.
-        return f"{_spoken(_plain(message))}\n\n_{_MORE_HELP}_"
+        return _bounded_reply(f"{_spoken(_plain(message))}\n\n_{_MORE_HELP}_")
     return f"I don't have grounded evidence for that ({outcome})."
 
 
@@ -556,8 +662,8 @@ _MORE_HELP = "For more: the Valkey Slack help channels, GitHub Discussions, or v
 # include X" is true and reads like a form letter; "I couldn't find X" says the same thing the way
 # a colleague would. Only exact stems are rewritten, so nothing about Valkey itself is reworded.
 _SPOKEN: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\bAt (?:the )?observation(?: time)?,?\s*"), "When I checked, "),
-    (re.compile(r"\bat (?:the )?observation time\b"), "when I checked"),
+    (re.compile(r"\bAt (?:the )?observation(?: time)?\b,?\s*"), "When I checked, "),
+    (re.compile(r"\bat (?:the )?observation(?: time)?\b"), "when I checked"),
     (
         re.compile(r"\b[Aa]s of the (?:latest |last |most recent )?observation\b"),
         "when I last checked",
@@ -599,30 +705,82 @@ _SPOKEN: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (re.compile(r"\bGiven these [a-z]+,?\s*"), "So "),
 )
-_ISO_INSTANT = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b")
-_ISO_DAY = re.compile(r"(?<![\w:/.-])(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?![\w:/-]|\.\w)")
+_ISO_INSTANT = re.compile(
+    r"(?<![\w:/.-])(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z(?![\w:/-]|\.\w)"
+)
+_ISO_DAY = re.compile(r"(?<![\w:/.-])(\d{4})-(\d{2})-(\d{2})(?![\w:/-]|\.\w)")
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
 def _day(match: re.Match[str]) -> str:
-    year, month, day = match.group(1), int(match.group(2)), int(match.group(3))
-    if not 1 <= month <= 12:
+    """A real calendar date (and, for an instant, a real time of day) as "15 Sep 2026"; anything
+    that only looks like one ("2026-02-31T99:99:99Z" in a token) is left exactly as written."""
+    from datetime import date
+
+    try:
+        when = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        if match.re is _ISO_INSTANT:
+            hour, minute, second = (int(match.group(i)) for i in (4, 5, 6))
+            if not (hour < 24 and minute < 60 and second < 61):
+                return match.group(0)
+    except ValueError:
         return match.group(0)
-    return f"{day} {_MONTHS[month - 1]} {year}"
+    return f"{when.day} {_MONTHS[when.month - 1]} {when.year}"
+
+
+# Text the renderer must never rewrite or split inside: fenced code, inline code, and anything in
+# double quotes (a quoted error message, a quoted command, quoted evidence). The prompt tells the
+# model to keep quoted evidence exactly as spelled, and "CONFIG SET appendonly yes; CONFIG GET
+# appendonly" inside quotes was split at its semicolon into two broken lines.
+_PROTECTED = re.compile(r"```.*?```|`[^`\n]*`|\"[^\"\n]{1,400}\"", re.DOTALL)
+
+
+def _protected_spans(text: str) -> list[tuple[int, int]]:
+    return [(m.start(), m.end()) for m in _PROTECTED.finditer(text)]
+
+
+def _is_protected(position: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= position < end for start, end in spans)
+
+
+def _outside_protected(text: str, transform: Callable[[str], str]) -> str:
+    """Apply `transform` to the stretches of `text` outside protected spans, in place."""
+    spans = _protected_spans(text)
+    out: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        out.append(transform(text[cursor:start]))
+        out.append(text[start:end])
+        cursor = end
+    out.append(transform(text[cursor:]))
+    return "".join(out)
+
+
+def _split_outside(text: str, delimiter: re.Pattern[str]) -> list[str]:
+    """Split at delimiter matches that lie outside protected spans."""
+    spans = _protected_spans(text)
+    pieces: list[str] = []
+    cursor = 0
+    for m in delimiter.finditer(text):
+        if _is_protected(m.start(), spans):
+            continue
+        pieces.append(text[cursor : m.start()])
+        cursor = m.end()
+    pieces.append(text[cursor:])
+    return pieces
 
 
 def _spoken(text: str) -> str:
     """Prose as a person would say it: spoken stems, and dates as "15 Sep 2026" rather than
-    "2026-09-15T21:15:53Z". Code fences are left exactly as written."""
-    pieces = text.split("```")
-    for index in range(0, len(pieces), 2):
-        piece = pieces[index]
+    "2026-09-15T21:15:53Z". Code, inline code and quoted text are left exactly as written."""
+
+    def prose(piece: str) -> str:
         for pattern, replacement in _SPOKEN:
             piece = pattern.sub(replacement, piece)
         piece = _ISO_INSTANT.sub(_day, piece)
-        piece = _ISO_DAY.sub(_day, piece)
-        pieces[index] = piece
-    return "```".join(pieces)
+        return _ISO_DAY.sub(_day, piece)
+
+    return _outside_protected(text, prose)
 
 
 def _is_a_lead(body: str, count: int) -> bool:
@@ -641,12 +799,12 @@ def _live_label(kind: str, name: str, url: str) -> str:
     """A live source named the way a person would point at it: "PR search: is:open fix test
     failure" rather than "issue (PR search: is:open fix test failure)", "valkey.conf (live)" rather
     than "file (valkey.conf)", "#3853" rather than "issue (#3853)"."""
-    if kind == "issue":
+    if kind in ("issue", "issue search"):
         if name.startswith(("PR search:", "issue search:")):
             return name.replace("PR search:", "PRs matching", 1).replace(
                 "issue search:", "issues matching", 1
             )
-        return name or "issue"
+        return name or kind
     if kind == "pull request":
         return f"PR {name}" if name else "pull request"
     if kind == "release":
@@ -658,10 +816,12 @@ def _live_label(kind: str, name: str, url: str) -> str:
     if kind == "file":
         return f"{name} (live)" if name else "file"
     if kind == "directory":
+        ref = re.search(r"/tree/([^/]+)", url)
+        at = _at_ref(ref.group(1)) if ref else ""
         if name in ("", "/"):
             repository = re.search(r"github\.com/valkey-io/([^/]+)", url)
-            return f"{repository.group(1)} root listing" if repository else "root listing"
-        return f"{name} listing"
+            return (f"{repository.group(1)} root listing" if repository else "root listing") + at
+        return f"{name} listing{at}"
     if kind == "compare":
         return name or "compare"
     if kind == "controller status":
@@ -775,7 +935,8 @@ _REPOSITORY_IN_URL = re.compile(
 )
 _REFERENCE = re.compile(
     r"(?<![\w/#])#(\d{1,6})\b"  # #4797
-    r"|\b(run) (\d{4,12})\b"  # run 13052
+    # run 36943607261: GitHub run ids are nine digits or more; "run 10000 iterations" is not one.
+    r"|\b(run) (\d{9,12})\b"
     r"|\b([0-9a-f]{40})\b"  # a full commit hash
     # "issue 4153", "PR 4795", "pull request 4795", with or without a hash: the model writes all
     # of these, and an unlinked number is a number the reader has to retype.
@@ -818,10 +979,12 @@ def _itemized(text: str) -> str:
     # A reference that completes the words before it ("disabled in #858", "the fix from #4795")
     # is part of the current item, not the start of the next one. An item starts at a reference
     # that follows a list separator (comma, semicolon, "and", "or") or begins the enumeration.
+    protected = _protected_spans(text)
     starts = [
         m.start()
         for m in _ITEM_REFERENCE.finditer(text)
-        if not text[: m.start()].rstrip().endswith("(")
+        if not _is_protected(m.start(), protected)
+        and not text[: m.start()].rstrip().endswith("(")
         and (
             _LIST_SEPARATOR_BEFORE.search(text[: m.start()])
             or _BEGINS_A_LIST.match(text[m.end() :])
@@ -893,10 +1056,11 @@ def _led(text: str) -> str:
     if len(sentences) >= 2:
         return f"• {sentences[0]}\n    {sentences[1]}"
     # One long sentence: its semicolon-joined clauses are separate points and read as such.
-    clauses = [c.strip() for c in _CLAUSE_BREAK.split(text) if c.strip()]
+    clauses = [c.strip() for c in _split_outside(text, _CLAUSE_BREAK) if c.strip()]
     if len(clauses) >= 2:
         first, rest = clauses[0], clauses[1:]
-        return "\n".join([f"• {first}"] + [f"    {_sentence_case(clause)}" for clause in rest])
+        # Continuations keep their own spelling: capitalizing changed "jemalloc" to "Jemalloc".
+        return "\n".join([f"• {first}"] + [f"    {clause}" for clause in rest])
     enumerated = _enumerated(text)
     if enumerated is not None:
         return enumerated
@@ -918,16 +1082,17 @@ _LISTING_VERB = re.compile(
 
 
 def _split_items(text: str) -> list[str]:
-    """Split on commas outside brackets and quotes; a final ", and X" is one more item."""
+    """Split on commas outside brackets, quotes and code; a final ", and X" is one more item."""
     items: list[str] = []
     depth = 0
     current = []
-    for ch in text:
+    spans = _protected_spans(text)
+    for position, ch in enumerate(text):
         if ch in "([{":
             depth += 1
         elif ch in ")]}":
             depth = max(0, depth - 1)
-        if ch == "," and depth == 0:
+        if ch == "," and depth == 0 and not _is_protected(position, spans):
             items.append("".join(current))
             current = []
         else:
@@ -1000,7 +1165,7 @@ def _grouped(text: str) -> str:
     if "\n" in text or not text.startswith("• "):
         return text
     body = text[2:]
-    segments = [s.strip() for s in _CLAUSE_BREAK.split(body) if s.strip()]
+    segments = [s.strip() for s in _split_outside(body, _CLAUSE_BREAK) if s.strip()]
     if len(segments) < MIN_GROUPS or not all(_GROUP_LABEL.match(s) for s in segments):
         return text
     lines = ["•"]
@@ -1047,7 +1212,7 @@ def _linked(text: str, repository: str | None) -> str:
         word, number = match.group(5), match.group(6)
         return f"{word} <{base}/issues/{number}|#{number}>"
 
-    return _REFERENCE.sub(link, text)
+    return _outside_protected(text, lambda piece: _REFERENCE.sub(link, piece))
 
 
 def _plain(text: str) -> str:
@@ -1057,7 +1222,11 @@ def _plain(text: str) -> str:
     pages the channel and `<@U…>` mentions a person; escaped, they are just the text they were.
     The bot's own link markup is added after escaping, so it is never affected.
     """
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Decode Slack's three entities first so escaping is idempotent: text quoted back from a
+    # thread (an earlier reply in the history) arrives already escaped, and "&lt;" became
+    # "&amp;lt;".
+    decoded = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    return decoded.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def main() -> None:
@@ -1078,6 +1247,18 @@ def main() -> None:
             "before starting the bot; see tools/run_bot.sh."
         ) from error
     log.info("answering as %s", identity.get("Arn"))
+    missing = [name for name in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN") if not os.environ.get(name)]
+    if missing:
+        raise SystemExit(f"{' and '.join(missing)} must be set; see tools/run_bot.sh.")
+    # Identity alone is not permission: credentials that resolve but cannot invoke the function
+    # would connect to Slack and fail every question. A DryRun invoke checks the exact function
+    # and version without running it.
+    try:
+        lambda_client.invoke(FunctionName=FUNCTION, Qualifier=QUALIFIER, InvocationType="DryRun")
+    except Exception as error:  # noqa: BLE001 - name the cause and stop
+        raise SystemExit(
+            f"cannot invoke {FUNCTION}:{QUALIFIER} ({type(error).__name__}: {error})."
+        ) from error
     app = App(token=os.environ["SLACK_BOT_TOKEN"], request_verification_enabled=False)
     app.event("app_mention")(answer_mention)
     # The assistant surface: Slack's AI panel and DMs, with no mention needed, a visible status

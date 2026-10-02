@@ -970,7 +970,10 @@ def _fetch_with_retry(
                 return response
             last = LiveGitHubError(f"REST read returned HTTP {status}")
             if attempt < _FETCH_ATTEMPTS - 1:
-                sleep(_retry_after_seconds(response.headers, attempt))
+                # A 429 with malformed headers raised AttributeError here, ahead of the response
+                # validator; a header set that is not a mapping of strings is read as empty.
+                headers = response.headers if isinstance(response.headers, Mapping) else {}
+                sleep(_retry_after_seconds(headers, attempt))
                 continue
             return response
         if attempt < _FETCH_ATTEMPTS - 1:
@@ -1045,7 +1048,9 @@ MAX_FILE_RESPONSE_BYTES: Final = 1024 * 1024
 FILE_WINDOW_LINES: Final = 24
 MAX_FILE_WINDOWS: Final = 6
 # A repository path: segments of ordinary file characters, no traversal, no leading slash.
-_REPO_PATH: Final = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+# A segment is printable, non-control text without a slash; "." and ".." segments are traversal
+# and refused. "docs/my file.md" and "foo..bar.md" are real repository paths and are allowed.
+_REPO_PATH_SEGMENT: Final = re.compile(r"^[^/\x00-\x1f\x7f]+$")
 # Published advisories per repository read at once, and the bound on one advisory's description.
 MAX_ADVISORIES: Final = 20
 MAX_ADVISORY_DESCRIPTION_BYTES: Final = 4 * 1024
@@ -1215,9 +1220,9 @@ def _advisory(value: Mapping[str, object], repository: str) -> dict[str, object]
         package = item.get("package")
         affected.append(
             {
-                "package": _text(_object(package, "advisory package"), "name", 256)
-                if isinstance(package, Mapping)
-                else None,
+                "package": None
+                if package is None
+                else _text(_object(package, "advisory package"), "name", 256),
                 "vulnerable_versions": _nullable_text(item, "vulnerable_version_range", 512),
                 "patched_versions": _nullable_text(item, "patched_versions", 512),
             }
@@ -1229,7 +1234,10 @@ def _advisory(value: Mapping[str, object], repository: str) -> dict[str, object]
         "summary": _text(value, "summary", 1024),
         "description": description,
         "description_truncated": truncated,
-        "cwe_ids": [str(x) for x in _list(value, "cwe_ids")[:MAX_COLLECTION_ITEMS]],
+        "cwe_ids": [
+            _bounded_str(x, 64, "advisory CWE id")
+            for x in _list(value, "cwe_ids")[:MAX_COLLECTION_ITEMS]
+        ],
         "published_at": _nullable_timestamp(value, "published_at"),
         "withdrawn_at": _nullable_timestamp(value, "withdrawn_at"),
         "affected": affected,
@@ -1245,9 +1253,10 @@ def _advisory_description(value: Mapping[str, object]) -> tuple[str | None, bool
         return None, False
     if type(raw) is not str:
         raise LiveGitHubError("GitHub advisory description must be a string")
-    encoded = raw.encode("utf-8")
-    if len(encoded) <= MAX_ADVISORY_DESCRIPTION_BYTES:
+    text, cut = _utf8_cut(raw, MAX_ADVISORY_DESCRIPTION_BYTES, "GitHub advisory description")
+    if not cut:
         return raw, False
+    encoded = raw.encode("utf-8")
     return encoded[:MAX_ADVISORY_DESCRIPTION_BYTES].decode("utf-8", "ignore"), True
 
 
@@ -1293,7 +1302,13 @@ def _file(
     except UnicodeDecodeError as error:
         raise LiveGitHubError("GitHub contents is not UTF-8 text") from error
     lines = text.splitlines()
-    commit = _text(value, "sha", 64)
+    commit = _sha(value, "sha")
+    encoded_path = "/".join(quote(part, safe="") for part in path.split("/"))
+    web = _text(value, "html_url", 1024)
+    if not web.startswith(f"{_WEB_ROOT}/{OWNER}/{repository}/blob/") or not web.endswith(
+        "/" + encoded_path
+    ):
+        raise LiveGitHubError("GitHub file page URL does not name the requested path")
     payload: dict[str, object] = {
         "api_version": _API_VERSION,
         "kind": "file",
@@ -1307,9 +1322,9 @@ def _file(
         # The contents endpoint answers with its own url carrying the resolved ref, so the exact
         # match the other readers use does not apply; the prefix is what must hold.
         "api_url": _github_api_url(
-            value, "url", f"{_API_ROOT}/repos/{OWNER}/{repository}/contents/"
+            value, "url", f"{_API_ROOT}/repos/{OWNER}/{repository}/contents/{encoded_path}"
         ),
-        "url": _github_api_url(value, "html_url", f"{_WEB_ROOT}/{OWNER}/{repository}/"),
+        "url": web,
     }
     if len(content) <= MAX_FILE_TEXT_BYTES:
         return {**payload, "text": text, "windows": None, "complete": True}
@@ -1384,10 +1399,14 @@ def _file_windows(lines: list[str], around: tuple[str, ...]) -> list[dict[str, o
             end = min(len(lines), hit + FILE_WINDOW_LINES // 2)
         # Hits are no longer in line order (a definition is moved first), so an overlap is checked
         # against every span kept so far, not only the last one.
-        overlapping = next((i for i, (s, e) in enumerate(spans) if start <= e and s <= end), None)
-        if overlapping is not None:
-            s, e = spans[overlapping]
-            spans[overlapping] = (min(s, start), max(e, end))
+        touching = [i for i, (s, e) in enumerate(spans) if start <= e and s <= end]
+        if touching:
+            # Merge with EVERY span the new one touches: a call window bridging two definition
+            # windows merged with the first only and left the second overlapping it.
+            merged_start = min([start] + [spans[i][0] for i in touching])
+            merged_end = max([end] + [spans[i][1] for i in touching])
+            spans = [span for i, span in enumerate(spans) if i not in touching]
+            spans.insert(touching[0], (merged_start, merged_end))
             continue
         if len(spans) == MAX_FILE_WINDOWS:
             break
@@ -1476,6 +1495,10 @@ def _directory(
     if isinstance(value, Mapping) and isinstance(value.get("items"), list):
         value = cast(Sequence[object], value["items"])
     if isinstance(value, Mapping):
+        # A file object names itself: without type "file" and the requested path, an empty or
+        # foreign object would have been reported as "this path is a file".
+        if value.get("type") != "file" or _text(value, "path", 1024) != path:
+            raise LiveGitHubError("GitHub contents response is neither a listing nor the file")
         return {
             "kind": "directory",
             "api_version": _API_VERSION,
@@ -1545,7 +1568,10 @@ def _tree(
 ) -> dict[str, object]:
     """A subtree, filtered to `path`. The endpoint takes no path, so the filter is applied here."""
     raw = _list(value, "tree")
-    truncated_by_github = value.get("truncated") is True
+    truncated = value.get("truncated")
+    if type(truncated) is not bool:
+        raise LiveGitHubError("GitHub tree truncated flag must be a boolean")
+    truncated_by_github = truncated
     prefix = f"{path}/" if path else ""
     matched: list[dict[str, object]] = []
     for item in raw:
@@ -1558,7 +1584,7 @@ def _tree(
         matched.append(
             {
                 "path": entry_path,
-                "size_bytes": _positive_or_zero_integer(entry, "size") if "size" in entry else 0,
+                "size_bytes": _positive_or_zero_integer(entry, "size"),
             }
         )
     largest = sorted(matched, key=lambda item: (-cast(int, item["size_bytes"]), item["path"]))
@@ -1606,6 +1632,8 @@ def _code_search(
     """Where a term appears, with each hit's own matching fragments."""
     total = _integer(value, "total_count")
     incomplete = _boolean(value, "incomplete_results")
+    if total < len(_list(value, "items")):
+        raise LiveGitHubError("code search total is below its own page")
     hits: list[dict[str, object]] = []
     for item in _list(value, "items")[:CODE_SEARCH_PER_PAGE]:
         hit = _object(item, "code search item")
@@ -1622,11 +1650,14 @@ def _code_search(
             for match in _list(hit, "text_matches")[:3]
             if isinstance(match, Mapping) and "fragment" in match
         ]
+        hit_url = _text(hit, "html_url", 1024)
+        if not hit_url.startswith(f"{_WEB_ROOT}/{OWNER}/{name}/blob/"):
+            raise LiveGitHubError("code search hit URL is outside its repository")
         hits.append(
             {
                 "repository": name,
                 "path": _text(hit, "path", 1024),
-                "url": _text(hit, "html_url", 1024),
+                "url": hit_url,
                 # The matching lines. Without them a hit is only a claim that a file is relevant.
                 "fragments": fragments,
             }
@@ -1661,7 +1692,11 @@ def _code_search(
 def _repository_path(value: object) -> str:
     if type(value) is not str or not 1 <= len(value.encode("utf-8")) <= 512:
         raise LiveGitHubError("file path is malformed")
-    if _REPO_PATH.fullmatch(value) is None:
+    segments = value.split("/")
+    if any(
+        segment in ("", ".", "..") or _REPO_PATH_SEGMENT.fullmatch(segment) is None
+        for segment in segments
+    ):
         raise LiveGitHubError("file path is malformed")
     return value
 
@@ -1696,11 +1731,30 @@ def _with_discussion(
     return enriched
 
 
+_CHECK_CONCLUSIONS: Final = frozenset(
+    {
+        "success",
+        "failure",
+        "neutral",
+        "cancelled",
+        "skipped",
+        "timed_out",
+        "action_required",
+        "startup_failure",
+        "stale",
+    }
+)
+
+
 def _logins(value: object) -> list[str]:
-    """Logins of a list of user objects; anything else is an empty list."""
-    if not isinstance(value, list):
+    """Logins of a list of user objects. An absent field is an empty list; a present field that
+    is not a list of objects is malformed: an object where the list belongs used to read as "no
+    reviewers requested"."""
+    if value is None:
         return []
-    return [_text(item, "login", 255) for item in value if isinstance(item, Mapping)]
+    if not isinstance(value, list):
+        raise LiveGitHubError("GitHub user list must be a list")
+    return [_text(_object(item, "user"), "login", 255) for item in value]
 
 
 def _with_readiness(
@@ -1747,7 +1801,12 @@ def _with_readiness(
             for raw in _list(checks, "check_runs"):
                 run = _object(raw, "check run")
                 conclusion = run.get("conclusion")
-                key = conclusion if isinstance(conclusion, str) else "pending"
+                if conclusion is None:
+                    key = "pending"
+                elif isinstance(conclusion, str) and conclusion in _CHECK_CONCLUSIONS:
+                    key = conclusion
+                else:
+                    raise LiveGitHubError("check run conclusion is malformed")
                 tally[key] = tally.get(key, 0) + 1
                 if key in {"failure", "timed_out", "action_required", "startup_failure"}:
                     failing.append(_text(run, "name", 255))
@@ -1864,9 +1923,12 @@ def _with_release_membership(
             return None
         if len(commits) >= MEMBERSHIP_COMMIT_PAGE:
             return None
-        return tag, any(
-            isinstance(commit, Mapping) and commit.get("sha") == merge_commit for commit in commits
-        )
+        try:
+            shas = [_sha(_object(commit, "commit"), "sha") for commit in commits]
+        except LiveGitHubError:
+            # A malformed listing is not evidence of absence; the tag stays unchecked.
+            return None
+        return tag, merge_commit in shas
 
     # The probes are independent reads of 0.2 to 0.5 s each; eight in sequence measured three
     # seconds, which was the whole cost of the feature.
@@ -1978,8 +2040,7 @@ def _project_page_info(value: Mapping[str, object]) -> tuple[bool, str | None]:
         )
     except (KeyError, TypeError) as error:
         raise LiveGitHubError("GitHub Projects response lacks page information") from error
-    if items.get("pageInfo") is None:
-        return False, None
+    # The query always asks for pageInfo; its absence is a malformed page, not the last one.
     return _page_info(_object(items.get("pageInfo"), "project pageInfo"))
 
 
@@ -2453,6 +2514,8 @@ def _issue(value: Mapping[str, object], repository: str, number: int) -> dict[st
     # real object whose status is known. What it is is stated in the payload instead of guessed at,
     # so an answer can say "pull request" rather than calling it an issue.
     nested = value.get("pull_request")
+    if nested is not None and not isinstance(nested, Mapping):
+        raise LiveGitHubError("GitHub issue pull_request marker must be an object")
     is_pull_request = isinstance(nested, Mapping)
     merged_at = (
         _nullable_timestamp(nested, "merged_at")
@@ -2547,7 +2610,11 @@ def _issue_search(
     # bug template, were 81 KB of payload: over the evidence bound, so the read was discarded in
     # silence and "the five most recent issues" got "I couldn't identify a supported query".
     # Bodies are halved until the page fits; titles, numbers and labels are never cut.
-    while _json_bytes(normalized) > MAX_SEARCH_PAYLOAD_BYTES and any(
+    # The envelope around the items is small and fixed; the bound is measured on the items plus
+    # that allowance, and a page whose bodies are at their floor and still do not fit is refused
+    # rather than emitted over the bound: the runtime would drop it anyway, and a refusal says why.
+    envelope = 1024
+    while _json_bytes(normalized) + envelope > MAX_SEARCH_PAYLOAD_BYTES and any(
         isinstance(item.get("body"), str) and len(cast(str, item["body"])) > 200
         for item in normalized
     ):
@@ -2556,6 +2623,8 @@ def _issue_search(
             if isinstance(body, str) and len(body) > 200:
                 item["body"] = body[: max(200, len(body) // 2)].rstrip()
                 item["body_truncated"] = True
+    if _json_bytes(normalized) + envelope > MAX_SEARCH_PAYLOAD_BYTES:
+        raise LiveGitHubError("GitHub issue search page exceeds the payload bound")
     # The same search, on GitHub's own page, so the citation is somewhere a person can click.
     # Only for a single repository: the allowlist admits github.com/valkey-io/<repo>/ paths and
     # nothing wider, and a cross-repository search has no such page.
@@ -2710,6 +2779,8 @@ def _search_finding(
     ordering = (
         "oldest (earliest created)"
         if order == "oldest"
+        else "newest (most recently created)"
+        if order == "newest"
         else "least recently updated"
         if updated_before
         else "most recently updated"
@@ -2720,6 +2791,21 @@ def _search_finding(
     return f"The search found {total_count} {what} in {where}{matching}.{listed}"
 
 
+def _utf8_cut(value: str, limit: int, label: str) -> tuple[str, bool]:
+    """`value` within `limit` UTF-8 bytes, cut on a character boundary, and whether it was cut.
+
+    JSON may carry an escaped lone surrogate, which Python decodes into a str that cannot be
+    encoded: that raised UnicodeEncodeError straight through the reader. Refused as malformed.
+    """
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise LiveGitHubError(f"{label} is not valid text") from error
+    if len(encoded) <= limit:
+        return value, False
+    return encoded[:limit].decode("utf-8", "ignore"), True
+
+
 def _search_body(value: Mapping[str, object], bound: int | None = None) -> tuple[str | None, bool]:
     """Return a search item body bounded to MAX_SEARCH_BODY_BYTES, and whether it was cut."""
     limit = MAX_SEARCH_BODY_BYTES if bound is None else bound
@@ -2728,11 +2814,7 @@ def _search_body(value: Mapping[str, object], bound: int | None = None) -> tuple
         return None, False
     if type(raw) is not str:
         raise LiveGitHubError("GitHub field body must be a string")
-    encoded = raw.encode("utf-8")
-    if len(encoded) <= limit:
-        return raw, False
-    # Cut on a character boundary so the retained text is always valid UTF-8.
-    return encoded[:limit].decode("utf-8", "ignore"), True
+    return _utf8_cut(raw, limit, "GitHub field body")
 
 
 def _search_item(
@@ -2939,6 +3021,8 @@ def _workflow_runs(
     items = _list(value, "workflow_runs")
     if len(items) > per_page:
         raise LiveGitHubError("GitHub workflow runs exceed the requested page bound")
+    if total < len(items):
+        raise LiveGitHubError("GitHub workflow runs total is below its own page")
     runs = []
     for item in items:
         run = _object(item, "workflow run")
@@ -3065,8 +3149,7 @@ def _shrink(value: object, depth: int = 0) -> object:
     """Bound a kept value: strings cut, lists capped, nested objects shrunk, nothing else kept."""
     if isinstance(value, str):
         limit = MAX_GENERIC_PATCH if depth else MAX_GENERIC_TEXT
-        encoded = value.encode("utf-8")
-        return value if len(encoded) <= limit else encoded[:limit].decode("utf-8", "ignore")
+        return _utf8_cut(value, limit, "generic read text")[0]
     if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
         return value
     if isinstance(value, list):
@@ -3074,6 +3157,15 @@ def _shrink(value: object, depth: int = 0) -> object:
     if isinstance(value, Mapping):
         return {str(k): _shrink(v, depth + 1) for k, v in list(value.items())[:MAX_GENERIC_ITEMS]}
     raise LiveGitHubError("generic read response carries an unexpected value type")
+
+
+def _generic_web_url(value: object, filled: Mapping[str, str]) -> None:
+    """A kept GitHub page URL must point into the repository the placeholders named (or, for a
+    user profile, at github.com itself)."""
+    repository = filled.get("repository")
+    prefix = f"{_WEB_ROOT}/{OWNER}/{repository}/" if repository else f"{_WEB_ROOT}/"
+    if type(value) is not str or not value.startswith(prefix) or ".." in value:
+        raise LiveGitHubError("generic read page URL is outside the named repository")
 
 
 def _pick(value: Mapping[str, object], dotted: str) -> object:
@@ -3097,25 +3189,37 @@ def _generic(
         if "[]." in key:
             prefix, _, inner = key.partition("[].")
             raw = _pick(value, prefix)
-            if isinstance(raw, list):
-                bucket = kept.setdefault(prefix, [{} for _ in raw[:MAX_GENERIC_ITEMS]])
-                for item, slot in zip(
-                    raw[:MAX_GENERIC_ITEMS], cast(list[dict[str, object]], bucket), strict=True
-                ):
-                    if isinstance(item, Mapping):
-                        slot[inner] = _shrink(_pick(item, inner), 1)
+            if raw is None:
+                continue
+            if not isinstance(raw, list):
+                raise LiveGitHubError(f"generic read expected a list at {prefix}")
+            bucket = kept.setdefault(prefix, [{} for _ in raw[:MAX_GENERIC_ITEMS]])
+            for item, slot in zip(
+                raw[:MAX_GENERIC_ITEMS], cast(list[dict[str, object]], bucket), strict=True
+            ):
+                if not isinstance(item, Mapping):
+                    raise LiveGitHubError(f"generic read expected objects in {prefix}")
+                slot[inner] = _shrink(_pick(item, inner), 1)
             continue
         picked = _pick(value, key)
-        if picked is not None:
-            kept[key] = _shrink(picked)
+        if picked is None:
+            continue
+        if key.endswith("html_url") or key == "url":
+            _generic_web_url(picked, filled)
+        kept[key] = _shrink(picked)
     if items_fields:
         raw_items = value.get("items")
         if not isinstance(raw_items, list):
             raise LiveGitHubError("generic read expected a list response")
+        if not all(isinstance(item, Mapping) for item in raw_items[:MAX_GENERIC_ITEMS]):
+            raise LiveGitHubError("generic read expected objects in items")
         kept["items"] = [
-            {f: _shrink(_pick(item, f), 1) for f in items_fields if isinstance(item, Mapping)}
+            {f: _shrink(_pick(item, f), 1) for f in items_fields}
             for item in raw_items[:MAX_GENERIC_ITEMS]
         ]
+        for shown in cast(list[dict[str, object]], kept["items"]):
+            if shown.get("html_url") is not None:
+                _generic_web_url(shown["html_url"], filled)
         kept["items_shown"] = len(cast(list[object], kept["items"]))
         kept["items_total_in_page"] = len(raw_items)
     # A page a person can open, derived from the placeholders, so the citation is clickable.
@@ -3146,6 +3250,8 @@ def _run_jobs(value: Mapping[str, object], repository: str, run_id: int) -> dict
     items = _list(value, "jobs")
     if len(items) > MAX_RUN_JOBS:
         raise LiveGitHubError("GitHub run jobs exceed the page bound")
+    if total < len(items):
+        raise LiveGitHubError("GitHub run jobs total is below its own page")
     jobs = []
     for item in items:
         job = _object(item, "job")
@@ -3247,6 +3353,8 @@ def _compare(
     items = _list(value, "commits")
     if len(items) > per_page:
         raise LiveGitHubError("GitHub compare commits exceed the requested page bound")
+    if total < len(items):
+        raise LiveGitHubError("GitHub compare total is below its own page")
     commits = []
     for item in items:
         entry = _object(item, "compare commit")
@@ -3552,6 +3660,12 @@ def _tag(value: object) -> str:
         raise LiveGitHubError("release tag is malformed") from error
     if not 1 <= len(encoded) <= MAX_TAG_BYTES or _TAG.fullmatch(value) is None:
         raise LiveGitHubError("release tag is malformed")
+    return value
+
+
+def _bounded_str(value: object, maximum: int, label: str) -> str:
+    if type(value) is not str or not 1 <= len(value.encode("utf-8")) <= maximum:
+        raise LiveGitHubError(f"{label} is malformed")
     return value
 
 

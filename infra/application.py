@@ -533,11 +533,19 @@ def derive_application_evidence(
                 "PRIOR_ARTIFACT_VERSION_ID": "<OPERATOR-SUPPLIED retained S3 version ID>",
                 "PRIOR_LAMBDA_VERSION": "<OPERATOR-SUPPLIED retained physical Lambda version>",
             },
+            # The application role may read exactly ONE artifact key: the current one, pinned by
+            # Sid ReadExactApplicationArtifact in the bootstrap stack. A prior template names a
+            # different key, so the rollback starts by widening that grant to [current, prior]
+            # (the bootstrap overlap step every deploy performs), applies the prior template, and
+            # ends by tightening the grant to the prior key alone. Without the first step the
+            # change set fails with AccessDenied on s3:GetObject.
             "commands": [
                 'sha256sum -c <(printf \'%s  %s\\n\' "${PRIOR_TEMPLATE_SHA256#sha256:}" "$PRIOR_TEMPLATE_FILE")',  # noqa: E501
+                f"# 1. Bootstrap overlap: patch Sid ReadExactApplicationArtifact in the synthesized {BOOTSTRAP_STACK_NAME} template so Resource lists BOTH the current artifact key and $PRIOR_ARTIFACT_KEY, then create and execute a change set on {BOOTSTRAP_STACK_NAME} with the bootstrap CloudFormation role and CAPABILITY_NAMED_IAM.",  # noqa: E501
                 f"aws cloudformation create-change-set --stack-name {APPLICATION_STACK_NAME} --change-set-name a07a-rollback-<UNIQUE> --change-set-type UPDATE --template-body file://$PRIOR_TEMPLATE_FILE --role-arn {APPLICATION_SERVICE_ROLE_ARN} --capabilities CAPABILITY_NAMED_IAM",  # noqa: E501
                 f"aws cloudformation execute-change-set --stack-name {APPLICATION_STACK_NAME} --change-set-name a07a-rollback-<UNIQUE>",  # noqa: E501
                 f"aws lambda invoke --function-name {APPLICATION_FUNCTION_NAME} --qualifier \"$PRIOR_LAMBDA_VERSION\" --cli-binary-format raw-in-base64-out --payload '<PRIOR-EXACT-HEALTH-PAYLOAD>' /tmp/a07a-prior-health.json",  # noqa: E501
+                f"# 4. Bootstrap tighten: once the prior version is healthy, re-apply the {BOOTSTRAP_STACK_NAME} template with Sid ReadExactApplicationArtifact pinned to $PRIOR_ARTIFACT_KEY alone.",  # noqa: E501
             ],
             "corpus_action": "none",
         },

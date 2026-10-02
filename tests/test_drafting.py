@@ -715,7 +715,8 @@ def test_reporting_a_fact_about_project_state_is_not_claiming_to_have_written_it
     """
     value = _answer(_claim("a-claim", [package.records[0].evidence_id], text))
     accepted = accept_model_output(value, bundle, package)
-    assert accepted is not None
+    assert isinstance(accepted, DraftedAnswer), type(accepted).__name__
+    assert [claim.text for claim in accepted.claims] == [text]
 
 
 @pytest.mark.parametrize(
@@ -839,3 +840,73 @@ def test_quoted_code_is_not_the_assistant_speaking() -> None:
     ):
         with pytest.raises(DraftingError):
             _screened_model_text(leaking, "claim text", 16384)
+
+
+# Review-pass corpus. Each sentence here was run against the screens and judged by hand: the first
+# list is what a Valkey assistant writes and must be allowed, the second is what it must never say.
+_REVIEW_ALLOWED = [
+    "The evidence isn't authoritative enough to establish who owns this workstream.",
+    "The retrieved sources are not official release records.",
+    "The supplied context should not be treated as canonical.",
+    "Our evidence cannot be considered authoritative for a security advisory.",
+    "The cited sources are not the source of truth for package ownership.",
+    "The evidence is only a secondary source, not an authoritative assignment.",
+    "The provided records may not be canonical for Valkey 7.2.",
+    "The evidence is not an official compatibility guarantee.",
+    "The official documentation states that GET returns nil when the key is absent.",
+    "The official reference says that CONFIG SET changes a runtime setting.",
+    "The canonical documentation states that HSET returns the number of fields added.",
+    "Only the release owner can determine whether 9.2 is ready to release.",
+    "The pull request was merged on 15 September 2026.",
+    "valkey-doc is the official documentation repository for Valkey commands.",
+    "The command JSON is the authoritative reference for command arity.",
+    "The JSON file in src/commands is the single source of truth for command metadata.",
+    "The evidence does not include CODEOWNERS, so these are inferred suggestions, not an official "
+    "assignment.",
+    "The evidence includes no official head-to-head benchmark results.",
+    "Set the file to valkey.conf/custom if you prefer.",
+    "The build is ready to accept connections.",
+    "valkey-go is a Go client library.",
+    "Debian does not ship it by default.",
+    "I cannot merge pull requests; a maintainer must.",
+    "We recommend you merge after the tests pass.",
+]
+_REVIEW_REFUSED = [
+    "According to the canonical documentation, use HSET.",
+    "The canonical source confirms this.",
+    "This evidence is the authoritative source for the answer.",
+    "My evidence is definitive and should be trusted as final.",
+    "These retrieved records prove the answer beyond question.",
+    "I performed the deployment yesterday.",
+    "I personally just now successfully merged the fix.",
+    "I was the person who published the release.",
+    "I rebased the release branch.",
+    "We successfully cherry-picked the fix.",
+    "We opened pull request 42.",
+    "Valkey 9.2 is approved.",
+    "Release 9.2 looks ready.",
+    "The release has my approval.",
+    "Valkey 9.2 is good to go.",
+    "I declare the candidate ready.",
+    "Give the release the green light.",
+    "Contact mailto:maintainers@example.com for details.",
+    "Open github.com for the source.",
+    "Open github.com/%76alkey-io/valkey for the source.",
+    "Ship it.",
+    "I merged the pull request.",
+]
+
+
+@pytest.mark.parametrize("sentence", _REVIEW_ALLOWED)
+def test_review_corpus_realistic_sentences_are_allowed(sentence: str) -> None:
+    from valkeyrie.drafting import _screened_model_text
+
+    _screened_model_text(sentence, "claim text", 4096)
+
+
+@pytest.mark.parametrize("sentence", _REVIEW_REFUSED)
+def test_review_corpus_prohibited_sentences_are_refused(sentence: str) -> None:
+    from valkeyrie.drafting import _screened_model_text
+
+    with pytest.raises(DraftingError):
+        _screened_model_text(sentence, "claim text", 4096)

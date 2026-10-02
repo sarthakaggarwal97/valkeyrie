@@ -146,9 +146,11 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             # model-authored one is as clickable as a real link and qualification counts it as a
             # fabricated citation. The last label must be a plausible public suffix, so
             # valkey.conf/foo stays a file path.
-            r"\b(?:https?|ftp)://|\bwww\.|"
+            r"\b(?:https?|ftp)://|\bwww\.|\bmailto:|"
+            # Slack auto-links these hosts even without a path.
+            r"\b(?:github\.com|valkey\.io)\b|"
             r"\b[a-z0-9-]+(?:\.[a-z0-9-]+)*"
-            r"\.(?:com|org|net|io|dev|sh|app|co|ai|me|info|edu|gov|cloud|xyz)/[a-z0-9]",
+            r"\.(?:com|org|net|io|dev|sh|app|co|ai|me|info|edu|gov|cloud|xyz)/(?:[a-z0-9]|%[0-9a-f]{2})",
             re.IGNORECASE,
         ),
     ),
@@ -178,12 +180,23 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             # not about authority: "the evidence does not include CODEOWNERS, so these are
             # inferred suggestions, not an official assignment" was refused, and the user lost
             # the review-suggestion answer to "I couldn't produce a reliable answer".
-            r"\b(?:this|the|my|our)\s+(?:supplied\s+|retrieved\s+|provided\s+|cited\s+)?"
+            r"\b(?:this|the|my|our|these)\s+(?:supplied\s+|retrieved\s+|provided\s+|cited\s+)?"
             r"(?:evidence|context|sources?|documents?|records?)\b"
             r"(?!\s+(?:does|do|did)\s+not\b|\s+(?:lacks?|omits?)\b"
-            r"|\s+(?:has|have|includes?|contains?|shows?|names?|offers?|provides?)\s+no\b)"
+            r"|\s+(?:has|have|includes?|contains?|shows?|names?|offers?|provides?)\s+no\b"
+            # "is not authoritative", "are not official", "isn't the source of truth", "should
+            # not be treated as canonical", "cannot be considered authoritative", "may not be
+            # canonical", "is only a secondary source, not an authoritative X": disclaimers.
+            r"|\s+(?:is|are|was|were)(?:n't|\s+not)\b"
+            r"|\s+(?:should|cannot|can't|could|may|must)(?:\s+not|n't)?\s+(?:be\s+)?"
+            r"(?:treated|considered|taken|read|be)\b"
+            r"|[^.;:!?]*\bnot\s+(?:an?\s+|the\s+)?(?:canonical|authoritative|official|source\s+of\s+truth)\b)"
             r"[^.;:!?]*"
-            r"\b(?:canonical|authoritative|official|source\s+of\s+truth)\b"
+            r"\b(?:canonical|authoritative|official|definitive|source\s+of\s+truth)\b"
+            # "these records prove the answer beyond question": the evidence declared conclusive.
+            r"|\b(?:this|the|my|our|these)\s+(?:supplied\s+|retrieved\s+|provided\s+|cited\s+)?"
+            r"(?:evidence|context|sources?|documents?|records?)\b[^.;:!?]*"
+            r"\bprove[sd]?\b[^.;:!?]*\bbeyond\s+(?:question|doubt|dispute)\b"
             r"|\b(?:canonical|authoritative|official)\b[^.;:!?]*"
             r"\b(?:supplied|retrieved|provided|cited)\s+(?:evidence|context|sources?)\b"
             # "According to X" stays prohibited in every form. It is attribution prose rather than
@@ -198,7 +211,7 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             r"|\b(?:this|the)\s+(?:canonical|authoritative|official)\s+"
             r"(?:source|reference|documentation|authority)"
             r"\s*(?:[.,;:!?]|$"
-            r"|\b(?:confirms?|states?|says?|shows?|indicates?|proves?)\b"
+            r"|\b(?:confirms?|proves?|guarantees?|settles?)\b"
             # "The canonical source IS authoritative" asserts the authority outright.
             r"|\s*\b(?:is|are|was|were|remains?)\s+(?:the\s+)?"
             r"(?:canonical|authoritative|official)\b)",
@@ -228,7 +241,17 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             # "safe to merge" about an iterator or a config is not a release decision, so the
             # sentence must be about a release for this to be one.
             r"|\bsafe\s+to\s+(?:release|ship|tag|deploy)\b"
-            r"|\bsafe\s+to\s+merge\b(?=[^.;:!?]*\b(?:release|candidate|version\s+[0-9])\b)",
+            r"|\bsafe\s+to\s+merge\b(?=[^.;:!?]*\b(?:release|candidate|version\s+[0-9])\b)"
+            # Verdicts in the release owner's words, each bound to a release subject: "9.2 is
+            # approved", "the release looks ready", "the candidate is good to go", "has my
+            # approval", "declare the release ready", "give the release the green light".
+            r"|\bvalkey\s+\d+\.\d+(?:\.\d+)?(?:-rc\d+)?\s+is\s+(?:approved|ready|good\s+to\s+go)\b"
+            r"|\b(?:release|version|candidate)(?:\s+\S{1,16}){0,2}\s+(?:looks|seems|appears|is)\s+"
+            r"(?:ready|good\s+to\s+go)\b"
+            r"|\b(?:release|version|candidate)\b[^.;:!?]*\bhas\s+(?:my|our)\s+approval\b"
+            r"|\bdeclare\s+the\s+(?:release|candidate|version)\s+ready\b"
+            r"|\bgreen\s+light\b(?=[^.;:!?]*\b(?:release|candidate)\b)"
+            r"|\b(?:release|candidate)\b[^.;:!?]*\bgreen\s+light\b",
             re.IGNORECASE,
         ),
     ),
@@ -252,8 +275,13 @@ _PROHIBITED_MODEL_TEXT: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             r"\b(?:i|we)(?:'ve|'d)?"
             r"(?:\s+(?!(?:can|cannot|can't|could|couldn't|would|wouldn't|should|shouldn't|may|"
             r"might|must|will|won't|do|don't|not|never|think|believe|recommend|suggest|hope|"
-            r"cannot)\b)[a-z]{2,12}){0,3}\s+"
-            r"(?:merged|pushed|committed|deployed|released|tagged|published|closed|created)\b"
+            r"cannot)\b)[a-z]{2,12}){0,4}\s+"
+            r"(?:merged|pushed|committed|deployed|released|tagged|published|closed|created|"
+            r"rebased|cherry-picked|opened|reverted|approved|dispatched|triggered|rerun|reran)\b"
+            r"|\b(?:i|we)\s+(?:personally\s+)?performed\s+the\s+"
+            r"(?:deployment|merge|release|rollout|commit|push|publication|tag|rebase|revert)\b"
+            r"|\b(?:i|we)\s+(?:was|were|am|are)\s+the\s+(?:one|person|ones)\s+who\s+"
+            r"(?:merged|pushed|deployed|released|tagged|published|closed|created|opened|rebased)\b"
             # Emphatic past: "we did publish the release". "did" followed directly by the bare
             # verb is a claim of having acted; "did not" is excluded by the negation above being
             # required to sit between them.
@@ -460,7 +488,9 @@ def _is_readiness_deferral(value: str) -> bool:
     label_pattern = dict((label, pattern) for label, pattern in _PROHIBITED_MODEL_TEXT)[
         _READINESS_LABEL
     ]
-    for clause in re.split(r"[.;:!?\n]+", value):
+    # A period inside a version ("9.2") is not a clause boundary: "only the release owner can
+    # determine whether 9.2 is ready" was split there and refused.
+    for clause in re.split(r"(?<!\d)\.(?!\d)|[;:!?\n]+", value):
         if label_pattern.search(clause) is None:
             continue
         if _READINESS_DEFERRAL.search(clause) is None:

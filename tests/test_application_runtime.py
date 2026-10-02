@@ -3343,7 +3343,8 @@ def test_the_retry_writes_one_terminal_result_when_both_draws_fail(
     assert result["outcome"] == "error"
     assert len(services.model_calls) == 2, "one retry, not more"
     completions = [call for call in services.requests.values() if call.get("outcome") == "error"]
-    assert len(completions) <= 1, "exactly one terminal write"
+    assert len(completions) == 1, "exactly one terminal write"
+    assert completions[0]["outcome"] == "error" and completions[0]["result"] is not None
 
 
 def test_a_claim_carrying_a_program_may_exceed_the_prose_bound() -> None:
@@ -3854,6 +3855,19 @@ def test_an_english_question_answered_in_another_language_is_redrawn_once(
     assert _dominant_language(spanish) == "other"
     assert _dominant_language(english) == "en"
     assert _dominant_language("HSET key field value") is None, "too few function words to judge"
+    # One English marker against none is English; the old ratio needed two.
+    assert _dominant_language("Is replication enabled?", minimum=1) == "en"
+    # A short foreign answer to an English question is refused; a short English one is not.
+    with pytest.raises(ApplicationRuntimeError, match="another language"):
+        _require_askers_language("Is replication enabled?", [{"text": "No es compatible."}], None)
+    with pytest.raises(ApplicationRuntimeError, match="another language"):
+        _require_askers_language(
+            "Is replication enabled?",
+            [{"text": "La replicación está deshabilitada porque la opción no está disponible."}],
+            None,
+        )
+    _require_askers_language("Is replication enabled?", [{"text": "No, it is off."}], None)
+    _require_askers_language("Is replication enabled?", [{"text": "CONFIG GET repl-*"}], None)
     _require_askers_language("Why is CI failing?", [{"text": english}], None)
     _require_askers_language("¿Por qué falla la CI en la rama unstable?", [{"text": spanish}], None)
     with pytest.raises(ApplicationRuntimeError, match="another language"):
@@ -4083,3 +4097,136 @@ def test_any_rejected_first_draw_is_redrawn_once(manifest: dict[str, object]) ->
         manifest=manifest,
     )
     assert refused["outcome"] == "error" and len(twice.model_calls) == 2
+
+
+def test_pathological_model_json_is_a_redraw_not_a_crash(manifest: dict[str, object]) -> None:
+    """json.loads raises plain ValueError on a 5,000-digit integer and RecursionError on a
+    1,200-deep array; both escaped the fail-closed path as crashes with no terminal write."""
+
+    class Pathological(FakeServices):
+        def __init__(self, first: str) -> None:
+            super().__init__()
+            self.first = first
+
+        def converse(self, **kwargs: object) -> BedrockTextResponse:
+            self.model_calls.append(dict(kwargs))
+            evidence = cast(tuple[RuntimeEvidence, ...], kwargs["evidence"])
+            if len(self.model_calls) == 1:
+                return BedrockTextResponse(self.first, "end_turn")
+            return BedrockTextResponse(
+                _output(
+                    "answer",
+                    [
+                        {
+                            "claim_id": "c1",
+                            "text": "Fine.",
+                            "evidence_ids": [evidence[0].evidence_id],
+                        }
+                    ],
+                ),
+                "end_turn",
+            )
+
+    for first in ('{"api_version":' + "1" * 5000 + "}", "[" * 1200 + "0" + "]" * 1200):
+        services = Pathological(first)
+        result = run_runtime_event(
+            _event(request_id="req_pathological"), services, root=ROOT, manifest=manifest
+        )
+        assert result["outcome"] == "answer" and len(services.model_calls) == 2
+
+
+def test_a_recovered_plan_must_belong_to_this_request_and_have_a_sound_sequence(
+    manifest: dict[str, object],
+) -> None:
+    """A stored plan whose request_id names another row, or a row with revision 0 and fence -1,
+    was recovered and executed as sound."""
+    from valkeyrie.application_runtime import _existing_plan
+
+    services = FakeServices()
+    run_runtime_event(_event(request_id="req_state"), services, root=ROOT, manifest=manifest)
+    item = dict(services.requests["req_state"])
+    for key in ("outcome", "completed_at", "result"):
+        item.pop(key, None)
+    digest = cast(str, cast(dict[str, object], item["plan"])["question_digest"])
+    _existing_plan(item, digest, manifest, request_id="req_state")  # sound: accepted
+    with pytest.raises(ApplicationRuntimeError, match="different request"):
+        _existing_plan(item, digest, manifest, request_id="req_other")
+    with pytest.raises(ApplicationRuntimeError, match="sequence is malformed"):
+        _existing_plan(
+            {**item, "revision": 0, "fence": -1}, digest, manifest, request_id="req_state"
+        )
+
+
+def test_the_github_token_is_read_once_under_a_lock_and_a_failed_read_is_not_cached() -> None:
+    import os
+    import threading
+
+    from valkeyrie.application_runtime import _UNSET, AwsRuntimeServices
+
+    class Secrets:
+        def __init__(self, fail_first: bool) -> None:
+            self.calls = 0
+            self.fail_first = fail_first
+            self.lock = threading.Lock()
+
+        def get_secret_value(self, **kwargs: object) -> dict[str, object]:
+            with self.lock:
+                self.calls += 1
+                call = self.calls
+            if self.fail_first and call == 1:
+                raise RuntimeError("transient")
+            return {"SecretString": "github_pat_good"}
+
+    class SDK:
+        def __init__(self, secrets: Secrets) -> None:
+            self.secrets = secrets
+
+        def client(self, name: str) -> Secrets:
+            return self.secrets
+
+    os.environ["GITHUB_TOKEN_SECRET_ID"] = "secret-id"
+    try:
+        secrets = Secrets(fail_first=False)
+        services = object.__new__(AwsRuntimeServices)
+        services._github_token_cached = _UNSET
+        services._github_token_lock = threading.Lock()
+        services._boto3 = lambda: SDK(secrets)  # type: ignore[method-assign]
+        results: list[str | None] = []
+        threads = [
+            threading.Thread(target=lambda: results.append(services._github_token()))
+            for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert secrets.calls == 1 and set(results) == {"github_pat_good"}
+
+        flaky = Secrets(fail_first=True)
+        services = object.__new__(AwsRuntimeServices)
+        services._github_token_cached = _UNSET
+        services._github_token_lock = threading.Lock()
+        services._boto3 = lambda: SDK(flaky)  # type: ignore[method-assign]
+        assert services._github_token() is None  # the failure is returned
+        assert services._github_token() == "github_pat_good"  # and not cached
+    finally:
+        os.environ.pop("GITHUB_TOKEN_SECRET_ID", None)
+
+
+def test_search_scope_order_does_not_make_two_queries() -> None:
+    from valkeyrie.application_runtime import _query_key
+    from valkeyrie.live_github import IssueSearchQuery
+
+    a = IssueSearchQuery(
+        ("streaming", "compression"),
+        repository="valkey",
+        repositories=("valkey-glide",),
+        kind="pull-request",
+    )
+    b = IssueSearchQuery(
+        ("compression", "streaming"),
+        repository="valkey-glide",
+        repositories=("valkey",),
+        kind="pull-request",
+    )
+    assert _query_key(a) == _query_key(b)

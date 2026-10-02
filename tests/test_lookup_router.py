@@ -565,7 +565,7 @@ def test_a_shortfall_rides_as_bounded_data_beside_the_question() -> None:
         "do not compute others from memory.\nq"
     )
     # The bound is reviewed policy, not whatever the constant happens to say.
-    assert MAX_SHORTFALL_BYTES == 600
+    assert MAX_SHORTFALL_BYTES == 1024
 
 
 def test_the_parser_refuses_a_repository_outside_the_reviewed_inventory() -> None:
@@ -694,3 +694,36 @@ def test_the_router_may_use_a_catalog_template_and_nothing_outside_it() -> None:
     ):
         with pytest.raises(LookupRouterError, match=reason):
             parse_lookup_plan('{"lookups":[' + bad + "]}")
+
+
+def test_the_parser_accepts_only_what_the_reader_will_fetch() -> None:
+    """Review pass: a plan the parser accepted and the reader refused failed silently at read time.
+    The reader's URL builder is the authority and runs at parse time."""
+    from valkeyrie.live_github import WorkflowRunQuery
+    from valkeyrie.lookup_router import LookupRouterError, parse_lookup_plan
+
+    for bad in (
+        '{"kind":"github_read","template":"commit","values":{"repository":"valkey","sha":"not-a-sha"}}',
+        '{"kind":"github_read","template":"user","values":{"login":"-bad"}}',
+        '{"kind":"file","repository":"valkey","path":"' + "a" * 513 + '"}',
+        '{"kind":"code_search","term":"repo:evil","repositories":["valkey"]}',
+        '{"kind":"code_search","term":"expireIfNeeded","repositories":["valkey"],"extension":"c++"}',
+        '{"kind":"advisory","repository":"valkey","identifier":"GHSA-bbbb-bbbb-bbbb"}',
+        '{"kind":"search","terms":["is","it"],"repositories":["valkey"],"scope":"issue"}',
+    ):
+        with pytest.raises(LookupRouterError):
+            parse_lookup_plan('{"lookups":[' + bad + "]}")
+    # The guidance names workflow_run; the parser now has the arm.
+    plan = parse_lookup_plan(
+        '{"lookups":[{"kind":"workflow_run","repository":"valkey","run_id":36502585735}]}'
+    )
+    assert plan.live == (WorkflowRunQuery("valkey", 36502585735),)
+
+
+def test_faithfulness_needs_a_whole_word_or_a_six_character_stem() -> None:
+    from valkeyrie.lookup_router import _is_faithful
+
+    assert _is_faithful("is it released yet?", "is pull request 3853 released yet?")
+    assert _is_faithful("who authored it?", "who authored pull request 3853?")
+    # "authored" and "authority" share five characters and nothing else.
+    assert not _is_faithful("who authored it?", "What authority does the TSC have?")

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -900,7 +901,7 @@ def _resume_existing(
     replayed = _replayed_result(item, request_digest, manifest, request_id=request_id)
     if replayed is not None:
         return replayed
-    plan, revision, fence = _existing_plan(item, request_digest, manifest)
+    plan, revision, fence = _existing_plan(item, request_digest, manifest, request_id=request_id)
     expected_owner = _bounded_text(item.get("owner"), "request owner", 128)
     existing_expiry = _timestamp(item.get("lease_expires_at"), "request lease expiration")
     if _timestamp_value(now) < _timestamp_value(existing_expiry):
@@ -917,7 +918,7 @@ def _resume_existing(
     if recovered is None:
         return RuntimeResult("partial", request_id, "request recovery condition failed")
     recovered_plan, recovered_revision, recovered_fence = _existing_plan(
-        recovered, request_digest, manifest
+        recovered, request_digest, manifest, request_id=request_id
     )
     return _execute_plan(
         services,
@@ -1149,9 +1150,11 @@ def _dominant_language(text: str, *, minimum: int = 3) -> str | None:
     other = sum(1 for w in words if w in _OTHER_MARKERS and w not in _ENGLISH_MARKERS)
     if english + other < minimum:
         return None
-    if english >= 2 * max(other, 1):
+    # One marker against none is a verdict; "max(other, 1)" made a single English function word
+    # fall short of the stated minimum of one.
+    if english >= minimum and english >= 2 * other:
         return "en"
-    if other >= 2 * max(english, 1):
+    if other >= minimum and other >= 2 * english:
         return "other"
     return None
 
@@ -1165,7 +1168,9 @@ def _require_askers_language(
     if _dominant_language(question, minimum=1) != "en":
         return
     written = " ".join(str(c.get("text", "")) for c in claims) + " " + (message or "")
-    if _dominant_language(written) == "other":
+    # Two foreign function words and no English ones is a foreign answer ("No es compatible.");
+    # a command-only or code-heavy answer has no function words at all and stays unjudged.
+    if _dominant_language(written, minimum=2) == "other":
         raise _UnparseableModelOutput("model answered an English question in another language")
 
 
@@ -1267,7 +1272,7 @@ def _accept_output(
 ) -> tuple[str, tuple[Mapping[str, object], ...], tuple[str, ...], str | None]:
     try:
         value = json.loads(response_text, object_pairs_hook=_unique_object)
-    except (UnicodeError, json.JSONDecodeError) as error:
+    except (UnicodeError, ValueError, RecursionError) as error:
         # A whole answer was discarded for wearing a Markdown fence the prompt told it not to use.
         # Exactly one fence around exactly one object, with nothing else outside it, is the same
         # object; prose beside the JSON stays a rejection, because then the model said two things
@@ -1284,7 +1289,9 @@ def _accept_output(
             raise _UnparseableModelOutput("normalized model response is invalid JSON") from error
         try:
             value = json.loads(unfenced, object_pairs_hook=_unique_object)
-        except (UnicodeError, json.JSONDecodeError):
+        except (UnicodeError, ValueError, RecursionError):
+            # ValueError covers JSONDecodeError and the "integer string too large" refusal; a
+            # 1,200-deep array raises RecursionError. Both escaped the fail-closed path as crashes.
             raise _UnparseableModelOutput("normalized model response is invalid JSON") from error
     if not isinstance(value, Mapping) or set(value) not in (
         {"api_version", "kind", "outcome", "claims"},
@@ -1756,6 +1763,12 @@ def _query_key(query: LiveGitHubQuery) -> str:
         key: [type(value).__name__, sorted(value)] if isinstance(value, tuple) else value
         for key, value in asdict(query).items()
     }
+    if isinstance(query, IssueSearchQuery):
+        # One scope: the primary repository and the extra ones are one sorted collection, so
+        # listing them in a different order is the same search (and fetched once).
+        scope = sorted({query.repository or "", *query.repositories})
+        fields["repository"] = scope[0] or None
+        fields["repositories"] = ["tuple", scope[1:]]
     # Typed queries hold only strings, ints, bools, None and tuples of strings; anything else
     # is a defect and json.dumps says so rather than a stringified stand-in colliding.
     return type(query).__name__ + json.dumps(fields, sort_keys=True)
@@ -2242,6 +2255,8 @@ def _existing_plan(
     item: Mapping[str, object],
     request_digest: str,
     manifest: Mapping[str, object],
+    *,
+    request_id: str | None = None,
 ) -> tuple[Mapping[str, object], int, int]:
     if item.get("outcome") is not None:
         raise ApplicationRuntimeError("request audit is already terminal")
@@ -2249,6 +2264,13 @@ def _existing_plan(
     revision, fence = item.get("revision"), item.get("fence")
     if not isinstance(plan, Mapping) or type(revision) is not int or type(fence) is not int:
         raise ApplicationRuntimeError("request audit state is malformed")
+    # The reachable state space is revision >= fence >= 1; anything else is a row written by
+    # something other than this runtime, and a plan whose request_id names another row is not
+    # this request's plan. Both were recovered and executed as if sound.
+    if not revision >= fence >= 1:
+        raise ApplicationRuntimeError("request audit sequence is malformed")
+    if request_id is not None and plan.get("request_id") != request_id:
+        raise ApplicationRuntimeError("request is pinned to a different request")
     if plan.get("question_digest") != request_digest:
         raise ApplicationRuntimeError("request is pinned to different content")
     if plan.get("application_revision") != manifest["application_revision"]:
@@ -2852,6 +2874,7 @@ class AwsRuntimeServices:
     # Assignment in _github_token creates an instance attribute, so the cache never leaks
     # between instances.
     _github_token_cached: object = _UNSET
+    _github_token_lock: threading.Lock = threading.Lock()
 
     def __init__(self) -> None:
         self._table_name = os.environ["STATE_TABLE_NAME"]
@@ -2921,18 +2944,28 @@ class AwsRuntimeServices:
         """
         if self._github_token_cached is not _UNSET:
             return cast("str | None", self._github_token_cached)
-        token: str | None = None
-        secret_id = os.environ.get("GITHUB_TOKEN_SECRET_ID", "")
-        if secret_id:
-            try:
-                value = self._boto3().client("secretsmanager").get_secret_value(SecretId=secret_id)
-                candidate = value.get("SecretString")
-                if isinstance(candidate, str) and candidate.strip():
-                    token = candidate.strip()
-            except Exception:
-                token = None
-        self._github_token_cached = token
-        return token
+        # Concurrent live reads all saw _UNSET and each called Secrets Manager; a later transient
+        # failure then overwrote a good token with None for the life of the container. One reader
+        # loads under the lock, the rest wait for it.
+        with self._github_token_lock:
+            if self._github_token_cached is not _UNSET:
+                return cast("str | None", self._github_token_cached)
+            token: str | None = None
+            secret_id = os.environ.get("GITHUB_TOKEN_SECRET_ID", "")
+            if secret_id:
+                try:
+                    value = (
+                        self._boto3().client("secretsmanager").get_secret_value(SecretId=secret_id)
+                    )
+                    candidate = value.get("SecretString")
+                    if isinstance(candidate, str) and candidate.strip():
+                        token = candidate.strip()
+                except Exception:
+                    # A failed read is not cached: the next question tries again rather than
+                    # running anonymously for the rest of the container's life.
+                    return None
+            self._github_token_cached = token
+            return token
 
     def retrieve(
         self, *, knowledge_base_id: str, generation_id: str, question: str

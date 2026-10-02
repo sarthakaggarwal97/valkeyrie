@@ -4,7 +4,7 @@ import base64
 import copy
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -226,6 +226,7 @@ def _project(number: int = 14) -> dict[str, object]:
                     "url": f"https://github.com/orgs/{OWNER}/projects/{number}",
                     "items": {
                         "totalCount": 3,
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
                         "nodes": [
                             {
                                 "id": "PVTI_issue",
@@ -367,11 +368,10 @@ def test_every_rest_query_is_one_fixed_bounded_get_and_normalized(
         f"sha256:{hashlib.sha256(observation.canonical_payload).hexdigest()}"
     )
     payload = _decoded(observation)
-    if kind is None:
-        assert payload["id"] == 12
-        assert "output" not in payload
-    else:
-        assert payload["kind"] == kind
+    assert payload["kind"] == kind
+    if kind == "check_run":
+        # The raw check-run output (annotations, summary text) is not part of the evidence.
+        assert payload["id"] == 12 and "output" not in payload
     assert "unknown" not in payload
     assert observation.observation_id.startswith("obs_")
 
@@ -699,6 +699,7 @@ def test_issue_search_body_is_nullable_but_strictly_bounded() -> None:
     # A body over the bound must NOT discard the whole result set. A long issue body is
     # ordinary, and failing the search made every repository-scoped question return
     # "Live GitHub data is temporarily unavailable". It is truncated, and the item says so.
+    assert MAX_SEARCH_BODY_BYTES == 6 * 1024, "reviewed policy, not whatever the constant says"
     item["body"] = "x" * (MAX_SEARCH_BODY_BYTES + 1)
     result = read_live_github(
         IssueSearchQuery(("release", "status")),
@@ -1258,7 +1259,12 @@ def test_documented_waiting_and_startup_failure_states_are_supported(kind: str) 
         query, fetch=lambda *args: _response(value), observed_clock=lambda: OBSERVED
     )
 
-    assert _decoded(observation)["kind"] in {"workflow_run", "check_run"}
+    payload = _decoded(observation)
+    if kind == "workflow":
+        assert payload["kind"] == "workflow_run" and payload["conclusion"] == "startup_failure"
+    else:
+        assert payload["kind"] == "check_run"
+        assert payload["status"] == "waiting" and payload["conclusion"] is None
 
 
 @pytest.mark.parametrize(
@@ -2106,7 +2112,9 @@ def test_a_directory_listing_reports_entries_and_whether_it_is_complete() -> Non
 
     # A path that is a FILE arrives as the file object, with no items key. Saying so beats
     # reporting an empty directory, which would read as "the path holds nothing".
-    as_file = _directory({"name": "db.c", "type": "file"}, "valkey", "src/db.c", None)
+    as_file = _directory(
+        {"name": "db.c", "path": "src/db.c", "type": "file"}, "valkey", "src/db.c", None
+    )
     assert as_file["is_file"] is True and as_file["entries"] == []
     assert "is a file, not a directory" in cast(str, as_file["finding"])
 
@@ -2126,12 +2134,13 @@ def test_a_subtree_is_ordered_by_size_so_the_largest_stays_exact() -> None:
     """The model read "incomplete listing" as "no maximum can be established" and abstained on a
     question its evidence answered, so the payload states what the truncation preserved."""
     tree = {
+        "truncated": False,
         "tree": [
             {"path": "src/small.c", "type": "blob", "size": 10},
             {"path": "src/module.c", "type": "blob", "size": 684862},
             {"path": "src/sub", "type": "tree"},
             {"path": "tests/other.c", "type": "blob", "size": 999999},
-        ]
+        ],
     }
     payload = _tree(tree, "valkey", "src", None)
     files = cast(list[Any], payload["files"])
@@ -2863,3 +2872,146 @@ def test_a_search_page_of_long_bodies_is_trimmed_to_the_payload_bound() -> None:
     items = cast(list[dict[str, object]], payload["items"])
     assert len(items) == 20 and items[0]["title"] == "[BUG] issue 0"
     assert all(item["body_truncated"] for item in items)
+
+
+def test_malformed_but_plausible_responses_are_refused_not_crashed_or_believed() -> None:
+    """Review pass over the normalizers. Each case used to raise a Python exception through the
+    reader or to emit a payload that asserted something the response did not say."""
+    import pytest as _pytest
+
+    from valkeyrie.live_github import (
+        CodeSearchQuery,
+        FileQuery,
+        GenericReadQuery,
+        WorkflowRunsQuery,
+        _file_windows,
+    )
+
+    def fixed(payload: object) -> Callable[..., HttpResponse]:
+        return lambda *a: _response(payload)
+
+    # A 429 whose headers are not a mapping: AttributeError before the response validator.
+    from valkeyrie.live_github import _fetch_with_retry
+
+    bad_429 = HttpResponse(429, None, b"{}")  # type: ignore[arg-type]
+    returned = _fetch_with_retry(
+        lambda *a: bad_429, "https://api.github.com/x", 1024, sleep=lambda s: None
+    )
+    assert returned is bad_429  # handed to the validator, which refuses it as malformed
+    # An escaped lone surrogate in a body: UnicodeEncodeError through the reader.
+    item = _search_item()
+    item["body"] = "\ud800"
+    with _pytest.raises(LiveGitHubError, match="not valid text"):
+        read_live_github(
+            IssueSearchQuery(("release", "status"), repository="valkey"),
+            fetch=fixed(_issue_search(item)),
+            observed_clock=lambda: OBSERVED,
+        )
+    # A file response whose sha is not a sha, whose url names another path, whose page is an issue.
+    with _pytest.raises(LiveGitHubError):
+        read_live_github(
+            FileQuery("valkey", "src/a.c", None, ()),
+            fetch=fixed(
+                {
+                    "type": "file",
+                    "path": "src/a.c",
+                    "size": 3,
+                    "sha": "z" * 64,
+                    "encoding": "base64",
+                    "content": "YWJj",
+                    "url": "https://api.github.com/repos/valkey-io/valkey/contents/other.c",
+                    "html_url": "https://github.com/valkey-io/valkey/issues/1",
+                }
+            ),
+            observed_clock=lambda: OBSERVED,
+        )
+    # A code-search hit pointing outside its repository, and a total below its own page.
+    hit = {
+        "path": "src/a.c",
+        "html_url": "https://evil.example/phish",
+        "repository": {"name": "valkey"},
+        "text_matches": [],
+    }
+    with _pytest.raises(LiveGitHubError):
+        read_live_github(
+            CodeSearchQuery("expireIfNeeded", ("valkey",), None, None),
+            fetch=fixed({"total_count": 1, "incomplete_results": False, "items": [hit]}),
+            observed_clock=lambda: OBSERVED,
+        )
+    hit["html_url"] = "https://github.com/valkey-io/valkey/blob/abc/src/a.c"
+    with _pytest.raises(LiveGitHubError, match="below its own page"):
+        read_live_github(
+            CodeSearchQuery("expireIfNeeded", ("valkey",), None, None),
+            fetch=fixed({"total_count": 0, "incomplete_results": False, "items": [hit]}),
+            observed_clock=lambda: OBSERVED,
+        )
+    # Workflow runs total below the page.
+    with _pytest.raises(LiveGitHubError, match="below its own page"):
+        read_live_github(
+            WorkflowRunsQuery("valkey", "unstable", 10),
+            fetch=fixed({"total_count": 0, "workflow_runs": [_run_fixture(1, "CI", "success")]}),
+            observed_clock=lambda: OBSERVED,
+        )
+    # A generic read whose kept object fields are lists and whose file entries are not objects.
+    with _pytest.raises(LiveGitHubError):
+        read_live_github(
+            GenericReadQuery("commit", {"repository": "valkey", "sha": "c" * 40}),
+            fetch=fixed(
+                {
+                    "sha": "c" * 40,
+                    "html_url": "https://github.com/valkey-io/valkey/commit/" + "c" * 40,
+                    "commit": {
+                        "message": "m",
+                        "author": {"name": "A", "date": "2026-01-01T00:00:00Z"},
+                    },
+                    "stats": {"additions": 1, "deletions": 0, "total": 1},
+                    "files": [7],
+                }
+            ),
+            observed_clock=lambda: OBSERVED,
+        )
+    # A generic read whose page URL points outside the named repository.
+    with _pytest.raises(LiveGitHubError, match="outside the named repository"):
+        read_live_github(
+            GenericReadQuery("commit", {"repository": "valkey", "sha": "c" * 40}),
+            fetch=fixed(
+                {
+                    "sha": "c" * 40,
+                    "html_url": "https://evil.example/x",
+                    "commit": {
+                        "message": "m",
+                        "author": {"name": "A", "date": "2026-01-01T00:00:00Z"},
+                    },
+                    "stats": {"additions": 1, "deletions": 0, "total": 1},
+                    "files": [],
+                }
+            ),
+            observed_clock=lambda: OBSERVED,
+        )
+    # A call window bridging two definition windows merges with both: no overlapping windows.
+    lines = ["x"] * 200
+    lines[50] = "void alpha(client *c) {"
+    lines[102] = "    alpha(c); beta(c);"
+    lines[110] = "void beta(client *c) {"
+    spans = [
+        (cast(int, w["first_line"]), cast(int, w["last_line"]))
+        for w in _file_windows(lines, ("alpha", "beta"))
+    ]
+    for (a_start, a_end), (b_start, b_end) in zip(spans, spans[1:], strict=False):
+        assert a_end < b_start or b_end < a_start, spans
+    # A search page over the payload bound even at the body floor is refused, not emitted.
+    from valkeyrie.live_github import MAX_SEARCH_PAYLOAD_BYTES
+
+    fat = []
+    for i in range(20):
+        it = _search_item(number=4000 + i)
+        it["title"] = "T" * 1024
+        it["labels"] = [{"name": f"label-{j}-" + "L" * 40} for j in range(20)]
+        fat.append(it)
+    with _pytest.raises(LiveGitHubError, match="exceeds the payload bound"):
+        read_live_github(
+            IssueSearchQuery((), repository="valkey", state="open", order="newest"),
+            fetch=fixed({"total_count": 100, "incomplete_results": False, "items": fat}),
+            observed_clock=lambda: OBSERVED,
+        )
+    assert MAX_SEARCH_PAYLOAD_BYTES == 32 * 1024
