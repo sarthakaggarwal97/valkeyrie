@@ -1299,6 +1299,7 @@ def _sentence_case(text: str) -> str:
 _PROSE_STARTERS = frozenset(
     "a an the this that these those it its they there here if when while so but and or otherwise "
     "however therefore instead because since once after before until unless although though "
+    "whether what which how where why who whatever whichever "
     "meanwhile it's that's there's don't doesn't isn't we're you're "
     "then thus hence also only even each every all both some any no not use set run check try "
     "small large other another with without for from to in on at by as of is are was were be "

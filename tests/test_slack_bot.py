@@ -1080,6 +1080,7 @@ def test_a_verb_form_continuation_is_capitalized_and_a_split_head_ends_as_a_sent
         s._sentence_case("choosing an eviction policy lets") == "Choosing an eviction policy lets"
     )
     assert s._sentence_case("jemalloc releases memory") == "jemalloc releases memory"
+    assert s._sentence_case("whether that is safe depends") == "Whether that is safe depends"
     assert s._sentence_case("appendonly yes turns it on") == "appendonly yes turns it on"
     joined = (
         "The change itself is immediately safe for the data set, since nothing is evicted and no "
