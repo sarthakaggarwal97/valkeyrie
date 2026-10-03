@@ -639,17 +639,11 @@ def _format(result: dict[str, Any], *, seconds: float | None = None) -> str:
                 sources = "\n\n_Sources:_ " + " \u00b7 ".join(links)
             else:
                 sources = "\n\n_Sources_\n" + "\n".join(f"  {link}" for link in links)
-        # A complete answer ends with what it checked. Only an answer with a stated limitation gets
-        # the pointer to the human channels: on a complete one it was noise under every reply.
-        checked = f"Checked {len(citations)} source{'s' if len(citations) != 1 else ''}" + (
-            f" in {seconds:.0f} s" if seconds is not None else ""
-        )
-        tail = (
-            (f"\n\n_{_spoken(_plain(message))}_" if message else "")
-            + f"\n\n_{checked}."
-            + (f" {_MORE_HELP}" if message else "")
-            + "_"
-        )
+        # The answer ends with its stated limitation, when it has one, and nothing else: the
+        # "Checked 3 sources in 25 s" line and the pointer to the human channels were chrome
+        # that the fifth reply taught people to skip. An abstention still gets the pointer, in
+        # _format, because it is the one reply with nothing else to offer.
+        tail = f"\n\n_{_spoken(_plain(message))}_" if message else ""
         budget = MAX_REPLY_CHARS - len(sources) - len(tail) - 80
         rendered: list[str] = []
         used = 0
@@ -713,6 +707,18 @@ _MORE_HELP = "For more: the Valkey Slack help channels, GitHub Discussions, or v
 # include X" is true and reads like a form letter; "I couldn't find X" says the same thing the way
 # a colleague would. Only exact stems are rewritten, so nothing about Valkey itself is reworded.
 _SPOKEN: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
+    (
+        # "Given these facts, the most likely cause is ..." says nothing before the comma that the
+        # citation does not already say; the conclusion stands on its own. "Given that X, Y" keeps
+        # its X, which is content.
+        re.compile(
+            r"^Given (?:these|those|the above|all this|this|the preceding|the|what I read)"
+            r"(?: facts| recommendations| guidance| constraints| defaults| points"
+            r"| behaviou?rs| documentation| evidence| sources)?,\s*"
+            r"(\w)"
+        ),
+        lambda m: m.group(1).upper(),
+    ),
     (
         re.compile(r"\b(?:are|is) (?:not )?listed in the (?:supplied |available )?evidence\b"),
         lambda m: (
@@ -1132,7 +1138,11 @@ def _led(text: str) -> str:
         return enumerated if enumerated is not None else f"• {text}"
     sentences = _SENTENCE_BREAK.split(text, maxsplit=1)
     if len(sentences) >= 2:
-        return f"• {sentences[0]}\n    {sentences[1]}"
+        # Indented, the second sentence reads as part of the first. "The dictEntry no longer has a
+        # next pointer." indented under a bullet about a pull request's goal read as a dangling
+        # fragment; a sentence about something else is its own bullet.
+        joint = "\n    " if _continues(sentences[0], sentences[1]) else "\n• "
+        return f"• {sentences[0]}{joint}{sentences[1]}"
     # One long sentence: its semicolon-joined clauses are separate points and read as such.
     enumerated = _enumerated(text)
     if enumerated is not None:
@@ -1151,6 +1161,33 @@ def _led(text: str) -> str:
         if len(head) >= 60 and len(tail) >= 60:
             return f"• {head}\n    {_sentence_case(match.group(1))} {tail}"
     return f"• {text}"
+
+
+def _continues(first: str, second: str) -> bool:
+    """Whether the second sentence elaborates the first: it refers back to it (It, This, That,
+    Otherwise, ...) or shares a substantive word with it. Two sentences with neither in common
+    are two facts."""
+    if _BACK_REFERENCE.match(second):
+        return True
+
+    def words(sentence: str) -> set[str]:
+        found = re.findall(r"[A-Za-z][\w-]{4,}", sentence)
+        return {w.casefold().strip("'`\"") for w in found} - _COMMON_WORDS
+
+    return bool(words(first) & words(second))
+
+
+_BACK_REFERENCE = re.compile(
+    r"(?:It|Its|This|That|These|Those|Such|Here|There|Both|Each|Either|Neither|Otherwise|Instead|"
+    r"So|Then|Hence|Thus|Therefore|However|Still|Also|In (?:that|this) case|If (?:so|not)|"
+    r"The (?:same|former|latter|result|default|rest|fix|change|check))\b"
+)
+_COMMON_WORDS = frozenset(
+    "about above after again against along among around because before being below between "
+    "could during either every first found further having itself later might never often other "
+    "others rather really right second should since still their there these those through under "
+    "until using value values where which while whose would within without".split()
+)
 
 
 # "while" and "whereas" are left joined: a contrast reads as one thought, split it reads as two.
@@ -1215,6 +1252,11 @@ def _enumerated(text: str) -> str | None:
             for item in items
         ):
             continue  # "so", "but", "in practice" between commas are clauses, not items
+        # "..., volatile-random, volatile-ttl so the server frees keys automatically": the last
+        # item carries the sentence's closing clause. Listed, the clause hung off one policy.
+        longest_other = max(len(item.split()) for item in items[:-1])
+        if len(items[-1].split()) > 2 * longest_other + 1 and _CLAUSE_IN_ITEM.search(items[-1]):
+            continue
         if _LISTING_VERB.search(items[0]):
             # The list starts at a later verb; this one was a noun ("security support end
             # dates are: ...").
@@ -1258,6 +1300,9 @@ _PROSE_STARTERS = frozenset(
 )
 
 
+_CLAUSE_IN_ITEM = re.compile(
+    r"\s(?:so|which|because|since|unless|if|when|while|to|in order to|and then)\s", re.IGNORECASE
+)
 _NOT_AN_ITEM = frozenset(
     "so but and or then however therefore because although though whereas while yet".split()
 )

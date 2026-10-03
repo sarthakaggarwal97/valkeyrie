@@ -240,8 +240,10 @@ def test_a_complete_answer_ends_with_what_it_checked_and_only_a_limited_one_poin
         },
         seconds=12.4,
     )
-    assert answered.endswith("_Checked 1 source in 12 s._")
-    assert "Slack help channels" not in answered
+    # No "Checked N sources in T s" line and no pointer to people under a complete answer: after
+    # the fifth reply both were skipped, and what is skipped at the end is skipped above it.
+    assert answered.endswith("|valkey-doc/commands/hset.md>")
+    assert "Checked" not in answered and "Slack help channels" not in answered
     limited = slack_bot._format(
         {
             "outcome": "answer",
@@ -251,9 +253,8 @@ def test_a_complete_answer_ends_with_what_it_checked_and_only_a_limited_one_poin
         }
     )
     # The limitation is spoken as a person would say it, and the pointer rides on the footer.
-    assert "_I couldn't find every breaking change._" in limited
-    assert slack_bot._MORE_HELP in limited
-    assert "_Checked 0 sources. For more:" in limited
+    assert limited.endswith("_I couldn't find every breaking change._")
+    assert slack_bot._MORE_HELP not in limited
     assert "Slack help channels" in slack_bot._MORE_HELP
 
 
@@ -703,9 +704,7 @@ def test_prose_is_spoken_and_the_first_claim_leads() -> None:
     )
     assert spoken("a decision the evidence cannot settle") == "a decision my reading cannot settle"
     # "Given these facts" is natural prose and stays; an earlier rewrite to "So" read abruptly.
-    assert (
-        spoken("Given these facts, GT suits counters.") == "Given these facts, GT suits counters."
-    )
+    assert spoken("Given these facts, GT suits counters.") == "GT suits counters."
     # Not touched: a version, a login at sentence start, code, a date glued to other text.
     assert spoken("madolson is the chair.") == "madolson is the chair."
     assert spoken("Use 9.0.6 or 2026-09-01.x builds.") == "Use 9.0.6 or 2026-09-01.x builds."
@@ -729,7 +728,7 @@ def test_prose_is_spoken_and_the_first_claim_leads() -> None:
     lines = text.split("\n")
     assert lines[0] == "The default is noeviction." and lines[1] == ""
     assert lines[2] == "\u2022 Writes then fail with OOM."
-    assert "_Sources:_ <" in text and text.endswith("_Checked 1 source in 3 s._")
+    assert "_Sources:_ <" in text and "Checked" not in text
     # One claim: a sentence, no bullet at all.
     single = slack_bot._format({**result, "claims": result["claims"][:1]}, seconds=3.0)
     assert single.startswith("The default is noeviction.\n\n_Sources:_")
@@ -1030,3 +1029,46 @@ def test_verification_wave_renderer_rules() -> None:
     # Common sentence starters are capitalized after a split; names are not.
     assert s._sentence_case("however, the backlog may") == "However, the backlog may"
     assert s._sentence_case("valkey-cli follows redirects") == "valkey-cli follows redirects"
+
+
+def test_the_five_readability_rules_from_reading_v91_replies() -> None:
+    s = slack_bot
+    # 1. A content-free conclusion stem is dropped; "Given that X" keeps its X.
+    assert s._spoken("Given this guidance, enable io-threads when CPU-bound.") == (
+        "Enable io-threads when CPU-bound."
+    )
+    assert s._spoken("Given that timeout defaults to 0, check it first.").startswith("Given that")
+    # 3. An abstention still points to people.
+    assert s._MORE_HELP in s._format({"outcome": "abstention", "message": "Nothing found."})
+    # 4a. A last list item carrying the sentence's closing clause is not a list.
+    policies = (
+        "To resolve it, raise maxmemory, delete or expire data, or set maxmemory-policy to an "
+        "eviction policy such as allkeys-lru, volatile-lru, allkeys-lfu, volatile-lfu, "
+        "allkeys-random, volatile-random, volatile-ttl so the server frees keys automatically."
+    )
+    assert s._enumerated(policies) is None
+    plain = (
+        "New features in 9.0 include atomic slot migration, multi-database cluster mode, hash "
+        "field expiration, numbered databases, cluster-wide pubsub, and a new hashtable."
+    )
+    assert s._enumerated(plain) is not None
+    # 4b. A second sentence about something else is its own bullet; one that refers back is not.
+    unrelated = (
+        "Pull request <https://github.com/valkey-io/valkey/issues/3366|#3366> removed dict.c and "
+        "made dict delegate to hashtable, stating the goal was to unify the hashtable "
+        "implementations in the project and remove duplicated logic. "
+        "The dictEntry no longer has a next pointer."
+    )
+    assert s._led(unrelated).count("\n• ") == 1
+    related = (
+        "If the primary is password protected via requirepass, the replica must be told to "
+        "authenticate before starting replication synchronization, otherwise the primary refuses "
+        "the replica request. This is done with primaryauth <primary-password>."
+    )
+    assert "\n    This is done" in s._led(related)
+    shared = (
+        "Do not set the replica client-output-buffer-limit lower than repl-backlog-size, because "
+        "such a configuration is ignored and the repl-backlog-size value is used instead of it. "
+        "The replica client shares the backlog buffer memory."
+    )
+    assert "\n    The replica client" in s._led(shared)
