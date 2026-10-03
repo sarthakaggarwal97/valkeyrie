@@ -1159,7 +1159,9 @@ def _led(text: str) -> str:
     for match in _STRONG_JOIN.finditer(text):
         head, tail = text[: match.start()].rstrip(), text[match.end() :].strip()
         if len(head) >= 60 and len(tail) >= 60:
-            return f"• {head}\n    {_sentence_case(match.group(1))} {tail}"
+            # The head is a sentence now and ends like one ("...nothing is evicted" ran into
+            # "But the node..." with no period between them).
+            return f"• {_ended(head)}\n    {_sentence_case(match.group(1))} {tail}"
     return f"• {text}"
 
 
@@ -1284,7 +1286,12 @@ def _sentence_case(text: str) -> str:
     # Only a word that is plainly English prose is capitalized; a lower-case word that could be a
     # name (jemalloc, valkey-cli, appendonly) keeps its spelling, since a wrong capital changes
     # what it refers to and a missing one does not.
-    if first.lower() not in _PROSE_STARTERS:
+    # A verb form ("choosing", "enabling", "compared") is prose too: no setting or tool is
+    # spelled that way, and "choosing an eviction policy..." began a line in lower case.
+    verb_form = (
+        first.isalpha() and first.islower() and len(first) > 5 and first.endswith(("ing", "ed"))
+    )
+    if first.lower() not in _PROSE_STARTERS and not verb_form:
         return text
     return text[0].upper() + text[1:]
 

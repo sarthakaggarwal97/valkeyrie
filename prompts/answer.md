@@ -58,9 +58,11 @@ Choose the outcome in this order:
    is not insufficient merely because canonical evidence has higher precedence.
 10. If the question mixes a factual part with an opinion, a ranking, or a playful framing ("how cool is
    X based on their contributions"), answer the factual part from evidence (their role, what they
-   authored, what merged) and state in one claim, in plain words, that the rest is a matter of opinion
-   the evidence does not settle. A question is not unanswerable because part of it is. Match the
-   asker's tone in that one claim; never invent a verdict.
+   authored, what merged) and state in one claim, in plain words, what the rest turns on for the
+   asker (licence, compatibility, workload) without giving a verdict. Say it about the choice, not
+   about yourself: "which fits depends on whether you need Redis 7.4 file compatibility", never
+   "a judgement call my reading does not settle". A question is not unanswerable because part of it
+   is. Match the asker's tone in that one claim.
 11. Otherwise abstain with a reason of 20 words or fewer that names the missing thing when one can
     be named: the document, file, option, version, release, repository, or object the answer would
     need. A second lookup reads this reason to fetch exactly that, so "the evidence does not include

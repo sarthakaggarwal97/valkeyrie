@@ -1072,3 +1072,18 @@ def test_the_five_readability_rules_from_reading_v91_replies() -> None:
         "The replica client shares the backlog buffer memory."
     )
     assert "\n    The replica client" in s._led(shared)
+
+
+def test_a_verb_form_continuation_is_capitalized_and_a_split_head_ends_as_a_sentence() -> None:
+    s = slack_bot
+    assert (
+        s._sentence_case("choosing an eviction policy lets") == "Choosing an eviction policy lets"
+    )
+    assert s._sentence_case("jemalloc releases memory") == "jemalloc releases memory"
+    assert s._sentence_case("appendonly yes turns it on") == "appendonly yes turns it on"
+    joined = (
+        "The change itself is immediately safe for the data set, since nothing is evicted and no "
+        "write is rejected, but the node can then grow past 30GB without bound and risk a real "
+        "out-of-memory condition, so make sure the host has headroom and monitoring first."
+    )
+    assert "is evicted and no write is rejected.\n    But the node" in s._led(joined)
