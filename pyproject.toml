@@ -20,7 +20,7 @@ bot = ["boto3==1.40.21", "slack-bolt==1.21.2"]
 dev = [
     "bandit==1.9.4",
     "hatchling==1.32.0",
-    "mypy==2.3.1",
+    "mypy==2.4.0",
     "pip-audit==2.10.1",
     "pytest==9.1.1",
     "ruff==0.16.3",
