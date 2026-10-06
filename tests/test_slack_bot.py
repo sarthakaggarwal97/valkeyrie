@@ -1088,3 +1088,48 @@ def test_a_verb_form_continuation_is_capitalized_and_a_split_head_ends_as_a_sent
         "out-of-memory condition, so make sure the host has headroom and monitoring first."
     )
     assert "is evicted and no write is rejected.\n    But the node" in s._led(joined)
+
+
+def test_references_followed_by_their_predicate_stay_a_sentence() -> None:
+    s = slack_bot
+    text = (
+        "Approved pull requests labeled major-decision-pending, major-decision-deferred, or "
+        "breaking-change, such as #978, #2157, #3068, #3986, and #906, carry process gates and "
+        "are not quick merges despite the approval."
+    )
+    assert s._enumerated(text) is None
+    listed = (
+        "The release includes these fixes: #2785, #2786, #2780, #2817, #2840, "
+        "#2787 and #2873, each with its own entry."
+    )
+    assert s._enumerated(listed) is not None
+
+
+def test_a_stale_pooled_connection_is_retried_once_and_a_read_timeout_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = slack_bot
+    calls: list[int] = []
+
+    class ConnectionClosedError(Exception):
+        pass
+
+    class ReadTimeoutError(Exception):
+        pass
+
+    def flaky(**kwargs: object) -> dict[str, str]:
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionClosedError("closed before a response")
+        return {"ok": "yes"}
+
+    monkeypatch.setattr(s.lambda_client, "invoke", flaky)
+    assert s._invoke_once_more_if_the_connection_was_stale({"q": 1}) == {"ok": "yes"}
+    assert len(calls) == 2
+
+    def timing_out(**kwargs: object) -> dict[str, str]:
+        raise ReadTimeoutError("still answering")
+
+    monkeypatch.setattr(s.lambda_client, "invoke", timing_out)
+    with pytest.raises(ReadTimeoutError):
+        s._invoke_once_more_if_the_connection_was_stale({"q": 1})

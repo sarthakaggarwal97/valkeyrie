@@ -444,6 +444,35 @@ def answer_assistant_message(
     deliver(text=_bounded_reply(text), unfurl_links=False)
 
 
+def _invoke_once_more_if_the_connection_was_stale(payload: dict[str, Any]) -> Any:
+    """Invoke the function; if the pooled HTTPS connection had been closed by the far side while
+    idle, invoke once more on a fresh one.
+
+    After nine idle minutes the next question got ConnectionClosedError ("Connection was closed
+    before we received a valid response") and the user got "Something went wrong": the endpoint
+    had dropped the keep-alive connection and the client sent the request down it. No request
+    row exists for that question, so the request never reached the function, and resending it is
+    safe. This is the ONE error class that is retried: a read timeout is not, since the function
+    may still be answering (see the client's configuration above)."""
+    for attempt in (1, 2):
+        try:
+            return lambda_client.invoke(
+                FunctionName=FUNCTION,
+                Qualifier=QUALIFIER,
+                InvocationType="RequestResponse",
+                Payload=json.dumps(payload).encode("utf-8"),
+            )
+        except Exception as error:  # noqa: BLE001 - classified by name just below
+            stale = {k.__name__ for k in type(error).__mro__} & {
+                "ConnectionClosedError",
+                "EndpointConnectionError",
+            }
+            if attempt == 2 or not stale:
+                raise
+            log.warning("stale connection on invoke, retrying once: %s", _brief(error))
+    raise AssertionError("unreachable")
+
+
 def _ask(
     question: str, event: dict[str, Any], conversation: list[dict[str, str]] | None = None
 ) -> dict[str, Any]:
@@ -470,12 +499,7 @@ def _ask(
         # before it. The runtime resolves the follow-up into a standalone question and answers
         # that from evidence; the history decides what was asked, never what may be claimed.
         payload["conversation"] = conversation
-    response = lambda_client.invoke(
-        FunctionName=FUNCTION,
-        Qualifier=QUALIFIER,
-        InvocationType="RequestResponse",
-        Payload=json.dumps(payload).encode("utf-8"),
-    )
+    response = _invoke_once_more_if_the_connection_was_stale(payload)
     raw = response["Payload"].read()
     if "FunctionError" in response:
         # The error body can carry anything the function raised. Its type is enough to act on.
@@ -1262,6 +1286,12 @@ def _enumerated(text: str) -> str | None:
         if _LISTING_VERB.search(items[0]):
             # The list starts at a later verb; this one was a noun ("security support end
             # dates are: ...").
+            continue
+        # "such as #978, #2157, #3068, #3986, and #906, carry process gates and are not quick
+        # merges": references followed by the sentence's predicate. Listed, the predicate was an
+        # item. The sentence stays a sentence.
+        references = [_WHOLE_REFERENCE.fullmatch(item.strip()) is not None for item in items]
+        if all(references[:-1]) and not references[-1]:
             continue
         lines = [f"• {lead.rstrip(':')}"] + [f"    \u25e6 {item}" for item in items]
         if trailer:
