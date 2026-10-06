@@ -756,7 +756,11 @@ _SPOKEN: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...
     (re.compile(r"\bat (?:the )?observation(?: time)?\b"), "when I checked"),
     (
         re.compile(r"\b[Aa]s of the (?:latest |last |most recent )?observation\b(,?)(\s*)"),
-        lambda m: "when I last checked" + (", " if m.group(1) or m.start() == 0 else m.group(2)),
+        lambda m: (
+            ("When" if m.group(0)[0] == "A" else "when")
+            + " I last checked"
+            + (", " if m.group(1) or m.start() == 0 else m.group(2))
+        ),
     ),
     (re.compile(r"\b[Aa]s observed on (\d{4}-\d{2}-\d{2})\b"), r"when I checked on \1"),
     (

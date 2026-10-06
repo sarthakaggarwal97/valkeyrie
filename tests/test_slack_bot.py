@@ -1002,6 +1002,10 @@ def test_verification_wave_renderer_rules() -> None:
         "three approvals when I last checked."
     )
     assert s._spoken("(as of the latest observation) and more") == "(when I last checked) and more"
+    assert (
+        s._spoken("As of the latest observation, 22 are open.")
+        == "When I last checked, 22 are open."
+    )
     # A clause already ended by "?" does not get "?."; a semicolon in parentheses is not a split.
     question = (
         "A clause long enough to clear the lead threshold of two hundred and twenty characters "
