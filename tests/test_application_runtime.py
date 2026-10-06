@@ -4248,3 +4248,18 @@ def test_search_scope_order_does_not_make_two_queries() -> None:
         kind="pull-request",
     )
     assert _query_key(a) == _query_key(b)
+
+
+def test_whether_the_service_is_useful_is_a_capability_question() -> None:
+    from valkeyrie.application_runtime import _CAPABILITY
+
+    for asked in (
+        "Are you useful?",
+        "are you any good",
+        "can you help me?",
+        "Do you actually work?",
+        "r u helpful",
+    ):
+        assert _CAPABILITY.search(asked) is not None, asked
+    for asked in ("Are you running in cluster mode?", "can you help me understand PSYNC?"):
+        assert _CAPABILITY.search(asked) is None, asked

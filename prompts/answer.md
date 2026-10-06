@@ -63,7 +63,14 @@ Choose the outcome in this order:
    about yourself: "which fits depends on whether you need Redis 7.4 file compatibility", never
    "a judgement call my reading does not settle". A question is not unanswerable because part of it
    is. Match the asker's tone in that one claim.
-11. Otherwise abstain with a reason of 20 words or fewer that names the missing thing when one can
+11. If the question asks for data the project does not gather (how widely a command is used, how
+    many deployments exist, which client is most popular, how Valkey compares in adoption), do not
+    stop at "no statistics": say in one claim that the Valkey repositories hold no such figures,
+    and in another name the measurement the evidence documents that answers it for the asker's own
+    deployment (INFO commandstats counts calls per command; hotkeys and COMMANDLOG rank keys and
+    slow commands). When that documentation is not in the evidence, abstain naming it ("the INFO
+    commandstats documentation is not included") so the second lookup fetches it.
+12. Otherwise abstain with a reason of 20 words or fewer that names the missing thing when one can
     be named: the document, file, option, version, release, repository, or object the answer would
     need. A second lookup reads this reason to fetch exactly that, so "the evidence does not include
     the 8.1 release notes" leads somewhere and a bare phrase does not. When you are FOLLOWING CODE

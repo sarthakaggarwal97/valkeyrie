@@ -257,6 +257,12 @@ _CAPABILITY: Final = re.compile(
     r"|how\s+(?:can|do)\s+you\s+help"
     r"|who\s+(?:are|r)\s+(?:you|u)\b"
     r"|what\s+are\s+you\b"
+    # "Are you useful?" from a maintainer trying the bot got "What would you like to know about
+    # the Valkey project?", which answers nothing. A question about whether or how this service
+    # helps is a capability question.
+    r"|(?:are|r)\s+(?:you|u)\s+(?:useful|helpful|any\s+good|working|alive|real|a\s+bot|smart)\b"
+    r"|(?:can|could|will)\s+(?:you|u)\s+(?:actually\s+)?help(?:\s+me)?\s*[?.!]*$"
+    r"|do\s+(?:you|u)\s+(?:actually\s+|even\s+)?work\b"
     # Three more ways the sweep asked about the service itself, each of which had been sent to
     # the model, which has no evidence about this service: "insufficient validated evidence" was
     # the reply to "what sources do you use".

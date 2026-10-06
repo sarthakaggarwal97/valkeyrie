@@ -319,3 +319,19 @@
     (fragmentation 1.83, 90% of maxmemory under noeviction) to the defaults. active_defrag_running:0
     says only that defrag is not running at this instant (commands/info.md), not that activedefrag
     is disabled, and the answer must not claim the latter.
+
+- id: meta-are-you-useful
+  question: Are you useful?
+  expect: clarification
+  contains: [cites them]
+  because: |
+    A maintainer's first question to the bot. It is a capability question and gets the concrete
+    list of what the service does, not "what would you like to know".
+
+- id: stats-most-used-command
+  question: What is the most widely used Valkey command?
+  expect: answer
+  contains: [commandstats]
+  because: |
+    The project collects no usage statistics, which is worth one sentence; what the asker can do
+    about it (INFO commandstats on their own server) is the useful part and is documented.
